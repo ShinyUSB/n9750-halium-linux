@@ -1,0 +1,16 @@
+[Unit]
+Description=d2q WLAN bring-up (wpa_supplicant + addressing)
+After=systemd-udevd.service systemd-modules-load.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=180
+ExecStart=/usr/local/sbin/d2q-wlan-up.sh
+# SSH must not be held hostage by a slow Wi-Fi association: the RNDIS link is
+# the only recovery path on this headless board.
+ExecStartPost=-/bin/true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,60 @@
+--- a/drivers/gpu/drm/msm/msm_mmu.h
++++ b/drivers/gpu/drm/msm/msm_mmu.h
+@@ -18,6 +18,7 @@
+ #ifndef __MSM_MMU_H__
+ #define __MSM_MMU_H__
+ 
++#include <linux/dma-mapping.h>
+ #include <linux/iommu.h>
+ 
+ struct msm_mmu;
+@@ -54,6 +55,13 @@
+ 	int (*one_to_one_unmap)(struct msm_mmu *mmu, uint32_t dest_address,
+ 					uint32_t size);
+ 	struct device *(*get_dev)(struct msm_mmu *mmu);
++	/*
++	 * IMAGE 270 -- fetch the GPU-visible page table base and ASID.
++	 * Upstream equivalent: msm_iommu_pagetable_params().
++	 * Returns 0 and fills both on success, negative errno otherwise.
++	 */
++	int (*get_pagetable_params)(struct msm_mmu *mmu,
++			uint64_t *ttbr, int *asid);
+ };
+ 
+ struct msm_mmu {
+@@ -70,10 +78,35 @@
+ 	mmu->funcs = funcs;
+ }
+ 
++/* Diagnostic logging for the context-bank adapter (first runtime probe). */
++#ifndef MSM_GPU_MMU_DEBUG
++#define MSM_GPU_MMU_DEBUG 1
++#endif
++#define mmu_dbg(dev, fmt, ...) \
++	do { \
++		if (MSM_GPU_MMU_DEBUG) \
++			dev_info(dev, fmt, ##__VA_ARGS__); \
++	} while (0)
++
+ struct msm_mmu *msm_iommu_new(struct device *dev, struct iommu_domain *domain);
+ struct msm_mmu *msm_smmu_new(struct device *dev,
+ 	enum msm_mmu_domain_type domain);
+ 
++/*
++ * Context-bank adapter for the transplanted A6xx driver. Builds an msm_mmu on
++ * the existing Samsung CAF SMMU context banks (gfx3d_user, gmu_kernel, ...)
++ * without enabling KGSL. See msm_gpu_mmu.c.
++ *
++ * Context-bank assignment for SM8150 / A640:
++ *   GPU core      -> "gfx3d_user"   (CB 0, SID 0x401)
++ *   GMU buffers   -> "gmu_kernel"   (CB 5, SID 0x400)
++ */
++struct msm_gem_address_space *msm_gpu_aspace_new(const char *cb_name,
++		const char *aspace_name);
++int msm_gpu_cb_domain_get(const char *cb_name, struct iommu_domain **domain,
++		struct device **dev);
++void msm_gpu_cb_domain_put(struct iommu_domain *domain, struct device *dev);
++
+ static inline void msm_mmu_set_fault_handler(struct msm_mmu *mmu, void *arg,
+ 		int (*handler)(void *arg, unsigned long iova, int flags))
+ {

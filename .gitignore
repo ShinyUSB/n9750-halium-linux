@@ -1,0 +1,12 @@
+*.img
+*.tar.gz
+*.tar.xz
+*.cpio.gz
+*.raw
+*.wmfw
+*.so
+*.bin
+*.deb
+__pycache__/
+*.pyc
+core.*

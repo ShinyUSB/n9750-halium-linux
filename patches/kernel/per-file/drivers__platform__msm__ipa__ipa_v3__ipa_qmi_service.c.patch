@@ -1,0 +1,48 @@
+--- a/drivers/platform/msm/ipa/ipa_v3/ipa_qmi_service.c
++++ b/drivers/platform/msm/ipa/ipa_v3/ipa_qmi_service.c
+@@ -41,6 +41,9 @@
+ 
+ #define QMI_IPA_FORCE_CLEAR_DATAPATH_TIMEOUT_MS 1000
+ 
++/* D2QQMI: temporary trace of every QMI_IPA message from the modem (debug image). */
++#define D2QQMI(...) do { pr_err("D2QQMI " __VA_ARGS__); } while (0)
++
+ static struct qmi_handle *ipa3_svc_handle;
+ static struct workqueue_struct *ipa_clnt_req_workqueue;
+ static bool ipa3_qmi_modem_init_fin, ipa3_qmi_indication_fin;
+@@ -105,6 +108,7 @@
+ 	int rc;
+ 
+ 	indication_req = (struct ipa_indication_reg_req_msg_v01 *)decoded_msg;
++	D2QQMI("RX INDICATION_REGISTER_REQ\n");
+ 	IPAWANDBG("Received INDICATION Request\n");
+ 
+ 	/* cache the client sq */
+@@ -129,9 +133,11 @@
+ 	ipa3_qmi_indication_fin = true;
+ 
+ 	/* check if need sending indication to modem */
++	D2QQMI("indication_fin check: modem_init_fin=%d\n", ipa3_qmi_modem_init_fin);
+ 	if (ipa3_qmi_modem_init_fin)	{
+ 		IPAWANDBG("send indication to modem (%d)\n",
+ 		ipa3_qmi_modem_init_fin);
++		D2QQMI("TX MASTER_DRIVER_INIT_COMPLETE_IND\n");
+ 		memset(&ind, 0, sizeof(struct
+ 				ipa_master_driver_init_complt_ind_msg_v01));
+ 		ind.master_driver_init_status.result =
+@@ -166,6 +172,7 @@
+ 	rule_req = (struct ipa_install_fltr_rule_req_msg_v01 *)decoded_msg;
+ 	memset(rule_hdl, 0, sizeof(rule_hdl));
+ 	memset(&resp, 0, sizeof(struct ipa_install_fltr_rule_resp_msg_v01));
++	D2QQMI("RX INSTALL_FILTER_RULE_REQ\n");
+ 	IPAWANDBG("Received install filter Request\n");
+ 
+ 	rc = ipa3_copy_ul_filter_rule_to_ipa((struct
+@@ -282,6 +289,7 @@
+ 	struct ipa_init_modem_driver_cmplt_resp_msg_v01 resp;
+ 	int rc;
+ 
++	D2QQMI("RX INIT_MODEM_DRIVER_CMPLT_REQ\n");
+ 	IPAWANDBG("Received QMI_IPA_INIT_MODEM_DRIVER_CMPLT_REQ_V01\n");
+ 	cmplt_req = (struct ipa_init_modem_driver_cmplt_req_msg_v01 *)
+ 		decoded_msg;

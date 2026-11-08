@@ -1,0 +1,489 @@
+--- /dev/null
++++ b/drivers/gpu/drm/msm/msm_gpu_mmu.c
+@@ -0,0 +1,485 @@
++/*
++ * Copyright (C) 2026
++ *
++ * msm_gpu_mmu - minimal address-space adapter for the transplanted A6xx
++ *              DRM driver on the Samsung SM8150 (d2q) tree.
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ *
++ * WHY THIS FILE EXISTS
++ * ===================
++ *
++ * The A640 DRM bring-up needs a real address space, but CONFIG_QCOM_KGSL=n
++ * (required so the pre-existing DRM load_gpu() path can bind) also removes the
++ * only driver that would otherwise create the GPU context-bank devices.
++ *
++ * Almost nothing from KGSL is actually needed:
++ *
++ *   - The SMMU hardware node on this platform is
++ *         kgsl-smmu@0x02ca0000  compatible = "qcom,qsmmu-v500"
++ *     which is bound by the GENERIC drivers/iommu/arm-smmu.c
++ *     (CONFIG_ARM_SMMU=y, completely independent of CONFIG_QCOM_KGSL).
++ *     Verified live: /sys/bus/platform/devices/2ca0000.kgsl-smmu -> arm-smmu
++ *
++ *   - The context banks are declared as children carrying standard "iommus"
++ *     properties, so the generic IOMMU API can consume them directly:
++ *         gfx3d_user     iommus = <&qsmmu 0x0 0x401>   CB 0, SID 0x401
++ *         gfx3d_secure   iommus = <&qsmmu 0x2 0x400>   CB 2, SID 0x400
++ *         gmu_user       iommus = <&qsmmu 0x4 0x400>   CB 4, SID 0x400
++ *         gmu_kernel     iommus = <&qsmmu 0x5 0x400>   CB 5, SID 0x400
++ *
++ *   - CAF itself obtains these CBs with nothing but of_platform_populate(),
++ *     of_find_device_by_node(), of_dma_configure(), iommu_domain_alloc() and
++ *     iommu_attach_device(). See drivers/gpu/msm/kgsl_iommu.c:_kgsl_iommu_probe()
++ *     and drivers/gpu/msm/kgsl_gmu.c:gmu_iommu_cb_probe().
++ *
++ * So this file re-implements exactly that sequence and nothing more. It
++ * deliberately does NOT reimplement SMMU register programming, does NOT touch
++ * the SDE/display MMU path, and does NOT re-enable KGSL.
++ *
++ * CONTEXT-BANK ASSIGNMENT (traced from the KGSL reference, not guessed)
++ * =====================================================================
++ *
++ *   GPU core (a6xx)     -> gfx3d_user    (CB 0, SID 0x401)
++ *   GMU kernel buffers  -> gmu_kernel    (CB 5, SID 0x400)
++ *       HFI queues, A640 icache/dcache, debug region. Confirmed against
++ *       kgsl_gmu.c, which maps GMU kernel memory with GMU_CONTEXT_KERNEL.
++ *   GMU user pages      -> gmu_user      (CB 4)  - process pages only
++ *   GPU secure buffers  -> gfx3d_secure  (CB 2)  - secure allocs only
++ *
++ * The last two are not needed to bring the GPU up and are not requested here.
++ */
++
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/iommu.h>
++#include <linux/dma-mapping.h>
++#include <soc/qcom/scm.h>
++
++#include "msm_drv.h"
++#include "msm_gem.h"
++#include "msm_mmu.h"
++
++/*
++ * IMAGE 278 -- program the GPU's SMMU aperture in the secure world.
++ *
++ * WHY THIS EXISTS (the one secure-world handshake the working driver makes
++ * and this one does not):
++ *
++ * Stock CAF KGSL calls into TZ on every GPU start:
++ *
++ *   drivers/gpu/msm/adreno.c:1896  adreno_program_smmu_aperture()
++ *   drivers/gpu/msm/kgsl_iommu.c:1298
++ *       desc.args[0] = 0xFFFF0000 | ((CP_APERTURE_REG & 0xff) << 8) |
++ *                       (context_bank_number & 0xff);
++ *       scm_call2(SCM_SIP_FNID(SCM_SVC_MP, CP_SMMU_APERTURE_ID), &desc);
++ *
++ * with context_bank_number read from the user context's
++ * DOMAIN_ATTR_CONTEXT_BANK (kgsl_iommu.c:1343-1351).  Upstream msm does the
++ * same thing for a6xx (qcom_scm_set_gpu_smmu_aperture(0), called from
++ * adreno_hw_init()).
++ *
++ * The msm/drm path in this tree never makes that call, so TZ is never told
++ * which context bank / aperture the GPU's SMMU may use.  On a permissive
++ * firmware that is harmless; on Samsung's TZ the GPU's user-memory traffic
++ * can be refused while the boot-time windows (ring buffer, memstore fence)
++ * keep working -- which is exactly the observed signature: the CP executes
++ * commands and the fence retires, but nothing the GPU writes to a user
++ * buffer ever lands.
++ *
++ * PARAMETERS
++ *   a6xx.smmu_aperture_cb
++ *     -2  do not make the call at all (default: today's behaviour)
++ *     -1  make the call with the context bank's DOMAIN_ATTR_CONTEXT_BANK
++ *          (this is what CAF does)
++ *     >=0 make the call with that context bank number, overriding the
++ *          attribute (for A/B against what the hardware actually uses)
++ */
++#define MSM_APERTURE_CP_APERTURE_REG	0
++#define MSM_APERTURE_SCM_CMD_ID		0x1B
++
++int smmu_aperture_cb = -2;
++/* Same prefix the GPU params use (a6xx_gmu.c), so the cmdline token is
++ * a6xx.smmu_aperture_cb=... */
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "a6xx."
++module_param(smmu_aperture_cb, int, 0444);
++MODULE_PARM_DESC(smmu_aperture_cb,
++	"GPU SMMU aperture: -2=never call SCM (default), -1=use DOMAIN_ATTR_CONTEXT_BANK, >=0=force that context bank number (image 278)");
++
++/* mmu_dbg() is defined in msm_mmu.h and shared with the A6xx sources. */
++
++struct msm_gpu_cb {
++	struct device_node	*node;		/* borrowed, ref held while used */
++	struct platform_device	*cb_pdev;	/* the CB platform device     */
++	struct iommu_domain	*domain;
++	bool			domain_owned;	/* true once mmu owns it      */
++};
++
++/*
++ * Find the context-bank node by name anywhere in the DT, requiring an
++ * "iommus" property so we cannot latch onto an unrelated node.
++ */
++static struct device_node *msm_gpu_cb_find_node(const char *cb_name)
++{
++	struct device_node *np;
++
++	for_each_of_allnodes(np) {
++		if (of_node_cmp(np->name, cb_name))
++			continue;
++		if (!of_find_property(np, "iommus", NULL))
++			continue;
++		return np;
++	}
++
++	return NULL;
++}
++
++/*
++ * Obtain a usable IOMMU domain for one context bank.
++ */
++static int msm_gpu_cb_get(const char *cb_name, struct msm_gpu_cb *cb)
++{
++	struct device_node *cb_node, *parent_node;
++	struct platform_device *cb_pdev, *parent_pdev;
++	int ret;
++
++	memset(cb, 0, sizeof(*cb));
++
++	cb_node = msm_gpu_cb_find_node(cb_name);
++	if (!cb_node) {
++		pr_err("msm_gpu_mmu: no context bank node '%s' with iommus\n",
++			cb_name);
++		return -ENODEV;
++	}
++
++	parent_node = of_get_parent(cb_node);
++
++	/*
++	 * The parent (the SMMU node or the GMU node) is normally already a
++	 * platform device, created by of_platform_default_populate(). Create it
++	 * on demand so we do not depend on probe order.
++	 */
++	parent_pdev = of_find_device_by_node(parent_node);
++	if (!parent_pdev && parent_node) {
++		parent_pdev = of_platform_device_create(parent_node, NULL,
++				NULL);
++		if (!parent_pdev) {
++			of_node_put(cb_node);
++			return -ENODEV;
++		}
++	}
++
++	/* Create the CB platform device. Idempotent: OF_POPULATED is set. */
++	of_platform_populate(parent_node, NULL, NULL,
++			parent_pdev ? &parent_pdev->dev : NULL);
++
++	cb_pdev = of_find_device_by_node(cb_node);
++	if (!cb_pdev) {
++		pr_err("msm_gpu_mmu: context bank '%s' did not become a device\n",
++			cb_name);
++		of_node_put(cb_node);
++		return -ENODEV;
++	}
++
++	of_dma_configure(&cb_pdev->dev, cb_node);
++
++	cb->node = cb_node;
++	cb->cb_pdev = cb_pdev;
++
++	cb->domain = iommu_domain_alloc(&platform_bus_type);
++	if (!cb->domain) {
++		dev_err(&cb_pdev->dev,
++			"iommu_domain_alloc failed for '%s'\n", cb_name);
++		ret = -ENODEV;
++		goto err;
++	}
++
++	/*
++	 * IMAGE 240 -- set DOMAIN_ATTR_USE_LLC_NWA BEFORE attach.
++	 *
++	 * CAF sets this for a640 (vendor kgsl_iommu.c:1270-1296,
++	 * _enable_gpuhtw_llc). Image 236 set it in msm_gpu_aspace_new(),
++	 * which runs AFTER iommu_attach_device() below, so the SMMU refused
++	 * it (-EBUSY): arm_smmu_domain_finalise_s1() had already built the
++	 * page-table format. Image 236's dev_info proved the refusal, so the
++	 * LLC hypothesis was never tested.
++	 *
++	 * arm-smmu.c:2282 turns this attribute into
++	 * IO_PGTABLE_QUIRK_QCOM_USE_LLC_NWA (with QSMMUV500_NON_SHAREABLE on
++	 * QCOM_SMMUV500). Non-fatal on failure, like CAF's WARN_ONCE: a
++	 * refused attribute must not abort bring-up.
++	 */
++	{
++		int llc_nwa = 1;
++
++		ret = iommu_domain_set_attr(cb->domain,
++				DOMAIN_ATTR_USE_LLC_NWA, &llc_nwa);
++		dev_info(&cb_pdev->dev,
++			"aspace '%s': DOMAIN_ATTR_USE_LLC_NWA early = %d (0 means accepted)\n",
++			cb_name, ret);
++		ret = 0;
++	}
++
++	/*
++	 * TEMPORARY image 149 -- PROMOTE IFF STABILITY IMPROVES. GMU
++	 * firmware sporadically DMAs to garbage IOVAs (0x55555561-class,
++	 * 3 samples); a fatal fault panics the run before retry can engage.
++	 * Non-fatal turns those into dev_err + waiter timeout, which the
++	 * bounded retry recovers. Real mapping bugs still log loudly.
++	 */
++	{
++		int nonfatal = 1;
++
++		ret = iommu_domain_set_attr(cb->domain,
++			DOMAIN_ATTR_NON_FATAL_FAULTS, &nonfatal);
++		if (ret)
++			dev_err(&cb_pdev->dev,
++				"non-fatal faults unsupported for '%s': %d\n",
++				cb_name, ret);
++	}
++
++	ret = iommu_attach_device(cb->domain, &cb_pdev->dev);
++	if (ret) {
++		dev_err(&cb_pdev->dev,
++			"iommu_attach_device failed for '%s': %d\n",
++			cb_name, ret);
++		goto err_domain;
++	}
++
++	mmu_dbg(&cb_pdev->dev,
++		"cb '%s' (%pOF) attached, domain=%p aperture=0x%llx-0x%llx\n",
++		cb_name, cb_node, cb->domain,
++		(unsigned long long)cb->domain->geometry.aperture_start,
++		(unsigned long long)cb->domain->geometry.aperture_end);
++
++	/*
++	 * IMAGE 278 -- tell the secure world which SMMU aperture the GPU may
++	 * use.  CAF does this for the *user* context only (KGSL_IOMMU_CONTEXT_
++	 * USER), so it is restricted to gfx3d_user here as well.
++	 */
++	if (smmu_aperture_cb > -2 && !strcmp(cb_name, "gfx3d_user")) {
++		struct scm_desc desc = {0};
++		u32 cb_num = 0;
++		int attr_ret;
++		int scm_ret;
++		int avail;
++
++		if (smmu_aperture_cb >= 0) {
++			cb_num = smmu_aperture_cb;
++		} else {
++			attr_ret = iommu_domain_get_attr(cb->domain,
++					DOMAIN_ATTR_CONTEXT_BANK, &cb_num);
++			if (attr_ret) {
++				dev_err(&cb_pdev->dev,
++					"aperture: DOMAIN_ATTR_CONTEXT_BANK unavailable (%d), using 0\n",
++					attr_ret);
++				cb_num = 0;
++			}
++		}
++
++		desc.args[0] = 0xFFFF0000 |
++			((MSM_APERTURE_CP_APERTURE_REG & 0xff) << 8) |
++			(cb_num & 0xff);
++		desc.args[1] = 0xFFFFFFFF;
++		desc.args[2] = 0xFFFFFFFF;
++		desc.args[3] = 0xFFFFFFFF;
++		desc.arginfo = SCM_ARGS(4);
++
++		avail = scm_is_call_available(SCM_SVC_MP,
++				MSM_APERTURE_SCM_CMD_ID);
++		scm_ret = scm_call2(SCM_SIP_FNID(SCM_SVC_MP,
++				MSM_APERTURE_SCM_CMD_ID), &desc);
++
++		pr_info("SECVID278: aperture SCM: cb=%u forced=%d avail=%d ret=%d (arg0=0x%08x)\n",
++			cb_num, smmu_aperture_cb, avail, scm_ret,
++			desc.args[0]);
++	}
++
++	return 0;
++
++err_domain:
++	iommu_domain_free(cb->domain);
++	cb->domain = NULL;
++err:
++	of_node_put(cb_node);
++	memset(cb, 0, sizeof(*cb));
++	return ret;
++}
++
++static void msm_gpu_cb_release(struct msm_gpu_cb *cb)
++{
++	if (!cb->cb_pdev)
++		return;
++
++	if (cb->domain) {
++		if (!cb->domain_owned) {
++			iommu_detach_device(cb->domain, &cb->cb_pdev->dev);
++			iommu_domain_free(cb->domain);
++		}
++		/* if owned, the mmu's destroy() frees the domain */
++	}
++
++	if (cb->node)
++		of_node_put(cb->node);
++
++	memset(cb, 0, sizeof(*cb));
++}
++
++/*
++ * Build an address space on top of a context bank.
++ *
++ * This tree's msm_gem_address_space_create() takes (dev, domain, name) and
++ * derives the IOVA window from the IOMMU domain's aperture, which is why it
++ * differs from the upstream (mmu, name, start, end) form. There is no separate
++ * mmu handle to return here: the address space owns the mmu.
++ *
++ * On success the address space owns the domain via its mmu, so the domain must
++ * NOT be freed here.
++ */
++struct msm_gem_address_space *msm_gpu_aspace_new(const char *cb_name,
++		const char *aspace_name)
++{
++	struct msm_gpu_cb cb;
++	struct msm_gem_address_space *aspace;
++	int ret;
++
++	ret = msm_gpu_cb_get(cb_name, &cb);
++	if (ret)
++		return ERR_PTR(ret);
++
++	/*
++	 * IMAGE 234 -- give the GPU domain a non-zero IOVA base.
++	 *
++	 * MEASURED (image 233): the aperture came up as 0x0-0x7fffffffff, so
++	 * drm_mm handed the first allocation -- the memptrs object -- iova 0,
++	 * and rbmemptr(ring, fence) evaluated to 0 + offsetof(fence) == 0x4.
++	 * That is the address a6xx_cache_flush_ts() programs into
++	 * CACHE_FLUSH_TS as the completed-fence write target, so the GPU was
++	 * told to echo the fence somewhere other than the memptrs BO.
++	 * memptrs->fence stayed frozen at its bring-up value, a6xx_last_fence()
++	 * returned that frozen value, and hangcheck_handler() declared LOCKUP
++	 * on every tick despite the CP demonstrably executing (ring pointer
++	 * advancing +15 dwords per check, DIAG231 all-clean).
++	 *
++	 * 0x7fffffffff is worth noting: arm-smmu clamps its aperture to
++	 * 4GB-1 (arm-smmu.c:2302-2303), so that value is dma-iopmu's 39-bit
++	 * default, not an SMMU aperture. See the IMAGE234 note below.
++	 *
++	 * Value is NOT invented. It is CAF's documented 64-bit user/SVM base:
++	 *   /home/usb/ShinyKernel/Kernel/drivers/gpu/msm/kgsl_iommu.h:39
++	 *     #define KGSL_IOMMU_SVM_BASE64  0x700000000ULL
++	 * CAF selects 32 vs 64 bit from the DT feature "qcom,force-32bit"
++	 * (kgsl_iommu.c:3068). arch/arm64/boot/dts/qcom/sm8150-gpu.dtsi does
++	 * NOT set that property, so d2q runs the 64-bit path and
++	 * KGSL_IOMMU_SVM_BASE64 is the correct base.
++	 */
++#define MSM_GPU_IOVA_BASE_64	0x700000000ULL
++
++	if (cb.domain->geometry.aperture_start == 0) {
++		u64 base = MSM_GPU_IOVA_BASE_64;
++
++		if (cb.domain->geometry.aperture_end <= base) {
++			/* window would be empty; leave the aperture alone */
++			dev_err(&cb.cb_pdev->dev,
++				"aspace '%s': aperture end 0x%llx <= base 0x%llx, not rebasing\n",
++				aspace_name,
++				(unsigned long long)cb.domain->geometry.aperture_end,
++				(unsigned long long)base);
++		} else {
++			cb.domain->geometry.aperture_start = base;
++			dev_info(&cb.cb_pdev->dev,
++				"aspace '%s': rebasing aperture 0x0 -> 0x%llx (end 0x%llx)\n",
++				aspace_name, (unsigned long long)base,
++				(unsigned long long)cb.domain->geometry.aperture_end);
++		}
++	}
++
++	/*
++	 * IMAGE 236 REVERTED -- DOMAIN_ATTR_USE_LLC_NWA is a NO-OP here.
++	 *
++	 * CAF sets it for a640 (vendor kgsl_iommu.c:1270-1296), but on this tree
++	 * iommu_domain_set_attr() returns -EBUSY: by the time msm_gpu_aspace_new()
++	 * runs, iommu_attach_device() has already let
++	 * arm_smmu_domain_finalise_s1() build the page-table format, and the
++	 * attribute can no longer be applied.
++	 *
++	 * So the LLC_NWA hypothesis was NEVER actually tested. To test it the
++	 * attribute must be set earlier, in msm_gpu_cb_get() before
++	 * iommu_attach_device(). That is an ordering change, not a one-liner.
++	 *
++	 * Kept as a comment so it is not re-derived. The companion change to the
++	 * mapping flags in msm_gem_vma.c was reverted too -- it broke bring-up.
++	 */
++	aspace = msm_gem_address_space_create(&cb.cb_pdev->dev, cb.domain,
++			aspace_name);
++	if (IS_ERR(aspace)) {
++		msm_gpu_cb_release(&cb);
++		return aspace;
++	}
++
++	/*
++	 * Attach the MMU to the device.
++	 *
++	 * msm_gpu_create_address_space() normally does this after creating the
++	 * address space. When the adapter supplies gpu->aspace, msm_gpu_init()
++	 * skips that function entirely, so the attach has to happen here or the
++	 * SMMU is allocated but never attached to the client device.
++	 */
++	ret = aspace->mmu->funcs->attach(aspace->mmu, NULL, 0);
++	if (ret) {
++		dev_err(&cb.cb_pdev->dev,
++			"failed to attach MMU for '%s': %d\n", cb_name, ret);
++		msm_gem_address_space_put(aspace);
++		msm_gpu_cb_release(&cb);
++		return ERR_PTR(ret);
++	}
++
++	mmu_dbg(&cb.cb_pdev->dev,
++		"aspace '%s' on cb '%s': iova 0x%llx-0x%llx\n",
++		aspace_name, cb_name,
++		(unsigned long long)cb.domain->geometry.aperture_start,
++		(unsigned long long)cb.domain->geometry.aperture_end);
++
++	/* the aspace's mmu destroy() frees the domain */
++	cb.domain_owned = true;
++	msm_gpu_cb_release(&cb);
++
++	return aspace;
++}
++
++/*
++ * Variant for callers that want the raw domain. The A640 GMU code maps its
++ * HFI/icache/dcache buffers with iommu_map() directly rather than through GEM.
++ *
++ * The caller takes ownership of the domain and must
++ * iommu_detach_device() + iommu_domain_free() it.
++ */
++int msm_gpu_cb_domain_get(const char *cb_name, struct iommu_domain **domain,
++		struct device **dev)
++{
++	struct msm_gpu_cb cb;
++	int ret;
++
++	ret = msm_gpu_cb_get(cb_name, &cb);
++	if (ret)
++		return ret;
++
++	*domain = cb.domain;
++	*dev = &cb.cb_pdev->dev;
++
++	/* caller owns the domain; drop only our node reference */
++	cb.domain_owned = true;
++	msm_gpu_cb_release(&cb);
++
++	return 0;
++}
++
++void msm_gpu_cb_domain_put(struct iommu_domain *domain, struct device *dev)
++{
++	if (!domain)
++		return;
++
++	iommu_detach_device(domain, dev);
++	iommu_domain_free(domain);
++}
+\ В конце файла нет новой строки

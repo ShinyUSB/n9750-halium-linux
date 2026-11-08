@@ -1,0 +1,1126 @@
+--- /dev/null
++++ b/drivers/gpu/drm/msm/adreno/a6xx_hfi.c
+@@ -0,0 +1,1123 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2017-2018 The Linux Foundation. All rights reserved. */
++
++#include <linux/completion.h>
++#include <linux/circ_buf.h>
++#include <linux/list.h>
++
++#include "a6xx_gmu.h"
++#include "a6xx_gmu.xml.h"
++
++#define HFI_MSG_ID(val) [val] = #val
++
++/*
++ * TEMPORARY image-107 diagnostics -- REMOVE AFTER RESULT. One-shot snapshots
++ * of the FW_VERSION transaction state. Work items fire once and only log;
++ * they never touch queues, registers (other than reads), or timeouts.
++ */
++static struct delayed_work hfi_snap_1ms_work;
++static struct delayed_work hfi_snap_100ms_work;
++static struct a6xx_gmu *hfi_snap_gmu;
++
++static void hfi_snap_show(struct a6xx_gmu *gmu, const char *when)
++{
++	struct a6xx_hfi_queue *q0 = &gmu->queues[0];
++	struct a6xx_hfi_queue *q1 = &gmu->queues[1];
++
++	pr_info("HFI-SNAP %s q0 rd=%u wr=%u q1 rd=%u wr=%u INTR_INFO=0x%x RAW=0x%x INFO0=0x%x INFO1=0x%x\n",
++		when, q0->header->read_index, q0->header->write_index,
++		q1->header->read_index, q1->header->write_index,
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_INFO_0),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_INFO_1));
++}
++
++static void hfi_snap_1ms_fn(struct work_struct *work)
++{
++	hfi_snap_show(hfi_snap_gmu, "C+1ms");
++}
++
++static void hfi_snap_100ms_fn(struct work_struct *work)
++{
++	hfi_snap_show(hfi_snap_gmu, "D+100ms");
++}
++
++static const char * const a6xx_hfi_msg_id[] = {
++	HFI_MSG_ID(HFI_H2F_MSG_INIT),
++	HFI_MSG_ID(HFI_H2F_MSG_FW_VERSION),
++	HFI_MSG_ID(HFI_H2F_MSG_BW_TABLE),
++	HFI_MSG_ID(HFI_H2F_MSG_PERF_TABLE),
++	HFI_MSG_ID(HFI_H2F_MSG_TEST),
++	HFI_MSG_ID(HFI_H2F_MSG_START),
++	HFI_MSG_ID(HFI_H2F_MSG_CORE_FW_START),
++	HFI_MSG_ID(HFI_H2F_MSG_FEATURE_CTRL),
++	HFI_MSG_ID(HFI_H2F_MSG_GX_BW_PERF_VOTE),
++};
++
++static int a6xx_hfi_queue_read(struct a6xx_gmu *gmu,
++		struct a6xx_hfi_queue *queue, u32 *data,
++		u32 dwords)
++{
++	struct a6xx_hfi_queue_header *header = queue->header;
++	u32 i, hdr, index = header->read_index;
++	int k;
++	/*
++	 * TEMPORARY image-108 diagnostics -- REMOVE AFTER RESULT. Snapshot the
++	 * response-queue state and ring contents BEFORE the BUG_ON below.
++	 * Read-only: no index advance, no queue writes, no size clamping.
++	 */
++	pr_info("HFI-RD hdr: status=%u iova=0x%x type=0x%x size=0x%x msg=%u drop=%u rxwm=%u txwm=%u rxrq=%u txrq=%u rd=%u wr=%u\n",
++		header->status, header->iova, header->type, header->size,
++		header->msg_size, header->dropped, header->rx_watermark,
++		header->tx_watermark, header->rx_request, header->tx_request,
++		header->read_index, header->write_index);
++	pr_info("HFI-RD ring[0..31]:");
++	for (k = 0; k < 32; k++)
++		pr_cont(" %08x", queue->data[k]);
++	pr_cont("\n");
++	{
++		u32 h0 = queue->data[index];
++		u32 span = (header->write_index - header->read_index +
++			header->size) % header->size;
++		pr_info("HFI-RD at rd=%u: hdr=0x%08x id=%u type=%u size=%u seq=%u next3=%08x %08x %08x span=%u dwords=%u\n",
++			index, h0, h0 & 0xff, (h0 >> 16) & 0xf,
++			(h0 >> 8) & 0xff, (h0 >> 20) & 0xfff,
++			queue->data[(index + 1) % header->size],
++			queue->data[(index + 2) % header->size],
++			queue->data[(index + 3) % header->size],
++			span, dwords);
++	}
++
++	if (header->read_index == header->write_index) {
++		header->rx_request = 1;
++		return 0;
++	}
++
++	hdr = queue->data[index];
++
++	pr_info("HFI_RX index=%u hdr=0x%08x id=%u type=%u size=%u seq=%u\n",
++		index, hdr, HFI_HEADER_ID(hdr), HFI_HEADER_TYPE(hdr),
++		HFI_HEADER_SIZE(hdr), HFI_HEADER_SEQNUM(hdr));
++
++	/*
++	 * TEMPORARY image-112 diagnostics -- REMOVE AFTER RESULT. Sole caller
++	 * is the response-queue tasklet (queue 1). Read-only dump of the exact
++	 * packet at read_index BEFORE the BUG_ON below; no advance, no clamp.
++	 */
++	{
++		u32 avail = (header->write_index - header->read_index +
++			header->size) % header->size;
++		u32 decl = HFI_HEADER_SIZE(hdr);
++		u32 n = decl < 32 ? decl : 32;
++		u32 k;
++		pr_info("=== HFI PRE-BUG PACKET ===\n");
++		pr_info("HFI-PRE queue=1(response) index=%u queue_size=%u\n",
++			index, header->size);
++		pr_info("HFI-PRE hdr=0x%08x id=%u type=%u size=%u seq=%u\n",
++			hdr, HFI_HEADER_ID(hdr), HFI_HEADER_TYPE(hdr),
++			decl, HFI_HEADER_SEQNUM(hdr));
++		pr_info("HFI-PRE q1 rd=%u wr=%u available=%u declared=%u dwords=%u\n",
++			header->read_index, header->write_index,
++			avail, decl, dwords);
++		pr_info("HFI-PRE ring@%u:", index);
++		for (k = 0; k < n; k++)
++			pr_cont(" %08x",
++				queue->data[(index + k) % header->size]);
++		pr_cont("\n");
++	}
++
++	/*
++	 * TEMPORARY image 125 -- vendor HFI-v2 parity. An oversized packet
++	 * is logged and returned as -EMSGSIZE, never BUGs. The queue index
++	 * is not advanced and the packet is not reinterpreted.
++	 */
++	if (HFI_HEADER_SIZE(hdr) > dwords) {
++		pr_info("HFI_RX OVERSIZE index=%u hdr=0x%08x size=%u max=%u\n",
++			index, hdr, HFI_HEADER_SIZE(hdr), dwords);
++		dev_err(gmu->dev,
++			"HFI response size %u exceeds reader capacity %u\n",
++			HFI_HEADER_SIZE(hdr), dwords);
++		return -EMSGSIZE;
++	}
++
++	for (i = 0; i < HFI_HEADER_SIZE(hdr); i++) {
++		data[i] = queue->data[index];
++		index = (index + 1) % header->size;
++	}
++
++	/*
++	 * TEMPORARY image 125 -- vendor HFI-v2 parity: 4-dword alignment
++	 * after each packet (this tree has no gmu->ver.hfi; !legacy is the
++	 * established HFI-v2 discriminator). Not applied to HFI v1.
++	 */
++	if (!gmu->legacy) {
++		u32 raw_end = index;
++		u32 aligned = ALIGN(raw_end, SZ_4) % header->size;
++		pr_info("HFI_RX advance old=%u raw_end=%u aligned=%u\n",
++			header->read_index, raw_end, aligned);
++		index = aligned;
++	}
++
++	header->read_index = index;
++	return HFI_HEADER_SIZE(hdr);
++}
++
++static int a6xx_hfi_queue_write(struct a6xx_gmu *gmu,
++	struct a6xx_hfi_queue *queue, u32 *data, u32 dwords)
++{
++	struct a6xx_hfi_queue_header *header = queue->header;
++	u32 i, space, index = header->write_index;
++
++	spin_lock(&queue->lock);
++
++	space = CIRC_SPACE(header->write_index, header->read_index,
++		header->size);
++	if (space < dwords) {
++		header->dropped++;
++		spin_unlock(&queue->lock);
++		return -ENOSPC;
++	}
++
++	for (i = 0; i < dwords; i++) {
++		queue->data[index] = data[i];
++		index = (index + 1) % header->size;
++	}
++
++	/*
++	 * TEMPORARY image 200 -- PROMOTE IF THE FLICKER STOPS.
++	 *
++	 * Barrier #1: payload -> write_index. MISSING until now.
++	 *
++	 * CAF KGSL has THREE ordered barriers on the transmit path; this port
++	 * had one (image 195 added the index->doorbell one). The first is:
++	 *
++	 *   hfi_update_write_idx:
++	 *       write payload into queue[...]
++	 *       wmb();                       <-- payload -> index
++	 *       *write_idx = index;
++	 *   hfi_update_write_idx again:
++	 *       wmb();                       <-- index -> doorbell
++	 *   a6xx_hfi_cmdq_write:
++	 *       wmb();
++	 *       HOST2GMU_INTR_SET = 0x1;
++	 *
++	 * CAF's comment at kgsl_hfi.c:175 states the invariant precisely:
++	 * "make sure packet AND WRITE INDEX are written before an interrupt
++	 * is raised" -- i.e. two orderings, not one.
++	 *
++	 * Without it the payload stores and the index publish are not ordered
++	 * against each other. The GMU can observe write_index advance (the
++	 * queue looks non-empty) while still reading stale payload, or miss
++	 * the payload entirely. Either way it never gets to a valid request,
++	 * which is exactly the observed "HFI-ACK 6 times once, timeout
++	 * otherwise".
++	 */
++	wmb();
++
++	header->write_index = index;
++	spin_unlock(&queue->lock);
++
++	/*
++	 * TEMPORARY image 195 -- PROMOTE IF THE HFI REPLY ARRIVES.
++	 *
++	 * Write barrier, ported from CAF KGSL kgsl_hfi.c:170-182, which this
++	 * port had DROPPED. CAF's own comment states the invariant:
++	 *
++	 *   hdr->write_index = write;
++	 *   ...
++	 *   "Memory barrier to make sure packet and write index are written
++	 *    before an interrupt is raised"
++	 *   wmb();
++	 *   adreno_write_gmureg(... GMU_HOST2GMU_INTR_SET, 0x1);
++	 *
++	 * Without it the queue stores and the write_index publish can still be
++	 * sitting in the CPU's write-combine buffer when the doorbell MMIO
++	 * write lands. The GMU is kicked, reads the queue, and sees the OLD
++	 * (zero) contents -- so read_index == write_index, nothing to do, and
++	 * it goes back to sleep. That matches the observed signature exactly:
++	 *
++	 *   HFI-T ... q0 rd=0 wr=2 ... hfi_irqs=0(+0) gmu_irqs=0(+0)
++	 *          INTR_INFO=0x0 H2G_RAW=0x0
++	 *   HFI-E q1resp: 00000000 (empty)
++	 *
++	 * -- a doorbell that was delivered and consumed (H2G_RAW back to 0)
++	 * but a command the GMU never actually saw. Our own log line
++	 * "doorbell=0x01" is a hardcoded printf literal, not a register
++	 * readback, so it was never evidence that the kick worked.
++	 */
++	wmb();
++
++	gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 0x01);
++	return 0;
++}
++
++struct a6xx_hfi_response {
++	u32 id;
++	u32 seqnum;
++	struct list_head node;
++	struct completion complete;
++
++	u32 error;
++	u32 payload[16];
++};
++
++/*
++ * Incoming HFI ack messages can come in out of order so we need to store all
++ * the pending messages on a list until they are handled.
++ */
++extern unsigned long bw124_gmu_irqs;
++extern unsigned long bw124_hfi_irqs;
++bool a6xx_hfi_bw_sent;
++static unsigned long hfi_send_irq_base;
++static unsigned long hfi_send_gmu_irq_base;
++
++extern bool skip_bw;
++
++static spinlock_t hfi_ack_lock = __SPIN_LOCK_UNLOCKED(message_lock);
++static LIST_HEAD(hfi_ack_list);
++
++static void a6xx_hfi_handle_ack(struct a6xx_gmu *gmu,
++		struct a6xx_hfi_msg_response *msg)
++{
++	struct a6xx_hfi_response *resp;
++	u32 id, seqnum;
++
++	/* msg->ret_header contains the header of the message being acked */
++	id = HFI_HEADER_ID(msg->ret_header);
++	seqnum = HFI_HEADER_SEQNUM(msg->ret_header);
++
++	spin_lock(&hfi_ack_lock);
++	list_for_each_entry(resp, &hfi_ack_list, node) {
++		/*
++		 * TEMPORARY image 157 -- PROMOTE IF VOTE COMPLETES. Vendor
++		 * matches ACKs by SEQNUM ONLY (receive_ack_cmd); our extra
++		 * id check drops legitimate answers whose ret_id differs
++		 * (observed: vote answered with ret_id=239). Sequential
++		 * sends make seqnum unique in practice.
++		 */
++		if (resp->seqnum == seqnum) {
++			if (resp->id != id)
++				pr_info("HFI-ACK idmismatch: waiter id=%u got ret_id=%u seq=%u error=%u (accepted by seq)\n",
++					resp->id, id, seqnum, msg->error);
++			resp->error = msg->error;
++			memcpy(resp->payload, msg->payload,
++				sizeof(resp->payload));
++
++			complete(&resp->complete);
++			spin_unlock(&hfi_ack_lock);
++			return;
++		}
++	}
++	spin_unlock(&hfi_ack_lock);
++
++	dev_err(gmu->dev, "Nobody was waiting for HFI message %d\n", seqnum);
++}
++
++static void a6xx_hfi_handle_error(struct a6xx_gmu *gmu,
++		struct a6xx_hfi_msg_response *msg)
++{
++	struct a6xx_hfi_msg_error *error = (struct a6xx_hfi_msg_error *) msg;
++
++	dev_err(gmu->dev, "GMU firmware error %d\n", error->code);
++}
++
++void a6xx_hfi_task(unsigned long data)
++{
++	struct a6xx_gmu *gmu = (struct a6xx_gmu *) data;
++	struct a6xx_hfi_queue *queue = &gmu->queues[HFI_RESPONSE_QUEUE];
++	struct a6xx_hfi_msg_response resp;
++
++	for (;;) {
++		u32 id;
++		int ret;
++		pr_info("HFI-ITER q1 rd=%u wr=%u\n",
++			queue->header->read_index, queue->header->write_index);
++		ret = a6xx_hfi_queue_read(gmu, queue, (u32 *) &resp,
++			sizeof(resp) >> 2);
++
++		/* Returns the number of bytes copied or negative on error */
++		if (ret <= 0) {
++			if (ret < 0)
++				dev_err(gmu->dev,
++					"Unable to read the HFI message queue\n");
++			break;
++		}
++
++		id = HFI_HEADER_ID(resp.header);
++
++		/* TEMPORARY image-111 diagnostics -- REMOVE AFTER RESULT. */
++		{
++			struct a6xx_hfi_queue *rq = &gmu->queues[HFI_RESPONSE_QUEUE];
++			u32 *rw = (u32 *) &resp;
++			int k, n = HFI_HEADER_SIZE(resp.header);
++			if (n > 19)
++				n = 19;
++			pr_info("HFI RX: header=0x%08x id=%u type=%u size=%u seq=%u\n",
++				resp.header, id,
++				HFI_HEADER_TYPE(resp.header),
++				HFI_HEADER_SIZE(resp.header),
++				HFI_HEADER_SEQNUM(resp.header));
++			pr_info("HFI RX: q1 rd=%u wr=%u words:",
++				rq->header->read_index, rq->header->write_index);
++			for (k = 0; k < n; k++)
++				pr_cont(" %08x", rw[k]);
++			pr_cont("\n");
++			if (HFI_HEADER_TYPE(resp.header) == HFI_MSG_ACK)
++				pr_info("HFI RX: ack ret_id=%u ret_type=%u ret_size=%u ret_seq=%u error=%u\n",
++					HFI_HEADER_ID(resp.ret_header),
++					HFI_HEADER_TYPE(resp.ret_header),
++					HFI_HEADER_SIZE(resp.ret_header),
++					HFI_HEADER_SEQNUM(resp.ret_header),
++					resp.error);
++			if (id == HFI_F2H_MSG_ERROR)
++				pr_info("HFI RX: ERROR code=%u payload=%08x %08x\n",
++					resp.error, resp.payload[0], resp.payload[1]);
++			if (a6xx_hfi_bw_sent) {
++				a6xx_hfi_bw_sent = false;
++				pr_info("=== HFI RX AFTER BW ===\n");
++			}
++		}
++
++		/*
++		 * TEMPORARY experiment image 109 -- REMOVE OR PROMOTE ON RESULT.
++		 * HFI v2 ACKs carry type == HFI_MSG_ACK with the acked command's
++		 * id/seqnum in ret_header; dispatching on id == 126 misses them.
++		 */
++		if (HFI_HEADER_TYPE(resp.header) == HFI_MSG_ACK) {
++			pr_info("HFI-ACK id=%u seq=%u error=%u\n", id,
++				HFI_HEADER_SEQNUM(resp.header), resp.error);
++			a6xx_hfi_handle_ack(gmu, &resp);
++		} else if (id == HFI_F2H_MSG_ERROR)
++			a6xx_hfi_handle_error(gmu, &resp);
++	}
++}
++
++static int a6xx_hfi_send_msg(struct a6xx_gmu *gmu, int id,
++		void *data, u32 size, u32 *payload, u32 payload_size)
++{
++	struct a6xx_hfi_queue *queue = &gmu->queues[HFI_COMMAND_QUEUE];
++	struct a6xx_hfi_response resp = { 0 };
++	int ret, dwords = size >> 2;
++	u32 seqnum;
++
++	seqnum = atomic_inc_return(&queue->seqnum) % 0xfff;
++
++	/* First dword of the message is the message header - fill it in */
++	*((u32 *) data) = (seqnum << 20) | (HFI_MSG_CMD << 16) |
++		(dwords << 8) | id;
++
++	init_completion(&resp.complete);
++	resp.id = id;
++	resp.seqnum = seqnum;
++
++	spin_lock_bh(&hfi_ack_lock);
++	list_add_tail(&resp.node, &hfi_ack_list);
++	spin_unlock_bh(&hfi_ack_lock);
++
++	if (id == HFI_H2F_MSG_FW_VERSION) {
++		struct a6xx_hfi_queue *q0 = &gmu->queues[0];
++		int k;
++		pr_info("HFI-A fw_version pre-write q0 rd=%u wr=%u msg=",
++			q0->header->read_index, q0->header->write_index);
++		for (k = 0; k < 8 && k < (int)dwords; k++)
++			pr_cont(" %08x", ((u32 *)data)[k]);
++		pr_cont("\n");
++	}
++	ret = a6xx_hfi_queue_write(gmu, queue, data, dwords);
++	hfi_send_irq_base = bw124_hfi_irqs;
++	hfi_send_gmu_irq_base = bw124_gmu_irqs;
++	if (id == HFI_H2F_MSG_FW_VERSION && !ret) {
++		struct a6xx_hfi_queue *q0 = &gmu->queues[0];
++		int k;
++		pr_info("HFI-B fw_version post-write q0 rd=%u wr=%u doorbell=0x01 data=",
++			q0->header->read_index, q0->header->write_index);
++		for (k = 0; k < 8 && k < (int)dwords; k++)
++			pr_cont(" %08x", q0->data[k]);
++		pr_cont("\n");
++		hfi_snap_gmu = gmu;
++		INIT_DELAYED_WORK(&hfi_snap_1ms_work, hfi_snap_1ms_fn);
++		INIT_DELAYED_WORK(&hfi_snap_100ms_work, hfi_snap_100ms_fn);
++		schedule_delayed_work(&hfi_snap_1ms_work, msecs_to_jiffies(1));
++		schedule_delayed_work(&hfi_snap_100ms_work, msecs_to_jiffies(100));
++	}
++	if (ret) {
++		dev_err(gmu->dev, "Unable to send message %s id %d\n",
++			a6xx_hfi_msg_id[id], seqnum);
++		goto out;
++	}
++
++	/*
++	 * TEMPORARY image 201 -- PROMOTE IF HFI STOPS TIMING OUT.
++	 *
++	 * Poll GMU2HOST_INTR_INFO for the MSGQ bit instead of waiting on IRQ
++	 * completion, matching CAF KGSL (adreno_a6xx_hfi.c,
++	 * a6xx_hfi_send_cmd_wait_inline polls INTR_INFO for BIT0 with a 1000ms
++	 * timeout; upstream msm does the same).
++	 *
++	 * We used to wait here on wait_for_completion_timeout(&resp.complete),
++	 * signalled via hardIRQ -> tasklet -> complete(). That chain has three
++	 * links that can each silently drop the wakeup: the GIC delivery, the
++	 * tasklet scheduling, and the completion itself. CAF deliberately
++	 * excludes MSGQ from its IRQ mask (HFI_IRQ_MASK has no BIT0) and polls
++	 * instead -- so an interrupt-driven wait on this path is itself a
++	 * porting bug regardless of outcome.
++	 *
++	 * This keeps the completion short-circuit (if the IRQ path did fire,
++	 * take the answer immediately) and otherwise polls INTR_INFO directly,
++	 * draining through the same a6xx_hfi_task() the tasklet runs. The
++	 * tasklet is disabled around the direct drain so a concurrently
++	 * scheduled instance cannot race it on the response queue.
++	 *
++	 * Decision rule for the result: if this still times out with
++	 * INTR_INFO == 0x0, the firmware genuinely never posts, and the problem
++	 * is inside the firmware's view of memory -- not barriers, not waits.
++	 */
++	{
++		unsigned long deadline =
++			jiffies + msecs_to_jiffies(5000);
++
++		ret = 0;
++		for (;;) {
++			if (completion_done(&resp.complete)) {
++				ret = 1;
++				break;
++			}
++			if (gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO) &
++				A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ) {
++				tasklet_disable(&gmu->hfi_tasklet);
++				a6xx_hfi_task((unsigned long) gmu);
++				tasklet_enable(&gmu->hfi_tasklet);
++				continue;
++			}
++			if (time_after(jiffies, deadline))
++				break;
++			usleep_range(100, 200);
++		}
++		pr_info("HFI-POLL id=%d seq=%u completed=%d INTR_INFO=0x%x\n",
++			id, seqnum, !!ret,
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	}
++	if (!ret) {
++		struct a6xx_hfi_queue *tq0 = &gmu->queues[0];
++		struct a6xx_hfi_queue *tq1 = &gmu->queues[1];
++		dev_err(gmu->dev,
++			"Message %s id %d timed out waiting for response\n",
++			a6xx_hfi_msg_id[id], seqnum);
++		/* TEMPORARY image 151 timeout forensics -- every message. */
++		pr_info("HFI-T id=%d seq=%u q0 rd=%u wr=%u q1 rd=%u wr=%u hfi_irqs=%lu(+%lu) gmu_irqs=%lu(+%lu) INTR_INFO=0x%x MASK=0x%x H2G_RAW=0x%x\n",
++			id, seqnum,
++			tq0->header->read_index, tq0->header->write_index,
++			tq1->header->read_index, tq1->header->write_index,
++			bw124_hfi_irqs, bw124_hfi_irqs - hfi_send_irq_base,
++			bw124_gmu_irqs, bw124_gmu_irqs - hfi_send_gmu_irq_base,
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK),
++			gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO));
++		if (id == HFI_H2F_MSG_FW_VERSION) {
++			struct a6xx_hfi_queue *q0 = &gmu->queues[0];
++			struct a6xx_hfi_queue *q1 = &gmu->queues[1];
++			int k;
++			pr_info("HFI-E fw_version timeout q0 rd=%u wr=%u q1 rd=%u wr=%u INTR_INFO=0x%x\n",
++				q0->header->read_index, q0->header->write_index,
++				q1->header->read_index, q1->header->write_index,
++				gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++			pr_info("HFI-E q0cmd:");
++			for (k = 0; k < 8; k++)
++				pr_cont(" %08x", q0->data[k]);
++			pr_cont("\nHFI-E q1resp:");
++			for (k = 0; k < 16; k++)
++				pr_cont(" %08x", q1->data[k]);
++			pr_cont("\n");
++		}
++		ret = -ETIMEDOUT;
++	} else
++		ret = 0;
++
++out:
++	spin_lock_bh(&hfi_ack_lock);
++	list_del(&resp.node);
++	spin_unlock_bh(&hfi_ack_lock);
++
++	if (ret)
++		return ret;
++
++	if (resp.error) {
++		dev_err(gmu->dev, "Message %s id %d returned error %d\n",
++			a6xx_hfi_msg_id[id], seqnum, resp.error);
++		return -EINVAL;
++	}
++
++	if (payload && payload_size) {
++		int copy = min_t(u32, payload_size, sizeof(resp.payload));
++
++		memcpy(payload, resp.payload, copy);
++	}
++
++	return 0;
++}
++
++static int a6xx_hfi_send_gmu_init(struct a6xx_gmu *gmu, int boot_state)
++{
++	struct a6xx_hfi_msg_gmu_init_cmd msg = { 0 };
++
++	msg.dbg_buffer_addr = (u32) gmu->debug->iova;
++	msg.dbg_buffer_size = (u32) gmu->debug->size;
++	msg.boot_state = boot_state;
++
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_INIT, &msg, sizeof(msg),
++		NULL, 0);
++}
++
++static int a6xx_hfi_get_fw_version(struct a6xx_gmu *gmu, u32 *version)
++{
++	struct a6xx_hfi_msg_fw_version msg = { 0 };
++
++	/* Currently supporting version 1.1 */
++	msg.supported_version = (1 << 28) | (1 << 16);
++
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_FW_VERSION, &msg, sizeof(msg),
++		version, sizeof(*version));
++}
++
++/* HFI v1 perf table (A618/A630). Ported/renamed per upstream v5.8. */
++static int a6xx_hfi_send_perf_table_v1(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_perf_table_v1 msg = { 0 };
++	int i;
++
++	msg.num_gpu_levels = gmu->nr_gpu_freqs;
++	msg.num_gmu_levels = gmu->nr_gmu_freqs;
++
++	for (i = 0; i < gmu->nr_gpu_freqs; i++) {
++		msg.gx_votes[i].vote = gmu->gx_arc_votes[i];
++		msg.gx_votes[i].freq = gmu->gpu_freqs[i] / 1000;
++	}
++
++	for (i = 0; i < gmu->nr_gmu_freqs; i++) {
++		msg.cx_votes[i].vote = gmu->cx_arc_votes[i];
++		msg.cx_votes[i].freq = gmu->gmu_freqs[i] / 1000;
++	}
++
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PERF_TABLE, &msg, sizeof(msg),
++		NULL, 0);
++}
++
++/* HFI v2 perf table (A640/A650). Ported from upstream v5.8. */
++static int a6xx_hfi_send_perf_table(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_perf_table msg = { 0 };
++	int ret, i;
++
++	msg.num_gpu_levels = gmu->nr_gpu_freqs;
++	/*
++	 * TEMPORARY experiment image 120 -- REMOVE OR PROMOTE ON RESULT.
++	 * Fixed CX shape per KGSL HFI-v2 reference: gmu_level_num=2,
++	 * CX0={cx_votes[0],0}, CX1={cx_votes[1],200000kHz}. GX votes/freqs
++	 * untouched; acd set to the established Samsung/Qualcomm sentinel
++	 * 0xffffffff (was implicit 0x0; no platform ACD source exists).
++	 */
++	msg.num_gmu_levels = 2;
++
++	for (i = 0; i < gmu->nr_gpu_freqs; i++) {
++		msg.gx_votes[i].vote = gmu->gx_arc_votes[i];
++		msg.gx_votes[i].acd = 0xffffffff;
++		msg.gx_votes[i].freq = gmu->gpu_freqs[i] / 1000;
++	}
++
++	msg.cx_votes[0].vote = gmu->cx_arc_votes[0];
++	msg.cx_votes[0].freq = 0;
++	msg.cx_votes[1].vote = gmu->cx_arc_votes[1];
++	msg.cx_votes[1].freq = 200000000 / 1000;
++
++	for (i = 0; i < gmu->nr_gpu_freqs; i++)
++		pr_info("PERF120: GX[%d] vote=0x%08x acd=0x%08x freq_khz=%u\n",
++			i, msg.gx_votes[i].vote, msg.gx_votes[i].acd,
++			msg.gx_votes[i].freq);
++	pr_info("PERF120: CX[0] vote=0x%08x freq_khz=%u CX[1] vote=0x%08x freq_khz=%u (old nr_gmu_freqs=%d)\n",
++		msg.cx_votes[0].vote, msg.cx_votes[0].freq,
++		msg.cx_votes[1].vote, msg.cx_votes[1].freq, gmu->nr_gmu_freqs);
++
++	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PERF_TABLE, &msg, sizeof(msg),
++		NULL, 0);
++	pr_info("PERF120: header=0x%08x total_dwords=%u gpu_level_num=%u gmu_level_num=%u ret=%d\n",
++		msg.header, (unsigned)(sizeof(msg) >> 2),
++		msg.num_gpu_levels, msg.num_gmu_levels, ret);
++	return ret;
++}
++
++/* HFI v2 feature control. Vendor KGSL sends ECP disable on the A640 path;
++ * ACD/LM need mailbox/throttle infrastructure this port does not have and are
++ * deliberately not sent here. */
++static int a6xx_hfi_send_feature_ctrl(struct a6xx_gmu *gmu, u32 feature,
++		u32 enable, u32 data)
++{
++	struct a6xx_hfi_msg_feature_ctrl msg = { 0 };
++
++	msg.feature = feature;
++	msg.enable = enable;
++	msg.data = data;
++
++	pr_info("HFI-ECP pkt: feature=%u enable=%u data=0x%08x size=%zu\n",
++		feature, enable, data, sizeof(msg));
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_FEATURE_CTRL, &msg, sizeof(msg),
++		NULL, 0);
++}
++
++/* HFI v2: tell the GMU the core firmware is starting. Ported from v5.8. */
++static int a6xx_hfi_send_core_fw_start(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_core_fw_start msg = { 0 };
++
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_CORE_FW_START, &msg, sizeof(msg),
++		NULL, 0);
++}
++
++/*
++ * HFI v2: final START message. The downstream driver sends this in its
++ * "a6xx_hw_init" equivalent; upstream notes it is harmless to send it here.
++ * Ported from v5.8.
++ */
++static int a6xx_hfi_send_start(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_start msg = { 0 };
++
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_START, &msg, sizeof(msg),
++		NULL, 0);
++}
++
++/* TEMPORARY experiment image 132 -- PROMOTE IF GX TURNS ON. Minimal
++ * A640 GX_BW_PERF_VOTE sender reusing a6xx_hfi_send_msg(); no transport,
++ * queue, or parser change. Logs the exact request dwords pre-submit. */
++int a6xx_hfi_send_gx_vote(struct a6xx_gmu *gmu, u32 ack_type, u32 freq, u32 bw)
++{
++	struct a6xx_hfi_msg_gx_bw_perf_vote msg = { 0 };
++	int ret;
++
++	msg.ack_type = ack_type;
++	msg.freq = freq;
++	msg.bw = bw;
++
++	pr_info("GX_BW_PERF_VOTE: header=0x%08x(id-filled-on-send) ack_type=%u freq=%u bw=%u dwords=%u\n",
++		msg.header, msg.ack_type, msg.freq, msg.bw,
++		(unsigned)(sizeof(msg) >> 2));
++
++	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_GX_BW_PERF_VOTE, &msg,
++		sizeof(msg), NULL, 0);
++	pr_info("GX_BW_PERF_VOTE: header=0x%08x size_dw=%u ret=%d\n",
++		msg.header, HFI_HEADER_SIZE(msg.header), ret);
++	return ret;
++}
++
++/*
++ * IMAGE 225 -- PROMOTE: this is the function that was missing.
++ *
++ * Set the GPU frequency on HFI v2 (A640/A650) firmware.
++ *
++ * Transcribed from upstream v5.8 a6xx_hfi.c:a6xx_hfi_set_freq() and upstream
++ * master (same body, extra bw_index). This is the ONLY instruction in the
++ * whole driver that tells v2 firmware which GX corner to vote for, and
++ * therefore the only one that can cause the GMU to raise the GX rail and
++ * clock gpu_cc_gx_gmu_clk.
++ *
++ * Our port had no equivalent: a6xx_gmu_set_freq() ran the HFI v1 DCVS
++ * register + DCVS-OOB sequence unconditionally. On v2 firmware the DCVS OOB
++ * request bit is not watched, so the request was never consumed and the
++ * firmware was never asked for a GX corner -- it correctly held GX collapsed.
++ * That matches every observation: GMU alive and ACKing HFI, CX domain running,
++ * GX_VOTE_IDX consumed and cleared, and gpu_cc_gx_gmu_clk permanently en=0.
++ */
++int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, int index)
++{
++	struct a6xx_hfi_msg_gx_bw_perf_vote msg = { 0 };
++
++	msg.ack_type = 1;	/* blocking */
++	msg.freq = index;
++	msg.bw = 0;		/* TODO: bus scaling */
++
++	return a6xx_hfi_send_gx_vote(gmu, msg.ack_type, msg.freq, msg.bw);
++}
++
++/*
++ * TEMPORARY image 170 -- PROMOTE with the slumber lifecycle. Nonlegacy
++ * PREPARE_SLUMBER (upstream: zero bw/freq; "TODO: should they be
++ * non-zero?"). ACKed like any other HFI message (bounded by the
++ * standard 5s waiter inside send_msg).
++ */
++int a6xx_hfi_send_prep_slumber(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_prep_slumber msg = { 0 };
++	int ret;
++
++	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PREPARE_SLUMBER, &msg,
++		sizeof(msg), NULL, 0);
++	pr_info("PREPSLUM170: sent ret=%d\n", ret);
++	return ret;
++}
++
++/* TEMPORARY image 124 -- REMOVE AFTER RESULT. BW audit capture. */
++static u32 bw124_q1_rd_before;
++
++static void bw124_decode_span(struct a6xx_gmu *gmu, u32 start, u32 end)
++{
++	u32 i = start, n = 0;
++	while (i != end && n < 256) {
++		u32 w0 = gmu->queues[HFI_RESPONSE_QUEUE].data[i & 1023];
++		u32 id = HFI_HEADER_ID(w0);
++		u32 type = HFI_HEADER_TYPE(w0);
++		u32 size = HFI_HEADER_SIZE(w0);
++		u32 seq = HFI_HEADER_SEQNUM(w0);
++		u32 k, m = size;
++		if (m > 12)
++			m = 12;
++		pr_info("BW124-PKT off=%u header=0x%08x id=%u type=%u size=%u seq=%u\n",
++			i, w0, id, type, size, seq);
++		for (k = 0; k < m; k++)
++			pr_info("BW124-WORD off=%u %08x\n", i + k,
++				gmu->queues[HFI_RESPONSE_QUEUE].data[(i + k) & 1023]);
++		if (type == HFI_MSG_ACK && m >= 3) {
++			u32 rh = gmu->queues[HFI_RESPONSE_QUEUE].data[(i + 1) & 1023];
++			u32 err = gmu->queues[HFI_RESPONSE_QUEUE].data[(i + 2) & 1023];
++			pr_info("BW124-ACK ret_id=%u ret_type=%u ret_size=%u ret_seq=%u error=%u\n",
++				HFI_HEADER_ID(rh), HFI_HEADER_TYPE(rh),
++				HFI_HEADER_SIZE(rh), HFI_HEADER_SEQNUM(rh), err);
++		}
++		if (size == 0)
++			break;
++		i += size;
++		n += size;
++	}
++	pr_info("BW124-SPAN done span_words=%u\n", n);
++}
++
++static void bw124_on_bw_timeout(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_queue *q1 = &gmu->queues[HFI_RESPONSE_QUEUE];
++	u32 rd = q1->header->read_index;
++	u32 wr = q1->header->write_index;
++	pr_info("BW124-TIMEOUT: q1 rd=%u wr=%u hfi_irqs=%lu gmu_irqs=%lu G2HINFO=0x%08x\n",
++		rd, wr, bw124_hfi_irqs, bw124_gmu_irqs,
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	pr_info("BW124-NOTE: G2HRAW absent on this GMU (no such register)\n");
++	bw124_decode_span(gmu, bw124_q1_rd_before, wr);
++}
++static int a6xx_hfi_send_bw_table(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_bw_table msg = { 0 };
++	int i;
++
++	/*
++	 * TEMPORARY experiment image 110 -- REMOVE OR PROMOTE ON RESULT.
++	 * Canonical A640 bring-up table (minimal single "off" entry): same
++	 * shape as before, but ddr_wait 0x01 (was 0x07), ddr addrs[1] 0x5003c
++	 * (was 0x5005c), cnoc_wait 0x01 (was 0x05). All other words identical.
++	 */
++	msg.bw_level_num = 1;
++
++	msg.ddr_cmds_num = 3;
++	msg.ddr_wait_bitmask = 0x01;
++
++	msg.ddr_cmds_addrs[0] = 0x50000;
++	msg.ddr_cmds_addrs[1] = 0x5003c;
++	msg.ddr_cmds_addrs[2] = 0x5000c;
++
++	msg.ddr_cmds_data[0][0] =  0x40000000;
++	msg.ddr_cmds_data[0][1] =  0x40000000;
++	msg.ddr_cmds_data[0][2] =  0x40000000;
++
++	msg.cnoc_cmds_num = 3;
++	msg.cnoc_wait_bitmask = 0x01;
++
++	msg.cnoc_cmds_addrs[0] = 0x50034;
++	msg.cnoc_cmds_addrs[1] = 0x5007c;
++	msg.cnoc_cmds_addrs[2] = 0x5004c;
++
++	msg.cnoc_cmds_data[0][0] =  0x40000000;
++	msg.cnoc_cmds_data[0][1] =  0x00000000;
++	msg.cnoc_cmds_data[0][2] =  0x40000000;
++
++	msg.cnoc_cmds_data[1][0] =  0x60000001;
++	msg.cnoc_cmds_data[1][1] =  0x20000001;
++	msg.cnoc_cmds_data[1][2] =  0x60000001;
++
++	pr_info("BW_TABLE: size=%u bw_levels=%u cnoc_num=%u ddr_num=%u cnoc_wait=0x%x ddr_wait=0x%x\n",
++		(unsigned)(sizeof(msg) >> 2), msg.bw_level_num,
++		msg.cnoc_cmds_num, msg.ddr_cmds_num,
++		msg.cnoc_wait_bitmask, msg.ddr_wait_bitmask);
++	for (i = 0; i < 3; i++)
++		pr_info("BW_TABLE: ddr[%d] addr=0x%x data=0x%x cnoc[%d] addr=0x%x data0=0x%x data1=0x%x\n",
++			i, msg.ddr_cmds_addrs[i], msg.ddr_cmds_data[0][i],
++			i, msg.cnoc_cmds_addrs[i], msg.cnoc_cmds_data[0][i],
++			msg.cnoc_cmds_data[1][i]);
++
++	{
++		struct a6xx_hfi_queue *q0 = &gmu->queues[HFI_COMMAND_QUEUE];
++		struct a6xx_hfi_queue *q1 = &gmu->queues[HFI_RESPONSE_QUEUE];
++		int r, c, ret;
++		pr_info("BW124-SEND: bw_level_num=%u cnoc_num=%u ddr_num=%u cnoc_wait=0x%x ddr_wait=0x%x sizeof_dw=%u\n",
++			msg.bw_level_num, msg.cnoc_cmds_num, msg.ddr_cmds_num,
++			msg.cnoc_wait_bitmask, msg.ddr_wait_bitmask,
++			(unsigned)(sizeof(msg) >> 2));
++		for (c = 0; c < 6; c++)
++			pr_info("BW124-SEND: cnoc_addr[%d]=0x%08x\n", c, msg.cnoc_cmds_addrs[c]);
++		for (r = 0; r < 2; r++)
++			for (c = 0; c < 6; c++)
++				pr_info("BW124-SEND: cnoc_data[%d][%d]=0x%08x\n", r, c, msg.cnoc_cmds_data[r][c]);
++		for (c = 0; c < 8; c++)
++			pr_info("BW124-SEND: ddr_addr[%d]=0x%08x\n", c, msg.ddr_cmds_addrs[c]);
++		for (r = 0; r < (int)msg.bw_level_num; r++)
++			for (c = 0; c < 8; c++)
++				pr_info("BW124-SEND: ddr_data[%d][%d]=0x%08x\n", r, c, msg.ddr_cmds_data[r][c]);
++		pr_info("BW124-Q: q0 rd=%u wr=%u q1 rd=%u wr=%u (before)\n",
++			q0->header->read_index, q0->header->write_index,
++			q1->header->read_index, q1->header->write_index);
++		bw124_q1_rd_before = q1->header->read_index;
++		ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_BW_TABLE, &msg, sizeof(msg),
++			NULL, 0);
++		pr_info("BW124-Q: q0 rd=%u wr=%u q1 rd=%u wr=%u header=0x%08x hdr_size=%u ret=%d (after)\n",
++			q0->header->read_index, q0->header->write_index,
++			q1->header->read_index, q1->header->write_index,
++			msg.header, HFI_HEADER_SIZE(msg.header), ret);
++		if (ret)
++			bw124_on_bw_timeout(gmu);
++		return ret;
++	}
++}
++
++static int a6xx_hfi_send_test(struct a6xx_gmu *gmu)
++{
++	struct a6xx_hfi_msg_test msg = { 0 };
++
++	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_TEST, &msg, sizeof(msg),
++		NULL, 0);
++}
++
++static int a6xx_hfi_start_v1(struct a6xx_gmu *gmu, int boot_state)
++{
++	int ret;
++
++	ret = a6xx_hfi_send_gmu_init(gmu, boot_state);
++	if (ret)
++		return ret;
++
++	ret = a6xx_hfi_get_fw_version(gmu, NULL);
++	if (ret)
++		return ret;
++
++	/*
++	 * We have to get exchange version numbers per the sequence but at this
++	 * point the kernel driver doesn't need to know the exact version of
++	 * the GMU firmware
++	 */
++
++	ret = a6xx_hfi_send_perf_table_v1(gmu);
++	if (ret)
++		return ret;
++
++	ret = a6xx_hfi_send_bw_table(gmu);
++	if (ret)
++		return ret;
++
++	/*
++	 * Let the GMU know that there won't be any more HFI messages until next
++	 * boot
++	 */
++	a6xx_hfi_send_test(gmu);
++
++	return 0;
++}
++
++/*
++ * HFI version dispatch. Ported from upstream v5.8.
++ *
++ * gmu->legacy is set for A618/A630, which speak HFI v1 and use the flat ITCM
++ * firmware image. A640/A650 (legacy == false) speak HFI v2 and use the block
++ * firmware format. Mixing the two fails in confusing ways, so the selection
++ * follows the same flag that selects the firmware format.
++ */
++int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state)
++{
++	int ret;
++
++	if (gmu->legacy)
++		return a6xx_hfi_start_v1(gmu, boot_state);
++
++	/*
++	 * TEMPORARY experiment image 106 -- REMOVE OR PROMOTE ON RESULT.
++	 * Vendor-compatible v2 order: version, perf, bw, ECP feature,
++	 * core_fw_start, start. Stop at the FIRST failing message.
++	 */
++	pr_info("=== FW_VERSION ===\n");
++	pr_info("HFI: verify_fw_version enter\n");
++	ret = a6xx_hfi_get_fw_version(gmu, NULL);
++	pr_info("HFI: verify_fw_version ret=%d\n", ret);
++	if (ret)
++		return ret;
++
++	/*
++	 * TEMPORARY experiment image 117 -- REMOVE OR PROMOTE ON RESULT.
++	 * Full canonical sequence restored (no skips): v2 PERF_TABLE send
++	 * for A640 (upstream v5.8 order). DCVS OOB is gated separately in
++	 * set_oob, not here.
++	 */
++	pr_info("=== PERF_TABLE ===\n");
++	pr_info("HFI: send_perftbl enter\n");
++	ret = a6xx_hfi_send_perf_table(gmu);
++	pr_info("HFI: send_perftbl ret=%d\n", ret);
++	if (ret)
++		return ret;
++
++	pr_info("=== BW_TABLE ===\n");
++	pr_info("HFI: send_bwtbl enter\n");
++	{
++		struct a6xx_hfi_queue *q0 = &gmu->queues[0];
++		struct a6xx_hfi_queue *q1 = &gmu->queues[1];
++		pr_info("=== BW_TABLE SEND BEGIN ===\n");
++		pr_info("HFI BW: q0 rd=%u wr=%u q1 rd=%u wr=%u INTR_INFO=0x%x\n",
++			q0->header->read_index, q0->header->write_index,
++			q1->header->read_index, q1->header->write_index,
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++		a6xx_hfi_bw_sent = true;
++	}
++	/* Canonical A640 BW table from Image 110 (untouched object). */
++	/* TEMPORARY image 145 -- REMOVE AFTER RESULT. Gated BW skip: tests
++	 * whether ECP answers with real ARC votes but no BW state, and
++	 * whether survival changes when firmware never receives the table. */
++	if (skip_bw) {
++		pr_info("BW145: SKIPPED (a6xx.skip_bw=1), continuing as if ACKed\n");
++		ret = 0;
++	} else {
++		ret = a6xx_hfi_send_bw_table(gmu);
++	}
++	pr_info("HFI: send_bwtbl ret=%d\n", ret);
++	if (ret)
++		return ret;
++
++	pr_info("=== ECP ===\n");
++	pr_info("HFI: feature_ctrl ECP enter\n");
++	{
++		struct a6xx_hfi_queue *q0 = &gmu->queues[0];
++		struct a6xx_hfi_queue *q1 = &gmu->queues[1];
++		pr_info("=== ECP SEND ===\n");
++		pr_info("HFI-ECP q0 rd=%u wr=%u q1 rd=%u wr=%u INTR_INFO=0x%x\n",
++			q0->header->read_index, q0->header->write_index,
++			q1->header->read_index, q1->header->write_index,
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	}
++	ret = a6xx_hfi_send_feature_ctrl(gmu, HFI_FEATURE_ECP, 0, 0);
++	pr_info("HFI: feature_ctrl ECP ret=%d\n", ret);
++	if (ret)
++		return ret;
++	pr_info("=== GMU BOOTSTRAP END ===\n");
++	pr_info("HFI: core_fw_start enter\n");
++	ret = a6xx_hfi_send_core_fw_start(gmu);
++	pr_info("HFI: core_fw_start ret=%d\n", ret);
++	if (ret)
++		return ret;
++
++	pr_info("HFI: init_perf_vote(start) enter\n");
++	ret = a6xx_hfi_send_start(gmu);
++	pr_info("HFI: init_perf_vote(start) ret=%d\n", ret);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++void a6xx_hfi_stop(struct a6xx_gmu *gmu)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(gmu->queues); i++) {
++		struct a6xx_hfi_queue *queue = &gmu->queues[i];
++
++		if (!queue->header)
++			continue;
++
++		if (queue->header->read_index != queue->header->write_index)
++			dev_err(gmu->dev, "HFI queue %d is not empty\n", i);
++
++		queue->header->read_index = 0;
++		queue->header->write_index = 0;
++	}
++}
++
++static void a6xx_hfi_queue_init(struct a6xx_hfi_queue *queue,
++		struct a6xx_hfi_queue_header *header, void *virt, u64 iova,
++		u32 id, u32 prio, u32 status)
++{
++	spin_lock_init(&queue->lock);
++	queue->header = header;
++	queue->data = virt;
++	atomic_set(&queue->seqnum, 0);
++
++	/* Set up the shared memory header */
++	header->iova = iova;
++	header->type = prio << 8 | id;
++	header->status = status;
++	header->size = SZ_4K >> 2;
++	header->msg_size = 0;
++	header->dropped = 0;
++	header->rx_watermark = 1;
++	header->tx_watermark = 1;
++	header->rx_request = 1;
++	header->tx_request = 0;
++	header->read_index = 0;
++	header->write_index = 0;
++}
++
++void a6xx_hfi_init(struct a6xx_gmu *gmu)
++{
++	struct a6xx_gmu_bo *hfi = gmu->hfi;
++	struct a6xx_hfi_queue_table_header *table = hfi->virt;
++	struct a6xx_hfi_queue_header *headers = hfi->virt + sizeof(*table);
++	u64 offset;
++	int table_size;
++
++	/*
++	 * The table size is the size of the table header plus all of the queue
++	 * headers
++	 */
++	table_size = sizeof(*table);
++	table_size += (ARRAY_SIZE(gmu->queues) *
++		sizeof(struct a6xx_hfi_queue_header));
++
++	table->version = 0;
++	/*
++	 * TEMPORARY experiment -- REMOVE OR PROMOTE ON RESULT. Vendor KGSL
++	 * documents size in dwords (its 4-queue table reports 0x36 = 216 bytes
++	 * >> 2); the sibling fields below already use >> 2. For our 2-queue
++	 * table: 120 bytes >> 2 = 30 = 0x1E. Queues/layout untouched.
++	 */
++	table->size = table_size >> 2;
++	/* First queue header is located immediately after the table header */
++	table->qhdr0_offset = sizeof(*table) >> 2;
++	table->qhdr_size = sizeof(struct a6xx_hfi_queue_header) >> 2;
++	table->num_queues = ARRAY_SIZE(gmu->queues);
++	table->active_queues = ARRAY_SIZE(gmu->queues);
++
++	/*
++	 * TEMPORARY experiment image 101 -- REMOVE OR PROMOTE ON RESULT.
++	 * Exact vendor KGSL 4-queue topology (CMD/MSG/DBG enabled, DSP defined
++	 * but disabled). Data pages at base+0x1000..+0x4000.
++	 */
++	/* Command queue */
++	offset = SZ_4K;
++	a6xx_hfi_queue_init(&gmu->queues[0], &headers[0], hfi->virt + offset,
++		hfi->iova + offset, 0, 10, 1);
++
++	/* GMU response queue */
++	offset += SZ_4K;
++	a6xx_hfi_queue_init(&gmu->queues[1], &headers[1], hfi->virt + offset,
++		hfi->iova + offset, 1, 10, 1);
++
++	/* Debug queue */
++	offset += SZ_4K;
++	a6xx_hfi_queue_init(&gmu->queues[2], &headers[2], hfi->virt + offset,
++		hfi->iova + offset, 2, 40, 1);
++
++	/* Dispatch queue (defined but disabled, per vendor) */
++	offset += SZ_4K;
++	a6xx_hfi_queue_init(&gmu->queues[3], &headers[3], hfi->virt + offset,
++		hfi->iova + offset, 3, 20, 0);
++}

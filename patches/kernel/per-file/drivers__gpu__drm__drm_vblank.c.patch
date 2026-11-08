@@ -1,0 +1,52 @@
+--- a/drivers/gpu/drm/drm_vblank.c
++++ b/drivers/gpu/drm/drm_vblank.c
+@@ -1069,7 +1069,48 @@
+ 				 msecs_to_jiffies(100));
+ #endif
+ 
+-	WARN(ret == 0, "vblank wait timed out on crtc %i\n", pipe);
++/*
++	 * TEMPORARY image 193 -- REMOVE OR RESTORE ON RESULT.
++	 *
++	 * Why this changed: on Samsung builds the 1000ms branch below was
++	 * already compiled in (CONFIG_DISPLAY_SAMSUNG=y), so the timeout is
++	 * ~1s, NOT 100ms. On every such timeout CAF's crash reporter escalates
++	 * to a real reboot:
++	 *
++	 *   vblank wait timed out on crtc 0
++	 *   WARNING: CPU: 0 PID: 500 at drivers/gpu/drm/drm_vblank.c:1072
++	 *     drm_wait_one_vblank+0x248/0x258
++	 *   Call trace:
++	 *     drm_wait_one_vblank+0x248/0x258
++	 *     _sde_encoder_update_rsc_client+0x52c/0x608
++	 *     sde_encoder_resource_control+0xcdc/0x1284
++	 *     sde_encoder_virt_enable+0x340/0x54c
++	 *     complete_commit+0x354/0xba4
++	 *     _msm_drm_commit_work_cb+0xcc/0x1a8
++	 *
++	 *   UploadCause[KERNEL PANIC], Don't check hangcnt
++	 *   collect_rr_data : upload_cause = KERNEL PANIC
++	 *
++	 * Every frame is CAF *display* code (sde_encoder_virt_*). Nothing
++	 * GPU-related. It fires right after a WLAN link-down, and it was
++	 * costing us a hard reboot roughly every 5 minutes, which in turn was
++	 * destroying the single clean boot window needed to diagnose the GPU.
++	 *
++	 * Note WARN() is normally non-fatal and CONFIG_PANIC_ON_OOPS is off,
++	 * so the escalation happens in CAF's TZ/SSR layer below our driver --
++	 * the exact mechanism was NOT found (that string is not in our tree).
++	 * Suppressing the WARN is therefore a workaround for an escalation we
++	 * cannot see, not a fix of the display bug itself.
++	 *
++	 * The diagnostic is deliberately KEPT as pr_info, so we still record
++	 * every timeout and can count them. Only the fatal escalation is
++	 * removed. Callers must tolerate a missed vblank -- which they already
++	 * do, since the function returns void and ignores the result either
++	 * way.
++	 */
++	if (ret == 0)
++		pr_info("vblank wait timed out on crtc %i (non-fatal, image 193)\n",
++			pipe);
+ 
+ 	drm_vblank_put(dev, pipe);
+ }

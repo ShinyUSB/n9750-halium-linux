@@ -1,0 +1,70 @@
+--- a/drivers/gpu/drm/msm/msm_ringbuffer.h
++++ b/drivers/gpu/drm/msm/msm_ringbuffer.h
+@@ -20,11 +20,48 @@
+ 
+ #include "msm_drv.h"
+ 
++/* a6xx (upstream v4.19) addresses the fence/rptr memptrs through the ring
++ * rather than through adreno_gpu. The legacy CAF tree in this vendor kernel
++ * keeps them on adreno_gpu (struct adreno_rbmemptrs / adreno_rbmemptr()).
++ * The two layouts are identical (rptr, fence), so the ring form is provided
++ * alongside the legacy one and populated from the same allocation.
++ */
++struct msm_rbmemptrs {
++	volatile uint32_t rptr;
++	volatile uint32_t fence;
++};
++
++#define rbmemptr(ring, member)  \
++	((ring)->memptrs_iova + offsetof(struct msm_rbmemptrs, member))
++
+ struct msm_ringbuffer {
+ 	struct msm_gpu *gpu;
++
++	/* ring id; a6xx only ever uses 0 */
++	int id;
++
++	/*
++	 * Legacy CAF field, kept so the a2xx-a5xx sources continue to build.
++	 * Upstream v4.19 uses a fixed MSM_GPU_RINGBUFFER_SZ instead.
++	 */
+ 	int size;
++
+ 	struct drm_gem_object *bo;
+ 	uint32_t *start, *end, *cur;
++
++	/*
++	 * v4.19 shadow/commit pointer: commands are written to ->next and only
++	 * become visible to the hardware at flush time (gpu->funcs->flush).
++	 */
++	uint32_t *next;
++
++	uint32_t seqno;
++
++	/* fence/rptr memptrs, shared with adreno_gpu (see adreno_rbmemptrs) */
++	struct msm_rbmemptrs *memptrs;
++	uint64_t memptrs_iova;
++
++	spinlock_t lock;
+ };
+ 
+ struct msm_ringbuffer *msm_ringbuffer_new(struct msm_gpu *gpu, int size);
+@@ -35,9 +72,13 @@
+ static inline void
+ OUT_RING(struct msm_ringbuffer *ring, uint32_t data)
+ {
+-	if (ring->cur == ring->end)
+-		ring->cur = ring->start;
+-	*(ring->cur++) = data;
++	/*
++	 * ring->next points at the command currently being written - it is not
++	 * committed as ring->cur until the flush copies next into cur.
++	 */
++	if (ring->next == ring->end)
++		ring->next = ring->start;
++	*(ring->next++) = data;
+ }
+ 
+-#endif /* __MSM_RINGBUFFER_H__ */
++#endif /* __MSM_RINGBUFFER_H__ */
+\ В конце файла нет новой строки

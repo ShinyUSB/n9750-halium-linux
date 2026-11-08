@@ -1,0 +1,44 @@
+--- a/drivers/devfreq/devfreq.c
++++ b/drivers/devfreq/devfreq.c
+@@ -611,6 +611,13 @@
+ 	if (IS_ERR(governor)) {
+ 		dev_err(dev, "%s: Unable to find governor for the device\n",
+ 			__func__);
++		/*
++		 * Not fatal for the rest of the system: the device simply stays
++		 * without a devfreq governor. This happens legitimately when a
++		 * DT node names a governor whose driver is not built in.
++		 */
++		dev_warn(dev, "%s: governor '%s' is unavailable, unwinding cleanly\n",
++			__func__, devfreq->governor_name);
+ 		err = PTR_ERR(governor);
+ 		goto err_init;
+ 	}
+@@ -628,10 +635,26 @@
+ 	return devfreq;
+ 
+ err_init:
+-	list_del(&devfreq->node);
+ 	mutex_unlock(&devfreq_list_lock);
+ 
++	/*
++	 * devfreq_dev_release() removes devfreq->node from devfreq_list and
++	 * frees devfreq.
++	 *
++	 * Do NOT unlink or free here as well. Doing so is a double removal from
++	 * the list: the second list_del() operates on a devfreq->node whose
++	 * next/prev pointers have already been overwritten with LIST_POISON1 /
++	 * LIST_POISON2 by the first list_del(), and writing through them faults
++	 * at the poisoned address (a hard Oops). Falling through to err_dev is
++	 * likewise a double free, because devfreq_dev_release() already freed
++	 * devfreq.
++	 *
++	 * See devbw soc:qcom,gpubw failing to find its governor when
++	 * CONFIG_QCOM_KGSL=n removes CONFIG_DEVFREQ_GOV_QCOM_GPUBW_MON.
++	 */
+ 	device_unregister(&devfreq->dev);
++	return ERR_PTR(err);
++
+ err_dev:
+ 	if (devfreq)
+ 		kfree(devfreq);

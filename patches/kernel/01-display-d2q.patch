@@ -1,0 +1,527 @@
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -763,6 +763,49 @@
+  * RETURNS
+  * Zero for success or -errno.
+  */
++
++/* ---- IMAGE 296 instrumentation: show what each atomic commit really changes ---- */
++static int d2q_atm_cnt;
++static void d2q_atm_dump(struct drm_atomic_state *state, const char *tag)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *ps;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *cs;
++	int i;
++
++	if (!state || d2q_atm_cnt >= 160)
++		return;
++	d2q_atm_cnt++;
++	pr_info("D2QATM[%s] comm=%s/%d allow_modeset=%d nconn=%d\n",
++		tag, current->comm, current->pid, state->allow_modeset,
++		state->num_connector);
++	for_each_new_crtc_in_state(state, crtc, cs, i)
++		pr_info("D2QATM[%s]  crtc%d '%s' enable=%d active=%d mode=%dx%d clk=%d\n",
++			tag, crtc->index, crtc->name, cs->enable, cs->active,
++			cs->mode.hdisplay, cs->mode.vdisplay, cs->mode.clock);
++	for_each_new_plane_in_state(state, plane, ps, i)
++		pr_info("D2QATM[%s]  plane%d '%s' crtc=%d fb=%u pos=%d,%d src=%ux%u\n",
++			tag, plane->base.id, plane->name,
++			ps->crtc ? (int)ps->crtc->index : -1,
++			ps->fb ? ps->fb->base.id : 0,
++			ps->crtc_x, ps->crtc_y,
++			ps->src_w >> 16, ps->src_h >> 16);
++}
++
++static void d2q_atm_after(struct drm_device *dev, const char *tag, int ret)
++{
++	struct drm_crtc *crtc;
++
++	drm_for_each_crtc(crtc, dev) {
++		struct drm_plane_state *ps = crtc->primary->state;
++		pr_info("D2QATM[%s] ret=%d crtc%d primary_fb=%u crtc_enable=%d\n",
++			tag, ret, crtc->index,
++			ps && ps->fb ? ps->fb->base.id : 0,
++			crtc->state ? crtc->state->enable : -1);
++	}
++}
++
+ int msm_atomic_commit(struct drm_device *dev,
+ 		struct drm_atomic_state *state, bool nonblock)
+ {
+@@ -783,6 +826,8 @@
+ 		return -EINVAL;
+ 	}
+ 
++	d2q_atm_dump(state, "in");
++
+ #if defined(CONFIG_DISPLAY_SAMSUNG_LEGO)
+ 	ndx = ss_get_vdd_ndx_from_state(state);
+ 
+@@ -879,12 +924,25 @@
+ 	drm_atomic_state_get(state);
+ 	msm_atomic_commit_dispatch(dev, state, c);
+ 
++#ifdef CONFIG_DRM_FBDEV_EMULATION
++	/* d2q: every userspace atomic commit needs the same DPU kick the
++	 * dirtyfb path performs - this cmd-mode panel does not latch a flip
++	 * reliably without a redundant plane re-assert. The kick itself runs
++	 * plane-only commits with d2q_kick_active() set, so no recursion. */
++	if (!d2q_kick_active()) {
++		d2q_atm_after(dev, "out", 0);
++		d2q_kick_arm(dev);
++	}
++#else
++	d2q_atm_after(dev, "out", 0);
++#endif
+ 	SDE_ATRACE_END("atomic_commit");
+ 	return 0;
+ 
+ err_free:
+ 	kfree(c);
+ error:
++	pr_info("D2QATM[fail] ret=%d comm=%s/%d\n", ret, current->comm, current->pid);
+ 	drm_atomic_helper_cleanup_planes(dev, state);
+ 	SDE_ATRACE_END("atomic_commit");
+ 	return ret;
+--- a/drivers/gpu/drm/msm/msm_fbdev.c
++++ b/drivers/gpu/drm/msm/msm_fbdev.c
+@@ -15,9 +15,12 @@
+  * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <drm/drm_atomic.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_fb_helper.h>
+ 
++#include <linux/workqueue.h>
++
+ #include "msm_drv.h"
+ #include "msm_kms.h"
+ 
+@@ -158,6 +161,116 @@
+ 	.fb_probe = msm_fbdev_create,
+ };
+ 
++/*
++ * d2q kick (async): this cmd-mode AMOLED only shows a frame when an atomic
++ * commit kicks the DPU, and userspace flushes frontbuffer rendering through
++ * DRM_IOCTL_MODE_DIRTYFB from Xorg's block handler.  The sync-kick version
++ * (image 299) committed the plane re-assert inline, which cost one TE
++ * interval (~8-17 ms measured) INSIDE Xorg's dispatch cycle: under
++ * high-rate mouse/touch motion the flushes alone saturated the server
++ * loop, client drawing and present copies queued behind them, and the
++ * screen froze until the cursor stopped (MC menu freeze, lagging selection
++ * box) even though every individual commit succeeded.
++ *
++ * The kick is therefore ASYNCHRONOUS and COLLAPSED: the dirtyfb handler
++ * only arms a work item; a dedicated single-threaded workqueue performs
++ * the plane re-assert (a plane-only atomic commit, no modeset, no fbcon
++ * restore) at most one per burst, bounded by the panel's TE rate.  Xorg's
++ * dirtyfb returns in microseconds and dispatch runs at full input rate
++ * while the panel refreshes from whatever glamor has already written into
++ * the scanned fb.  If no CRTC is active (DPMS off) the kick is skipped;
++ * if the dirtied fb is not on any plane yet (fbcon-era handoff), fall back
++ * to the proven fbcon restore.
++ */
++static struct workqueue_struct *d2q_kick_wq;
++static struct drm_device *d2q_kick_dev;
++static atomic_t d2q_kick_req = ATOMIC_INIT(0);
++static unsigned long d2q_kick_armed;
++static int d2q_kick_logs;
++static atomic_t d2q_kick_in_progress = ATOMIC_INIT(0);
++
++static void d2q_kick_work_fn(struct work_struct *work);
++
++static DECLARE_DELAYED_WORK(d2q_kick_work, d2q_kick_work_fn);
++/* d2q: shared with msm_atomic.c so every atomic commit (wlroots, apps)
++ * gets the same presentation kick the dirtyfb path provides. */
++void d2q_kick_arm(struct drm_device *dev)
++{
++	d2q_kick_dev = dev;
++	atomic_inc(&d2q_kick_req);
++	if (d2q_kick_wq)
++		mod_delayed_work(d2q_kick_wq, &d2q_kick_work,
++				 msecs_to_jiffies(20));
++}
++
++bool d2q_kick_active(void)
++{
++	return atomic_read(&d2q_kick_in_progress) != 0;
++}
++
++static void d2q_kick_work_fn(struct work_struct *work)
++{
++	struct drm_device *dev = d2q_kick_dev;
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_plane *plane;
++	int ret;
++
++	if (!dev)
++		goto done;
++
++	do {
++		atomic_set(&d2q_kick_req, 0);
++
++		state = drm_atomic_state_alloc(dev);
++		if (!state)
++			break;
++
++		drm_modeset_acquire_init(&ctx, 0);
++		state->acquire_ctx = &ctx;
++
++retry:
++		drm_for_each_plane(plane, dev) {
++			struct drm_plane_state *plane_state;
++
++			if (!plane->state || !plane->state->crtc ||
++			    !plane->state->fb)
++				continue;
++			plane_state = drm_atomic_get_plane_state(state, plane);
++			if (IS_ERR(plane_state)) {
++				ret = PTR_ERR(plane_state);
++				goto out;
++			}
++		}
++
++		atomic_set(&d2q_kick_in_progress, 1);
++		ret = drm_atomic_commit(state);
++		atomic_set(&d2q_kick_in_progress, 0);
++		if (ret == -EDEADLK) {
++			drm_atomic_state_clear(state);
++			drm_modeset_backoff(&ctx);
++			goto retry;
++		}
++
++		if (ret && d2q_kick_logs < 20) {
++			d2q_kick_logs++;
++			pr_info("D2QDIRTY: async kick ret=%d\n", ret);
++		}
++out:
++		drm_atomic_state_put(state);
++		drm_modeset_drop_locks(&ctx);
++		drm_modeset_acquire_fini(&ctx);
++	} while (atomic_read(&d2q_kick_req) > 0);
++
++done:
++	clear_bit(0, &d2q_kick_armed);
++	/* raced request; re-arm shortly (collapsed) */
++	if (atomic_read(&d2q_kick_req) > 0 && d2q_kick_wq)
++		mod_delayed_work(d2q_kick_wq, &d2q_kick_work,
++				 msecs_to_jiffies(5));
++}
++
++
+ /* initialize fbdev helper */
+ struct drm_fb_helper *msm_fbdev_init(struct drm_device *dev)
+ {
+@@ -166,6 +279,8 @@
+ 	struct drm_fb_helper *helper;
+ 	int ret;
+ 
++	d2q_kick_wq = alloc_workqueue("d2qkick", 0, 1);
++
+ 	fbdev = kzalloc(sizeof(*fbdev), GFP_KERNEL);
+ 	if (!fbdev)
+ 		goto fail;
+@@ -199,13 +314,6 @@
+ 	return NULL;
+ }
+ 
+-/*
+- * d2q fbcon: push fbcon draws to the CMD-mode panel. The internal AMOLED
+- * only shows a frame when an atomic commit kicks it off, so without this
+- * hook the screen would stay frozen at whatever was in memory at the last
+- * modeset (boot logo). Reuses the lastclose-restore path, which is proven
+- * to commit correctly on this SDE stack.
+- */
+ int msm_fbdev_dirty(struct drm_framebuffer *fb,
+ 		struct drm_file *file_priv, unsigned int flags,
+ 		unsigned int color, struct drm_clip_rect *clips,
+@@ -213,11 +321,33 @@
+ {
+ 	struct drm_device *dev = fb->dev;
+ 	struct msm_drm_private *priv = dev->dev_private;
++	struct drm_crtc *crtc;
++	struct drm_plane *plane;
++	bool crtc_on = false, fb_on_plane = false;
+ 
+ 	if (!priv || !priv->fbdev)
+ 		return -ENODEV;
+ 
+-	return drm_fb_helper_restore_fbdev_mode_unlocked(priv->fbdev);
++	drm_for_each_crtc(crtc, dev)
++		if (crtc->state && crtc->state->enable && crtc->state->active)
++			crtc_on = true;
++
++	if (!crtc_on)
++		return 0;   /* DPMS off: nothing to kick */
++
++	drm_for_each_plane(plane, dev)
++		if (plane->state && plane->state->crtc &&
++		    plane->state->fb == fb)
++			fb_on_plane = true;
++
++	if (!fb_on_plane) {
++		/* fb not scanned by any plane: legacy fbcon-era fallback */
++		return drm_fb_helper_restore_fbdev_mode_unlocked(priv->fbdev);
++	}
++
++	d2q_kick_arm(dev);
++
++	return 0;
+ }
+ 
+ void msm_fbdev_free(struct drm_device *dev)
+@@ -228,6 +358,11 @@
+ 
+ 	DBG();
+ 
++	if (d2q_kick_wq) {
++		destroy_workqueue(d2q_kick_wq);
++		d2q_kick_wq = NULL;
++	}
++
+ 	drm_fb_helper_unregister_fbi(helper);
+ 
+ 	drm_fb_helper_fini(helper);
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -619,6 +619,13 @@
+ 
+ 	/* when we have more than one 'msm_gpu' these need to be an array: */
+ 	struct msm_gpu *gpu;
++
++	/*
++	 * Deferred GPU bring-up (see gpu_init_delay_ms in a6xx_gmu.c).
++	 * Diagnostics only; normally idle.
++	 */
++	struct delayed_work gpu_load_work;
++	bool gpu_load_queued;
+ 	struct msm_file_private *lastctx;
+ 
+ 	struct drm_fb_helper *fbdev;
+@@ -885,6 +892,10 @@
+ 		struct drm_file *file_priv, unsigned int flags,
+ 		unsigned int color, struct drm_clip_rect *clips,
+ 		unsigned int num_clips);
++#ifdef CONFIG_DRM_FBDEV_EMULATION
++void d2q_kick_arm(struct drm_device *dev);
++bool d2q_kick_active(void);
++#endif
+ 
+ #if defined(CONFIG_DISPLAY_SAMSUNG) || defined(CONFIG_DISPLAY_SAMSUNG_LEGO)
+ int __msm_drm_notifier_call_chain(unsigned long event, void *data);
+@@ -971,6 +982,14 @@
+ #endif
+ 
+ struct clk *msm_clk_get(struct platform_device *pdev, const char *name);
++
++/* Ported from upstream v4.19 msm_drv.c - required by a6xx_gpu.c to
++ * acquire the GPU core/interconnect clocks from the "clock-names"
++ * property of the gpu node.
++ */
++int msm_clk_bulk_get(struct device *dev, struct clk_bulk_data **bulk);
++struct clk *msm_clk_bulk_get_clock(struct clk_bulk_data *bulk, int count,
++		const char *name);
+ void __iomem *msm_ioremap(struct platform_device *pdev, const char *name,
+ 		const char *dbgname);
+ unsigned long msm_iomap_size(struct platform_device *pdev, const char *name);
+--- a/drivers/gpu/drm/msm/dsi-staging/dsi_display.c
++++ b/drivers/gpu/drm/msm/dsi-staging/dsi_display.c
+@@ -7960,6 +7960,22 @@
+ 				   display->name, rc);
+ 			goto error;
+ 		}
++		/*
++		 * D2Q PATCH (2026-10-25): the disable phase of this commit
++		 * already ran the panel OFF sequence (dsi_panel_disable ->
++		 * ss_panel_off_post -> PANEL_PWR_OFF), but the DMS enable
++		 * path only sends the timing-switch commands, assuming the
++		 * panel stayed awake (true for Samsung's VRR flow, not for
++		 * a full drm modeset).  Wake the panel with the complete ON
++		 * sequence so the panel state machine and the hardware
++		 * agree again.
++		 */
++		rc = dsi_panel_enable(display->panel);
++		if (rc) {
++			pr_err("[%s] failed to re-enable DSI panel after DMS, rc=%d\n",
++			       display->name, rc);
++			goto error;
++		}
+ 	} else if (!(display->panel->cur_mode->dsi_mode_flags &
+ 			DSI_MODE_FLAG_POMS)){
+ 		rc = dsi_panel_enable(display->panel);
+--- a/drivers/gpu/drm/msm/dsi-staging/dsi_drm.c
++++ b/drivers/gpu/drm/msm/dsi-staging/dsi_drm.c
+@@ -640,6 +640,40 @@
+ 
+ 	convert_to_dsi_mode(drm_mode, &dsi_mode);
+ 
++	/*
++	 * D2Q PATCH (2026-10-25): priv_info comes from drm_mode->private,
++	 * which only exists on kernel-side mode objects.  A legacy
++	 * drmModeSetCrtc hands us a userspace-converted mode with private
++	 * == NULL, and the panel's topology (DSC etc.) is then unknowable
++	 * (-EINVAL from atomic check: "failed to get mode info").
++	 * Fall back to the display's own parsed mode list: match by active
++	 * size + clock, and borrow its priv_info.
++	 */
++	if (!dsi_mode.priv_info && display) {
++		struct dsi_display *d = (struct dsi_display *)display;
++		u32 count = 0;
++		int k;
++
++		if (!dsi_display_get_mode_count(d, &count)) {
++			for (k = 0; k < count; k++) {
++				struct dsi_display_mode *m = &d->modes[k];
++
++				/* refresh_rate may be 0 in userspace-converted
++				 * modes (vrefresh not computed); match on
++				 * geometry + clock only. */
++				if (m->timing.h_active ==
++					    dsi_mode.timing.h_active &&
++				    m->timing.v_active ==
++					    dsi_mode.timing.v_active &&
++				    m->pixel_clk_khz ==
++					    dsi_mode.pixel_clk_khz) {
++					dsi_mode.priv_info = m->priv_info;
++					break;
++				}
++			}
++		}
++	}
++
+ 	if (!dsi_mode.priv_info)
+ 		return -EINVAL;
+ 
+--- a/drivers/gpu/drm/msm/sde/sde_kms.c
++++ b/drivers/gpu/drm/msm/sde/sde_kms.c
+@@ -110,6 +110,11 @@
+ 	return sdecustom;
+ }
+ 
++static int d2q_dsi_crtc;
++module_param(d2q_dsi_crtc, int, 0644);
++MODULE_PARM_DESC(d2q_dsi_crtc,
++	"1=restrict DSI encoder to CRTC 0 (Note10+ sde: dead CRTC workaround)");
++
+ #ifdef CONFIG_DEBUG_FS
+ static int _sde_danger_signal_status(struct seq_file *s,
+ 		bool danger_status)
+@@ -1781,6 +1786,31 @@
+ 	for (i = 0; i < priv->num_encoders; i++)
+ 		priv->encoders[i]->possible_crtcs = (1 << priv->num_crtcs) - 1;
+ 
++	/*
++	 * D2Q PATCH (2026-10-24): on this device (Note10+, CAF sde) the DSI
++	 * encoder is routed by userspace to a dead CRTC (crtc-2), and
++	 * msm_atomic_commit fails with "failed to dispatch commit to any
++	 * CRTC" — the screen stays dark.  Weston (boot order) happens to
++	 * land on crtc-0, Xorg does not.  With d2q_dsi_crtc=1, restrict the
++	 * DSI-connected encoder to CRTC bit 0 so every client gets the
++	 * physically-wired CRTC.
++	 */
++	if (d2q_dsi_crtc) {
++		for (i = 0; i < priv->num_encoders; i++) {
++			if (priv->encoders[i]->encoder_type ==
++			    DRM_MODE_ENCODER_DSI)
++				priv->encoders[i]->possible_crtcs = 1;
++			else if (d2q_dsi_crtc >= 2 && priv->num_crtcs > 1)
++				/* reserve crtc-0 for DSI: ghost outputs
++				 * (Virtual/DP/writeback) must not take it,
++				 * or Xorg's first-crtc assignment leaves DSI
++				 * pointing at a dead CRTC (EINVAL at set-mode) */
++				priv->encoders[i]->possible_crtcs &= ~1u;
++		}
++		pr_info("D2QKMS: DSI encoder possible_crtcs forced to crtc-0 (mode %d)\n",
++			d2q_dsi_crtc);
++	}
++
+ 	return 0;
+ fail:
+ 	_sde_kms_drm_obj_destroy(sde_kms);
+--- a/drivers/clk/qcom/mdss/mdss-dsi-pll-7nm.c
++++ b/drivers/clk/qcom/mdss/mdss-dsi-pll-7nm.c
+@@ -981,7 +981,8 @@
+ 	u32 data = MDSS_PLL_REG_R(rsc->phy_base, PHY_CMN_CTRL_0);
+ 
+ 	MDSS_PLL_REG_W(rsc->pll_base, PLL_SYSTEM_MUXES, 0);
+-	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0, data & ~BIT(5));
++	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0,
++		       data & ~(BIT(6) | BIT(5)));
+ 	ndelay(250);
+ }
+ 
+@@ -989,7 +990,16 @@
+ {
+ 	u32 data = MDSS_PLL_REG_R(rsc->phy_base, PHY_CMN_CTRL_0);
+ 
+-	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0, data | BIT(5));
++	/*
++	 * D2Q PATCH (2026-10-25), mirroring mainline "drm/msm/dsi/phy:
++	 * power up the digital top before de-asserting PLL_SHUTDOWNB":
++	 * the 7nm PLL cannot lock while the digital top is powered down.
++	 * In the DMS path the PLL enable runs without a preceding PHY
++	 * enable, so bias must power DIGTOP too (status read 0x0 before
++	 * this fix; rc=-110 from lock timeout).
++	 */
++	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0,
++		       data | BIT(6) | BIT(5));
+ 	MDSS_PLL_REG_W(rsc->pll_base, PLL_SYSTEM_MUXES, 0xc0);
+ 	ndelay(250);
+ }
+--- a/drivers/gpu/drm/drm_vblank.c
++++ b/drivers/gpu/drm/drm_vblank.c
+@@ -1069,7 +1069,48 @@
+ 				 msecs_to_jiffies(100));
+ #endif
+ 
+-	WARN(ret == 0, "vblank wait timed out on crtc %i\n", pipe);
++/*
++	 * TEMPORARY image 193 -- REMOVE OR RESTORE ON RESULT.
++	 *
++	 * Why this changed: on Samsung builds the 1000ms branch below was
++	 * already compiled in (CONFIG_DISPLAY_SAMSUNG=y), so the timeout is
++	 * ~1s, NOT 100ms. On every such timeout CAF's crash reporter escalates
++	 * to a real reboot:
++	 *
++	 *   vblank wait timed out on crtc 0
++	 *   WARNING: CPU: 0 PID: 500 at drivers/gpu/drm/drm_vblank.c:1072
++	 *     drm_wait_one_vblank+0x248/0x258
++	 *   Call trace:
++	 *     drm_wait_one_vblank+0x248/0x258
++	 *     _sde_encoder_update_rsc_client+0x52c/0x608
++	 *     sde_encoder_resource_control+0xcdc/0x1284
++	 *     sde_encoder_virt_enable+0x340/0x54c
++	 *     complete_commit+0x354/0xba4
++	 *     _msm_drm_commit_work_cb+0xcc/0x1a8
++	 *
++	 *   UploadCause[KERNEL PANIC], Don't check hangcnt
++	 *   collect_rr_data : upload_cause = KERNEL PANIC
++	 *
++	 * Every frame is CAF *display* code (sde_encoder_virt_*). Nothing
++	 * GPU-related. It fires right after a WLAN link-down, and it was
++	 * costing us a hard reboot roughly every 5 minutes, which in turn was
++	 * destroying the single clean boot window needed to diagnose the GPU.
++	 *
++	 * Note WARN() is normally non-fatal and CONFIG_PANIC_ON_OOPS is off,
++	 * so the escalation happens in CAF's TZ/SSR layer below our driver --
++	 * the exact mechanism was NOT found (that string is not in our tree).
++	 * Suppressing the WARN is therefore a workaround for an escalation we
++	 * cannot see, not a fix of the display bug itself.
++	 *
++	 * The diagnostic is deliberately KEPT as pr_info, so we still record
++	 * every timeout and can count them. Only the fatal escalation is
++	 * removed. Callers must tolerate a missed vblank -- which they already
++	 * do, since the function returns void and ignores the result either
++	 * way.
++	 */
++	if (ret == 0)
++		pr_info("vblank wait timed out on crtc %i (non-fatal, image 193)\n",
++			pipe);
+ 
+ 	drm_vblank_put(dev, pipe);
+ }

@@ -1,0 +1,157 @@
+--- a/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
++++ b/drivers/platform/msm/ipa/ipa_v3/ipa_dp.c
+@@ -22,6 +22,30 @@
+ #include "ipahal/ipahal.h"
+ #include "ipahal/ipahal_fltrt.h"
+ 
++/* D2QRX: temporary targeted instrumentation for the WAN RX drop (debug image).
++ * pr_err-level so it lands in dmesg without dynamic debug; gated by d2q_rx_trace.
++ */
++int d2q_rx_trace = 1;
++static void d2q_hexdump(const char *tag, const void *buf, int len)
++{
++	int i;
++	char line[3 * 16 + 1];
++	const u8 *p = buf;
++
++	if (!d2q_rx_trace)
++		return;
++	if (len > 64)
++		len = 64;
++	for (i = 0; i < len; i++) {
++		snprintf(line + (i % 16) * 3, 4, "%02x ", p[i]);
++		if (i % 16 == 15 || i == len - 1) {
++			line[(i % 16) * 3 + 3] = 0;
++			pr_err("D2QRX %s: %s\n", tag, line);
++		}
++	}
++}
++#define D2QRX(...) do { if (d2q_rx_trace) pr_err("D2QRX " __VA_ARGS__); } while (0)
++
+ #define IPA_WAN_AGGR_PKT_CNT 5
+ #define IPA_WAN_NAPI_MAX_FRAMES (NAPI_WEIGHT / IPA_WAN_AGGR_PKT_CNT)
+ #define IPA_WAN_PAGE_ORDER 3
+@@ -3005,6 +3029,7 @@
+ 			if (likely(skb2)) {
+ 				IPADBG_LOW(
+ 					"removing Status element from skb and sending to WAN client");
++				D2QRX("SPLIT-DELIVER joined skb len=%d\n", skb2->len);
+ 				skb_pull(skb2, ipahal_pkt_status_get_size());
+ 				skb2->truesize = skb2->len +
+ 					sizeof(struct sk_buff);
+@@ -3045,6 +3070,9 @@
+ 	unsigned long unused = IPA_GENERIC_RX_BUFF_BASE_SZ - used;
+ 
+ 	IPA_DUMP_BUFF(skb->data, 0, skb->len);
++	D2QRX("wan_rx ENTER len=%d len_rem=%d prev_skb=%d used=%u used_align=%u unused=%lu\n",
++	      skb->len, sys->len_rem, sys->prev_skb != NULL, used, used_align, unused);
++	d2q_hexdump("entry", skb->data, skb->len);
+ 	if (skb->len == 0) {
+ 		IPAERR("ZLT\n");
+ 		goto bail;
+@@ -3064,10 +3092,11 @@
+ 	 * payload splits across 2 buff or more,
+ 	 * take the start of the payload from prev_skb
+ 	 */
+-	if (sys->len_rem)
+-		ipa3_wan_rx_handle_splt_pyld(skb, sys);
++		if (sys->len_rem)
++			ipa3_wan_rx_handle_splt_pyld(skb, sys);
+ 
+ 	pkt_status_sz = ipahal_pkt_status_get_size();
++	D2QRX("pkt_status_sz=%d\n", pkt_status_sz);
+ 	while (skb->len) {
+ 		IPADBG_LOW("LEN_REM %d\n", skb->len);
+ 		if (skb->len < pkt_status_sz) {
+@@ -3080,6 +3109,9 @@
+ 		IPADBG_LOW("STATUS opcode=%d src=%d dst=%d len=%d\n",
+ 				status.status_opcode, status.endp_src_idx,
+ 				status.endp_dest_idx, status.pkt_len);
++		D2QRX("STATUS opcode=%d src=%d dst=%d pkt_len=%d skb_len=%d\n",
++		    status.status_opcode, status.endp_src_idx,
++		    status.endp_dest_idx, status.pkt_len, skb->len);
+ 
+ 		if (sys->status_stat) {
+ 			sys->status_stat->status[sys->status_stat->curr] =
+@@ -3097,6 +3129,7 @@
+ 			IPAHAL_PKT_STATUS_OPCODE_PACKET_2ND_PASS)) {
+ 			IPAERR("unsupported opcode(%d)\n",
+ 				status.status_opcode);
++			D2QRX("SKIP unsupported opcode %d\n", status.status_opcode);
+ 			skb_pull(skb, pkt_status_sz);
+ 			continue;
+ 		}
+@@ -3110,15 +3143,18 @@
+ 		}
+ 		if (status.pkt_len == 0) {
+ 			IPADBG_LOW("Skip aggr close status\n");
++			D2QRX("SKIP pkt_len==0 (aggr close)\n");
+ 			skb_pull(skb, pkt_status_sz);
+ 			IPA_STATS_DEC_CNT(ipa3_ctx->stats.rx_pkts);
+ 			IPA_STATS_INC_CNT(ipa3_ctx->stats.wan_aggr_close);
+ 			continue;
+ 		}
+ 		ep_idx = ipa3_get_ep_mapping(IPA_CLIENT_APPS_WAN_CONS);
++		D2QRX("dest_idx=%d expected ep_idx=%d\n", status.endp_dest_idx, ep_idx);
+ 		if (status.endp_dest_idx != ep_idx) {
+ 			IPAERR("expected endp_dest_idx %d received %d\n",
+ 					ep_idx, status.endp_dest_idx);
++			D2QRX("BAIL dest_idx mismatch\n");
+ 			WARN_ON(1);
+ 			goto bail;
+ 		}
+@@ -3148,6 +3184,8 @@
+ 		if (checksum_trailer_exists)
+ 			frame_len += IPA_DL_CHECKSUM_LENGTH;
+ 		IPADBG_LOW("frame_len %d\n", frame_len);
++		D2QRX("qmap_hdr=0x%08x pkt_len_with_pad=%d csum_trailer=%d frame_len=%d\n",
++		    qmap_hdr, pkt_len_with_pad, checksum_trailer_exists, frame_len);
+ 
+ 		skb2 = skb_clone(skb, GFP_KERNEL);
+ 		if (likely(skb2)) {
+@@ -3158,6 +3196,8 @@
+ 			if (skb->len < frame_len) {
+ 				IPADBG_LOW("SPL skb len %d len %d\n",
+ 						skb->len, frame_len);
++				D2QRX("SPLIT skb_len=%d < frame_len=%d -> buffer (len_rem=%d)\n",
++				    skb->len, frame_len, frame_len - skb->len);
+ 				sys->prev_skb = skb2;
+ 				sys->len_rem = frame_len - skb->len;
+ 				skb_pull(skb, skb->len);
+@@ -3165,8 +3205,7 @@
+ 				skb_trim(skb2, frame_len);
+ 				IPADBG_LOW("rx avail for %d\n",
+ 						status.endp_dest_idx);
+-				IPADBG_LOW(
+-					"removing Status element from skb and sending to WAN client");
++				D2QRX("DELIVER frame_len=%d to WAN client (notify)\n", frame_len);
+ 				skb_pull(skb2, pkt_status_sz);
+ 				skb2->truesize = skb2->len +
+ 					sizeof(struct sk_buff) +
+@@ -3188,6 +3227,7 @@
+ 		}
+ 	};
+ bail:
++	D2QRX("wan_rx EXIT (bail/loop done) len=%d\n", skb->len);
+ 	sys->free_skb(skb);
+ 	return rc;
+ }
+@@ -3286,6 +3326,10 @@
+ 		rx_pkt->len = notify->bytes_xfered;
+ 
+ 	/*Drop packets when WAN consumer channel receive EOB event*/
++	if (notify->evt_id == GSI_CHAN_EVT_EOB ||
++	    (sys->ep->client == IPA_CLIENT_APPS_WAN_CONS))
++		D2QRX("wan_cons completion: evt_id=%d client=%d skip_eot=%d bytes=%u\n",
++		    notify->evt_id, sys->ep->client, sys->skip_eot, notify->bytes_xfered);
+ 	if ((notify->evt_id == GSI_CHAN_EVT_EOB ||
+ 		sys->skip_eot) &&
+ 		sys->ep->client == IPA_CLIENT_APPS_WAN_CONS) {
+@@ -3294,6 +3338,7 @@
+ 		sys->free_skb(rx_pkt->data.skb);
+ 		sys->free_rx_wrapper(rx_pkt);
+ 		sys->eob_drop_cnt++;
++		D2QRX("EOB-DROP on WAN consumer (eob_drop_cnt now)\n");
+ 		if (notify->evt_id == GSI_CHAN_EVT_EOB) {
+ 			IPADBG("EOB event on WAN consumer channel, drop\n");
+ 			sys->skip_eot = true;

@@ -1,0 +1,25 @@
+--- a/drivers/gpu/drm/msm/dsi-staging/dsi_display.c
++++ b/drivers/gpu/drm/msm/dsi-staging/dsi_display.c
+@@ -7960,6 +7960,22 @@
+ 				   display->name, rc);
+ 			goto error;
+ 		}
++		/*
++		 * D2Q PATCH (2026-10-25): the disable phase of this commit
++		 * already ran the panel OFF sequence (dsi_panel_disable ->
++		 * ss_panel_off_post -> PANEL_PWR_OFF), but the DMS enable
++		 * path only sends the timing-switch commands, assuming the
++		 * panel stayed awake (true for Samsung's VRR flow, not for
++		 * a full drm modeset).  Wake the panel with the complete ON
++		 * sequence so the panel state machine and the hardware
++		 * agree again.
++		 */
++		rc = dsi_panel_enable(display->panel);
++		if (rc) {
++			pr_err("[%s] failed to re-enable DSI panel after DMS, rc=%d\n",
++			       display->name, rc);
++			goto error;
++		}
+ 	} else if (!(display->panel->cur_mode->dsi_mode_flags &
+ 			DSI_MODE_FLAG_POMS)){
+ 		rc = dsi_panel_enable(display->panel);

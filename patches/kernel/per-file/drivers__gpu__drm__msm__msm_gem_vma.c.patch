@@ -1,0 +1,57 @@
+--- a/drivers/gpu/drm/msm/msm_gem_vma.c
++++ b/drivers/gpu/drm/msm/msm_gem_vma.c
+@@ -232,10 +232,53 @@
+ 
+ 	vma->iova = vma->node.start << PAGE_SHIFT;
+ 
++	/*
++	 * IMAGE 236 REVERTED -- DO NOT re-add IOMMU_NOEXEC or IOMMU_USE_LLC_NWA
++	 * here without also porting CAF's microcode exception.
++	 *
++	 * Adding them broke GPU bring-up: hw_init returned -22 because
++	 * a6xx_cp_init() -> adreno_idle() timed out draining the ringbuffer.
++	 * The CP could not fetch its command stream. The ring base and RPTR
++	 * shadow programmed correctly and every GMU map succeeded, so the
++	 * fault was the fetch, not the mapping.
++	 *
++	 * Cause: CAF's _get_protection_flags() (vendor kgsl_iommu.c:1919-1948)
++	 * sets IOMMU_NOEXEC on every buffer BUT has an exception that a partial
++	 * port drops:
++	 *
++	 *     if (memdesc->priv & KGSL_MEMDESC_UCODE)
++	 *             flags &= ~IOMMU_NOEXEC;
++	 *
++	 * CAF clears NOEXEC for microcode buffers. Without that exception we
++	 * marked the SQE ucode buffer execute-never and the GPU lost the
++	 * ability to fetch its instruction stream.
++	 *
++	 * A partial port of a function is worse than none: the exception is
++	 * exactly the clause that encodes "this buffer is special".
++	 *
++	 * DOMAIN_ATTR_USE_LLC_NWA was also refused (-EBUSY) by the SMMU, so
++	 * IOMMU_USE_LLC_NWA would have been inert even if NOEXEC had worked.
++	 */
+ 	if (aspace->mmu) {
+ 		unsigned size = npages << PAGE_SHIFT;
++		unsigned int prot = IOMMU_READ | IOMMU_WRITE;
++
++		/*
++		 * IMAGE 240 -- IOMMU_USE_LLC_NWA map hint (NO IOMMU_NOEXEC).
++		 *
++		 * CAF maps every buffer with the LLC hint when the domain
++		 * attribute is set (vendor kgsl_iommu.c:1919-1948). Image 236
++		 * also added IOMMU_NOEXEC and broke bring-up (hw_init ret=-22:
++		 * the SQE ucode buffer became execute-never and the CP could
++		 * not fetch). CAF exempts microcode
++		 * (if (memdesc->priv & KGSL_MEMDESC_UCODE) flags &= ~NOEXEC),
++		 * which this tree cannot express per-BO -- so NOEXEC is left
++		 * out entirely. It is hardening, not a functional requirement.
++		 */
++		prot |= IOMMU_USE_LLC_NWA;
++
+ 		ret = aspace->mmu->funcs->map(aspace->mmu, vma->iova, sgt,
+-				size, IOMMU_READ | IOMMU_WRITE);
++				size, prot);
+ 	}
+ 
+ 	/* Get a reference to the aspace to keep it around */

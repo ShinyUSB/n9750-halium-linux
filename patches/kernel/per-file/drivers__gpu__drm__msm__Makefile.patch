@@ -1,0 +1,22 @@
+--- a/drivers/gpu/drm/msm/Makefile
++++ b/drivers/gpu/drm/msm/Makefile
+@@ -113,7 +113,10 @@
+ 	adreno/a3xx_gpu.o \
+ 	adreno/a4xx_gpu.o \
+ 	adreno/a5xx_gpu.o \
+-	adreno/a5xx_power.o
++	adreno/a5xx_power.o \
++	adreno/a6xx_gpu.o \
++	adreno/a6xx_gmu.o \
++	adreno/a6xx_hfi.o
+ endif
+ 
+ msm_drm-$(CONFIG_DRM_MSM_MDP4) += mdp/mdp4/mdp4_crtc.o \
+@@ -224,6 +227,7 @@
+ 	msm_gem_shrinker.o \
+ 	msm_gem_vma.o\
+ 	msm_gpu.o \
++	msm_gpu_mmu.o \
+ 	msm_iommu.o \
+ 	msm_smmu.o \
+ 	msm_perf.o \

@@ -1,0 +1,30 @@
+--- a/drivers/clk/qcom/mdss/mdss-dsi-pll-7nm.c
++++ b/drivers/clk/qcom/mdss/mdss-dsi-pll-7nm.c
+@@ -981,7 +981,8 @@
+ 	u32 data = MDSS_PLL_REG_R(rsc->phy_base, PHY_CMN_CTRL_0);
+ 
+ 	MDSS_PLL_REG_W(rsc->pll_base, PLL_SYSTEM_MUXES, 0);
+-	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0, data & ~BIT(5));
++	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0,
++		       data & ~(BIT(6) | BIT(5)));
+ 	ndelay(250);
+ }
+ 
+@@ -989,7 +990,16 @@
+ {
+ 	u32 data = MDSS_PLL_REG_R(rsc->phy_base, PHY_CMN_CTRL_0);
+ 
+-	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0, data | BIT(5));
++	/*
++	 * D2Q PATCH (2026-10-25), mirroring mainline "drm/msm/dsi/phy:
++	 * power up the digital top before de-asserting PLL_SHUTDOWNB":
++	 * the 7nm PLL cannot lock while the digital top is powered down.
++	 * In the DMS path the PLL enable runs without a preceding PHY
++	 * enable, so bias must power DIGTOP too (status read 0x0 before
++	 * this fix; rc=-110 from lock timeout).
++	 */
++	MDSS_PLL_REG_W(rsc->phy_base, PHY_CMN_CTRL_0,
++		       data | BIT(6) | BIT(5));
+ 	MDSS_PLL_REG_W(rsc->pll_base, PLL_SYSTEM_MUXES, 0xc0);
+ 	ndelay(250);
+ }

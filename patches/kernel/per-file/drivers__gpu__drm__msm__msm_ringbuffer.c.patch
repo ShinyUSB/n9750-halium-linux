@@ -1,0 +1,22 @@
+--- a/drivers/gpu/drm/msm/msm_ringbuffer.c
++++ b/drivers/gpu/drm/msm/msm_ringbuffer.c
+@@ -34,6 +34,11 @@
+ 
+ 	ring->gpu = gpu;
+ 
++	/* a6xx only ever uses ring 0 */
++	ring->id = 0;
++	ring->seqno = 0;
++	spin_lock_init(&ring->lock);
++
+ 	/* Pass NULL for the iova pointer - we will map it later */
+ 	ring->start = msm_gem_kernel_new(gpu->dev, size, MSM_BO_WC,
+ 		gpu->aspace, &ring->bo, NULL);
+@@ -45,6 +50,7 @@
+ 	}
+ 	ring->end   = ring->start + (size / 4);
+ 	ring->cur   = ring->start;
++	ring->next  = ring->start;
+ 
+ 	ring->size = size;
+ 

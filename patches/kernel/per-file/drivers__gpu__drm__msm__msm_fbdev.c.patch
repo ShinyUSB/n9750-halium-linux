@@ -1,0 +1,202 @@
+--- a/drivers/gpu/drm/msm/msm_fbdev.c
++++ b/drivers/gpu/drm/msm/msm_fbdev.c
+@@ -15,9 +15,12 @@
+  * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <drm/drm_atomic.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_fb_helper.h>
+ 
++#include <linux/workqueue.h>
++
+ #include "msm_drv.h"
+ #include "msm_kms.h"
+ 
+@@ -158,6 +161,116 @@
+ 	.fb_probe = msm_fbdev_create,
+ };
+ 
++/*
++ * d2q kick (async): this cmd-mode AMOLED only shows a frame when an atomic
++ * commit kicks the DPU, and userspace flushes frontbuffer rendering through
++ * DRM_IOCTL_MODE_DIRTYFB from Xorg's block handler.  The sync-kick version
++ * (image 299) committed the plane re-assert inline, which cost one TE
++ * interval (~8-17 ms measured) INSIDE Xorg's dispatch cycle: under
++ * high-rate mouse/touch motion the flushes alone saturated the server
++ * loop, client drawing and present copies queued behind them, and the
++ * screen froze until the cursor stopped (MC menu freeze, lagging selection
++ * box) even though every individual commit succeeded.
++ *
++ * The kick is therefore ASYNCHRONOUS and COLLAPSED: the dirtyfb handler
++ * only arms a work item; a dedicated single-threaded workqueue performs
++ * the plane re-assert (a plane-only atomic commit, no modeset, no fbcon
++ * restore) at most one per burst, bounded by the panel's TE rate.  Xorg's
++ * dirtyfb returns in microseconds and dispatch runs at full input rate
++ * while the panel refreshes from whatever glamor has already written into
++ * the scanned fb.  If no CRTC is active (DPMS off) the kick is skipped;
++ * if the dirtied fb is not on any plane yet (fbcon-era handoff), fall back
++ * to the proven fbcon restore.
++ */
++static struct workqueue_struct *d2q_kick_wq;
++static struct drm_device *d2q_kick_dev;
++static atomic_t d2q_kick_req = ATOMIC_INIT(0);
++static unsigned long d2q_kick_armed;
++static int d2q_kick_logs;
++static atomic_t d2q_kick_in_progress = ATOMIC_INIT(0);
++
++static void d2q_kick_work_fn(struct work_struct *work);
++
++static DECLARE_DELAYED_WORK(d2q_kick_work, d2q_kick_work_fn);
++/* d2q: shared with msm_atomic.c so every atomic commit (wlroots, apps)
++ * gets the same presentation kick the dirtyfb path provides. */
++void d2q_kick_arm(struct drm_device *dev)
++{
++	d2q_kick_dev = dev;
++	atomic_inc(&d2q_kick_req);
++	if (d2q_kick_wq)
++		mod_delayed_work(d2q_kick_wq, &d2q_kick_work,
++				 msecs_to_jiffies(20));
++}
++
++bool d2q_kick_active(void)
++{
++	return atomic_read(&d2q_kick_in_progress) != 0;
++}
++
++static void d2q_kick_work_fn(struct work_struct *work)
++{
++	struct drm_device *dev = d2q_kick_dev;
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_plane *plane;
++	int ret;
++
++	if (!dev)
++		goto done;
++
++	do {
++		atomic_set(&d2q_kick_req, 0);
++
++		state = drm_atomic_state_alloc(dev);
++		if (!state)
++			break;
++
++		drm_modeset_acquire_init(&ctx, 0);
++		state->acquire_ctx = &ctx;
++
++retry:
++		drm_for_each_plane(plane, dev) {
++			struct drm_plane_state *plane_state;
++
++			if (!plane->state || !plane->state->crtc ||
++			    !plane->state->fb)
++				continue;
++			plane_state = drm_atomic_get_plane_state(state, plane);
++			if (IS_ERR(plane_state)) {
++				ret = PTR_ERR(plane_state);
++				goto out;
++			}
++		}
++
++		atomic_set(&d2q_kick_in_progress, 1);
++		ret = drm_atomic_commit(state);
++		atomic_set(&d2q_kick_in_progress, 0);
++		if (ret == -EDEADLK) {
++			drm_atomic_state_clear(state);
++			drm_modeset_backoff(&ctx);
++			goto retry;
++		}
++
++		if (ret && d2q_kick_logs < 20) {
++			d2q_kick_logs++;
++			pr_info("D2QDIRTY: async kick ret=%d\n", ret);
++		}
++out:
++		drm_atomic_state_put(state);
++		drm_modeset_drop_locks(&ctx);
++		drm_modeset_acquire_fini(&ctx);
++	} while (atomic_read(&d2q_kick_req) > 0);
++
++done:
++	clear_bit(0, &d2q_kick_armed);
++	/* raced request; re-arm shortly (collapsed) */
++	if (atomic_read(&d2q_kick_req) > 0 && d2q_kick_wq)
++		mod_delayed_work(d2q_kick_wq, &d2q_kick_work,
++				 msecs_to_jiffies(5));
++}
++
++
+ /* initialize fbdev helper */
+ struct drm_fb_helper *msm_fbdev_init(struct drm_device *dev)
+ {
+@@ -166,6 +279,8 @@
+ 	struct drm_fb_helper *helper;
+ 	int ret;
+ 
++	d2q_kick_wq = alloc_workqueue("d2qkick", 0, 1);
++
+ 	fbdev = kzalloc(sizeof(*fbdev), GFP_KERNEL);
+ 	if (!fbdev)
+ 		goto fail;
+@@ -199,13 +314,6 @@
+ 	return NULL;
+ }
+ 
+-/*
+- * d2q fbcon: push fbcon draws to the CMD-mode panel. The internal AMOLED
+- * only shows a frame when an atomic commit kicks it off, so without this
+- * hook the screen would stay frozen at whatever was in memory at the last
+- * modeset (boot logo). Reuses the lastclose-restore path, which is proven
+- * to commit correctly on this SDE stack.
+- */
+ int msm_fbdev_dirty(struct drm_framebuffer *fb,
+ 		struct drm_file *file_priv, unsigned int flags,
+ 		unsigned int color, struct drm_clip_rect *clips,
+@@ -213,11 +321,33 @@
+ {
+ 	struct drm_device *dev = fb->dev;
+ 	struct msm_drm_private *priv = dev->dev_private;
++	struct drm_crtc *crtc;
++	struct drm_plane *plane;
++	bool crtc_on = false, fb_on_plane = false;
+ 
+ 	if (!priv || !priv->fbdev)
+ 		return -ENODEV;
+ 
+-	return drm_fb_helper_restore_fbdev_mode_unlocked(priv->fbdev);
++	drm_for_each_crtc(crtc, dev)
++		if (crtc->state && crtc->state->enable && crtc->state->active)
++			crtc_on = true;
++
++	if (!crtc_on)
++		return 0;   /* DPMS off: nothing to kick */
++
++	drm_for_each_plane(plane, dev)
++		if (plane->state && plane->state->crtc &&
++		    plane->state->fb == fb)
++			fb_on_plane = true;
++
++	if (!fb_on_plane) {
++		/* fb not scanned by any plane: legacy fbcon-era fallback */
++		return drm_fb_helper_restore_fbdev_mode_unlocked(priv->fbdev);
++	}
++
++	d2q_kick_arm(dev);
++
++	return 0;
+ }
+ 
+ void msm_fbdev_free(struct drm_device *dev)
+@@ -228,6 +358,11 @@
+ 
+ 	DBG();
+ 
++	if (d2q_kick_wq) {
++		destroy_workqueue(d2q_kick_wq);
++		d2q_kick_wq = NULL;
++	}
++
+ 	drm_fb_helper_unregister_fbi(helper);
+ 
+ 	drm_fb_helper_fini(helper);

@@ -1,0 +1,67 @@
+--- /tmp/mp/mesa-25.3.0/src/gallium/drivers/zink/zink_screen.c	2025-11-15 00:25:42.000000000 +0300
++++ /home/usb/mnt-sda/mesa-root/root/mesa-25.3.0/src/gallium/drivers/zink/zink_screen.c	2026-10-24 02:16:27.966082909 +0300
+@@ -1748,6 +1748,28 @@
+          idx = zink_get_display_device(screen, pdev_count, pdevs, dev_major,
+                                        dev_minor);
+ 
++      /* PROJECT PATCH (d2q kgsl pivot, 2026-10-24): the only way to get an
++       * EGL surfaceless zink screen WITHOUT a DRM fd (which turnip/kgsl
++       * cannot have) is the sw-loader path, i.e. LIBGL_ALWAYS_SOFTWARE=1.
++       * But that makes choose_pdev accept only VK_PHYSICAL_DEVICE_TYPE_CPU
++       * devices, and with kgsl the single Vulkan device is the Adreno
++       * (INTEGRATED).  When exactly that configuration occurs -- cpu
++       * requested, no CPU device found, exactly one non-CPU device -- use
++       * it instead of failing. */
++      if (idx == -1 && pdev_count == 1) {
++         /* PROJECT PATCH (d2q kgsl pivot, 2026-10-24), part 2: the DRM
++          * identity path fails here too -- the only DRM node this kernel
++          * has is the msm *display* card, and turnip/kgsl has no DRM
++          * identity to match against it.  If exactly one non-CPU pdev
++          * exists, use it.  (Part 1 covered the cpu/sw-loader path.) */
++         VkPhysicalDeviceProperties props;
++         VKSCR(GetPhysicalDeviceProperties)(pdevs[0], &props);
++         if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
++            idx = 0;
++            mesa_loge("ZINK: no matching device for this DRM node; using the single non-CPU device (kgsl/Adreno)");
++         }
++      }
++
+       if (idx != -1)
+          /* valid cpu device */
+          screen->pdev = pdevs[idx];
+@@ -2433,7 +2455,15 @@
+    close(fd);
+    if (ret) {
+       if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+-         assert(!"how did this fail?");
++         /* PROJECT PATCH (d2q kgsl pivot, 2026-10-24): 4.14 kernel predates
++          * DMA_BUF_IOCTL_EXPORT_SYNC_FILE too.  Report "no semaphore" and
++          * let the caller's non-sync path run (same tradeoff as the import
++          * side: possible tearing, no breakage). */
++         static bool warned_once = false;
++         if (!warned_once) {
++            warned_once = true;
++            mesa_loge("ZINK: DMA_BUF_IOCTL_EXPORT_SYNC_FILE not supported by this kernel; continuing without dma-buf implicit sync");
++         }
+          return VK_NULL_HANDLE;
+       } else {
+          mesa_loge("MESA: failed to import sync file '%s'", strerror(errno));
+@@ -2485,7 +2515,17 @@
+       int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
+       if (ioctl_ret) {
+          if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+-            assert(!"how did this fail?");
++            /* PROJECT PATCH (d2q kgsl pivot, 2026-10-24): this kernel is
++             * 4.14 and predates DMA_BUF_IOCTL_IMPORT_SYNC_FILE (6.0), so
++             * ENOTTY here is EXPECTED, not a bug.  Continue without the
++             * optional implicit sync (worst case: tearing, not breakage).
++             * Upstream asserts because on >=6.0 kernels this cannot fail. */
++            static bool warned_once = false;
++            if (!warned_once) {
++               warned_once = true;
++               mesa_loge("ZINK: DMA_BUF_IOCTL_IMPORT_SYNC_FILE not supported by this kernel; continuing without dma-buf implicit sync");
++            }
++            ret = true;
+          } else {
+             ret = true;
+          }

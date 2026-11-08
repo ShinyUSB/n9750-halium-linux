@@ -1,0 +1,22 @@
+[Unit]
+Description=d2q Weston compositor TEST - GL renderer + landscape transform
+# Experimental only. Kept separate from weston.service (pixman) so it can be
+# started/stopped without editing the known-good unit.
+# The GL renderer is required for [output] transform to be accepted.
+Documentation=file:///home/usb/artifacts/display/WESTON-LOG.md
+After=systemd-udevd.service drm-kick.service
+Conflicts=weston.service
+
+[Service]
+Type=simple
+TimeoutStopSec=15
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=WAYLAND_DISPLAY=wayland-1
+ExecStartPre=/bin/mkdir -p /run/user/0
+ExecStartPre=/bin/chmod 700 /run/user/0
+ExecStart=/usr/bin/weston --backend=drm-backend.so --drm-device=card0 --use-gl --tty=1 --seat=seat0 --socket=wayland-1 --config=/root/.config/weston-gl.ini --log=/tmp/weston-gl.log
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

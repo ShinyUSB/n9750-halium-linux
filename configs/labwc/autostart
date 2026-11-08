@@ -1,0 +1,6 @@
+export LIBGL_ALWAYS_SOFTWARE=1
+waybar &
+pcmanfm-qt --desktop &
+lxqt-notificationd &
+lxqt-policykit-agent &
+/usr/local/bin/d2q-wl-keepalive &

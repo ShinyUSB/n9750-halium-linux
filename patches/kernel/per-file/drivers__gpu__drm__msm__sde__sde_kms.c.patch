@@ -1,0 +1,46 @@
+--- a/drivers/gpu/drm/msm/sde/sde_kms.c
++++ b/drivers/gpu/drm/msm/sde/sde_kms.c
+@@ -110,6 +110,11 @@
+ 	return sdecustom;
+ }
+ 
++static int d2q_dsi_crtc;
++module_param(d2q_dsi_crtc, int, 0644);
++MODULE_PARM_DESC(d2q_dsi_crtc,
++	"1=restrict DSI encoder to CRTC 0 (Note10+ sde: dead CRTC workaround)");
++
+ #ifdef CONFIG_DEBUG_FS
+ static int _sde_danger_signal_status(struct seq_file *s,
+ 		bool danger_status)
+@@ -1781,6 +1786,31 @@
+ 	for (i = 0; i < priv->num_encoders; i++)
+ 		priv->encoders[i]->possible_crtcs = (1 << priv->num_crtcs) - 1;
+ 
++	/*
++	 * D2Q PATCH (2026-10-24): on this device (Note10+, CAF sde) the DSI
++	 * encoder is routed by userspace to a dead CRTC (crtc-2), and
++	 * msm_atomic_commit fails with "failed to dispatch commit to any
++	 * CRTC" — the screen stays dark.  Weston (boot order) happens to
++	 * land on crtc-0, Xorg does not.  With d2q_dsi_crtc=1, restrict the
++	 * DSI-connected encoder to CRTC bit 0 so every client gets the
++	 * physically-wired CRTC.
++	 */
++	if (d2q_dsi_crtc) {
++		for (i = 0; i < priv->num_encoders; i++) {
++			if (priv->encoders[i]->encoder_type ==
++			    DRM_MODE_ENCODER_DSI)
++				priv->encoders[i]->possible_crtcs = 1;
++			else if (d2q_dsi_crtc >= 2 && priv->num_crtcs > 1)
++				/* reserve crtc-0 for DSI: ghost outputs
++				 * (Virtual/DP/writeback) must not take it,
++				 * or Xorg's first-crtc assignment leaves DSI
++				 * pointing at a dead CRTC (EINVAL at set-mode) */
++				priv->encoders[i]->possible_crtcs &= ~1u;
++		}
++		pr_info("D2QKMS: DSI encoder possible_crtcs forced to crtc-0 (mode %d)\n",
++			d2q_dsi_crtc);
++	}
++
+ 	return 0;
+ fail:
+ 	_sde_kms_drm_obj_destroy(sde_kms);

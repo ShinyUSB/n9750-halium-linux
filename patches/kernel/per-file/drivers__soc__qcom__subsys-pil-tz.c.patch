@@ -1,0 +1,107 @@
+--- a/drivers/soc/qcom/subsys-pil-tz.c
++++ b/drivers/soc/qcom/subsys-pil-tz.c
+@@ -112,6 +112,7 @@
+ 	u32 bus_client;
+ 	bool enable_bus_scaling;
+ 	bool keep_proxy_regs_on;
++	bool fw_loaded;
+ 	struct completion stop_ack;
+ 	struct completion shutdown_ack;
+ 	struct pil_desc desc;
+@@ -1135,6 +1136,43 @@
+ 			~BIT(d->bits_arr[PBL_DONE]), d->irq_mask);
+ }
+ 
++/*
++ * IMAGE 246 -- on-demand firmware load, off unless explicitly requested.
++ *
++ * Writing 1 calls the same subsys_powerup() -> pil_boot() path that a real
++ * powerup event would, which asks the secure world to load and start this PAS.
++ * That is why it is not done in the probe: an SCM secure-world call made at
++ * the wrong moment can wedge the machine, and on this device we already have
++ * an intermittent hard-freeze to contend with.
++ */
++static ssize_t fw_load_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct pil_tz_data *d = dev_get_drvdata(dev);
++	int val;
++	int rc;
++
++	if (kstrtoint(buf, 0, &val) || val != 1)
++		return -EINVAL;
++
++	if (d->fw_loaded) {
++		dev_warn(dev, "fw_load: already loaded\n");
++		return -EALREADY;
++	}
++
++	pr_info("pil_tz: fw_load requested for %s (pas_id %u, firmware '%s')\n",
++			dev_name(dev), d->pas_id, d->desc.name);
++
++	rc = subsys_powerup(&d->subsys_desc);
++
++	d->fw_loaded = (rc == 0);
++	pr_info("pil_tz: fw_load %s for %s: rc=%d\n",
++			rc == 0 ? "SUCCEEDED" : "FAILED", dev_name(dev), rc);
++	return count;
++}
++
++static DEVICE_ATTR(fw_load, 0644, NULL, fw_load_store);
++
+ static int pil_tz_driver_probe(struct platform_device *pdev)
+ {
+ 	struct pil_tz_data *d;
+@@ -1162,6 +1200,27 @@
+ 	if (rc)
+ 		return rc;
+ 
++	/*
++	 * IMAGE 246 -- BUG FIX: subsys_desc.fw_name was never populated.
++	 *
++	 * subsys_powerup() consumes subsys->fw_name:
++	 *
++	 *	d->desc.fw_name = subsys->fw_name;
++	 *	ret = pil_boot(&d->desc);
++	 *
++	 * but the probe only read the DT property into d->desc.name. Nothing in
++	 * this tree ever assigned subsys_desc.fw_name (it is devm_kzalloc'd,
++	 * so it was the empty string), meaning any powerup would have run
++	 *
++	 *	snprintf(fw_name, sizeof(fw_name), "%s.mdt", desc->fw_name);
++	 *
++	 * with fw_name == "" and requested a firmware literally named ".mdt".
++	 * All three powerup implementations in this tree (subsys-pil-tz,
++	 * subsys-pil-bg, pil-q6v5-mss) have the same latent defect.
++	 */
++	strlcpy(d->subsys_desc.fw_name, d->desc.name,
++		sizeof(d->subsys_desc.fw_name));
++
+ 	/* Defaulting smem_id to be not present */
+ 	d->smem_id = -1;
+ 
+@@ -1334,6 +1393,24 @@
+ 		goto err_subsys;
+ 	}
+ 
++	/*
++	 * IMAGE 246 -- on-demand firmware load.
++	 *
++	 * The probe deliberately does NOT boot the firmware: pil_boot() asks the
++	 * secure world to load and start a PAS, and getting that wrong hard-hangs
++	 * the device. Loading stays off unless something explicitly asks for it.
++	 *
++	 * This exists because the GPU (pil_gpu / "qcom,kgsl-hyp", pas-id 13) needs
++	 * its a640_zap firmware, and nothing in drivers/gpu/drm/msm/ triggers a
++	 * powerup -- CAF kgsl loads the zap itself via subsystem_get(), and that
++	 * framework does not exist in this CAF msm tree. Without the zap the
++	 * shader units silently do nothing while the CP domain works.
++	 *
++	 * Use:  echo 1 > /sys/devices/platform/soc/soc:qcom,kgsl-hyp/fw_load
++	 * Do it BEFORE touching the GPU. Result is printed, not guessed.
++	 */
++	device_create_file(&pdev->dev, &dev_attr_fw_load);
++
+ 	return 0;
+ err_subsys:
+ #ifdef CONFIG_QCOM_MINIDUMP

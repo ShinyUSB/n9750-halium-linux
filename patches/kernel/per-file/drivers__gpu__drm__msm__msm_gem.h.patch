@@ -1,0 +1,37 @@
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -135,6 +135,20 @@
+ 
+ 	struct msm_gem_address_space *aspace;
+ 	bool in_active_list;
++
++	/*
++	 * IMAGE 258 -- BO name, set via MSM_INFO_SET_NAME.
++	 *
++	 * freedreno labels every buffer it creates: "fs:...", "vs:...",
++	 * "pvtmem_per_fiber", "cmdstream", "gmem:...". Those labels are the
++	 * only authoritative way to say which buffer is which; everything
++	 * before this had to infer identity from size correlation, and got it
++	 * wrong repeatedly tonight (the "large vs small shader" distinction was
++	 * a reloc-patched dword; the pattern test's buffers were never
++	 * submitted at all). Set once, never re-read by the driver, purely for
++	 * diagnostics. Empty if Mesa did not name it.
++	 */
++	char name[64];
+ };
+ #define to_msm_bo(x) container_of(x, struct msm_gem_object, base)
+ 
+@@ -188,6 +202,13 @@
+ 	struct dma_fence *fence;
+ 	struct pid *pid;    /* submitting process */
+ 	bool valid;         /* true if no cmdstream patching needed */
++	/*
++	 * Monotonic submission counter. Required by a6xx, which writes it into
++	 * the command stream and has the GPU echo it back through
++	 * CACHE_FLUSH_TS into the ring fence memptr. The CAF tree instead
++	 * relies on gpu->fctx->completed_fence, so this is unused by a2xx-a5xx.
++	 */
++	unsigned int seqno;
+ 	unsigned int nr_cmds;
+ 	unsigned int nr_bos;
+ 	struct {

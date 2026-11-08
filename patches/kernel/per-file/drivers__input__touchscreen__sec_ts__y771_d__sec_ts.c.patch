@@ -1,0 +1,252 @@
+--- a/drivers/input/touchscreen/sec_ts/y771_d/sec_ts.c
++++ b/drivers/input/touchscreen/sec_ts/y771_d/sec_ts.c
+@@ -14,6 +14,7 @@
+ 
+ #include "sec_ts.h"
+ 
++
+ struct sec_ts_data *ts_dup;
+ 
+ #ifdef USE_POWER_RESET_WORK
+@@ -816,6 +817,31 @@
+ 
+ #if defined(CONFIG_TOUCHSCREEN_DUMP_MODE)
+ #include <linux/sec_ts_common.h>
++
++/*
++ * TEMPORARY bring-up silencing -- REMOVE ONCE A6xx BRING-UP IS DONE.
++ *
++ * The touch IRQ fires roughly every 9 ms and each pass through
++ * sec_ts_read_event() emits several input_info() lines, i.e. on the order of
++ * 100+ lines/second. That floods the kernel ring buffer so thoroughly that the
++ * A6xx GMU bring-up markers are rotated out within ~70 seconds, which makes the
++ * GPU bring-up unobservable over /dev/kmsg.
++ *
++ * Only the high-rate input_info() call sites inside sec_ts_read_event() are
++ * switched to SEC_TS_QUIET_INFO(); input_err() (real errors) is deliberately
++ * left alone. Off by default; set sec_ts_verbose=1 on the kernel command line to
++ * restore the old logging.
++ */
++static bool sec_ts_verbose;
++module_param(sec_ts_verbose, bool, 0644);
++MODULE_PARM_DESC(sec_ts_verbose,
++	"Re-enable high-rate sec_ts input_info logging (off by default)");
++
++#define SEC_TS_QUIET_INFO(mode, dev, fmt, ...)				\
++	do {									\
++		if (sec_ts_verbose)					\
++			input_info(mode, dev, fmt, ##__VA_ARGS__);	\
++	} while (0)
+ extern struct tsp_dump_callbacks dump_callbacks;
+ static struct delayed_work *p_ghost_check;
+ 
+@@ -1151,7 +1177,7 @@
+ 			return;
+ 		}
+ 
+-		input_info(true, &ts->client->dev, "%s: run LPM interrupt handler, %d\n", __func__, ret);
++		SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: run LPM interrupt handler, %d\n", __func__, ret);
+ 		/* run lpm interrupt handler */
+ 	}
+ 
+@@ -1164,14 +1190,14 @@
+ 	}
+ 
+ 	if (ts->debug_flag & SEC_TS_DEBUG_PRINT_ONEEVENT)
+-		input_info(true, &ts->client->dev, "ONE: %02X %02X %02X %02X %02X %02X %02X %02X\n",
++		SEC_TS_QUIET_INFO(true, &ts->client->dev, "ONE: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+ 				read_event_buff[0][0], read_event_buff[0][1],
+ 				read_event_buff[0][2], read_event_buff[0][3],
+ 				read_event_buff[0][4], read_event_buff[0][5],
+ 				read_event_buff[0][6], read_event_buff[0][7]);
+ 
+ 	if (read_event_buff[0][0] == 0) {
+-		input_info(true, &ts->client->dev, "%s: event buffer is empty\n", __func__);
++		SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: event buffer is empty\n", __func__);
+ 		return;
+ 	}
+ 
+@@ -1220,7 +1246,7 @@
+ 		event_id = event_buff[0] & 0x3;
+ 
+ 		if (ts->debug_flag & SEC_TS_DEBUG_PRINT_ALLEVENT)
+-			input_info(true, &ts->client->dev, "ALL: %02X %02X %02X %02X %02X %02X %02X %02X\n",
++			SEC_TS_QUIET_INFO(true, &ts->client->dev, "ALL: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+ 					event_buff[0], event_buff[1], event_buff[2], event_buff[3],
+ 					event_buff[4], event_buff[5], event_buff[6], event_buff[7]);
+ 
+@@ -1230,7 +1256,7 @@
+ 
+ 			/* tchsta == 0 && ttype == 0 && eid == 0 : buffer empty */
+ 			if (p_event_status->stype > 0)
+-				input_info(true, &ts->client->dev, "%s: STATUS %x %x %x %x %x %x %x %x\n", __func__,
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: STATUS %x %x %x %x %x %x %x %x\n", __func__,
+ 						event_buff[0], event_buff[1], event_buff[2],
+ 						event_buff[3], event_buff[4], event_buff[5],
+ 						event_buff[6], event_buff[7]);
+@@ -1267,7 +1293,7 @@
+ 			if ((p_event_status->stype == TYPE_STATUS_EVENT_INFO) &&
+ 					(p_event_status->status_id == SEC_TS_ACK_WET_MODE)) {
+ 				ts->wet_mode = p_event_status->status_data_1;
+-				input_info(true, &ts->client->dev, "%s: water wet mode %d\n",
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: water wet mode %d\n",
+ 						__func__, ts->wet_mode);
+ 				if (ts->wet_mode)
+ 					ts->wet_count++;
+@@ -1281,17 +1307,17 @@
+ 					ts->scrub_id = EVENT_TYPE_TSP_SCAN_UNBLOCK;
+ 					input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+ 					input_sync(ts->input_dev);
+-					input_info(true, &ts->client->dev, "%s: Normal changed(%d)\n", __func__, ts->scrub_id);
++					SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: Normal changed(%d)\n", __func__, ts->scrub_id);
+ 				} else if (p_event_status->status_data_1 == 5 && p_event_status->status_data_2 == 2) {
+ 					ts->scrub_id = EVENT_TYPE_TSP_SCAN_UNBLOCK;
+ 					input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+ 					input_sync(ts->input_dev);
+-					input_info(true, &ts->client->dev, "%s: lp changed(%d)\n", __func__, ts->scrub_id);
++					SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: lp changed(%d)\n", __func__, ts->scrub_id);
+ 				} else if (p_event_status->status_data_1 == 6) {
+ 					ts->scrub_id = EVENT_TYPE_TSP_SCAN_BLOCK;
+ 					input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+ 					input_sync(ts->input_dev);
+-					input_info(true, &ts->client->dev, "%s: sleep changed(%d)\n", __func__, ts->scrub_id);
++					SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: sleep changed(%d)\n", __func__, ts->scrub_id);
+ 				}
+ 				input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 0);
+ 				input_sync(ts->input_dev);
+@@ -1301,7 +1327,7 @@
+ 			if ((p_event_status->stype == TYPE_STATUS_EVENT_VENDOR_INFO) &&
+ 					(p_event_status->status_id == SEC_TS_VENDOR_ACK_NOISE_STATUS_NOTI)) {
+ 				ts->touch_noise_status = !!p_event_status->status_data_1;
+-				input_info(true, &ts->client->dev, "%s: TSP NOISE MODE %s[%02X %02X]\n",
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: TSP NOISE MODE %s[%02X %02X]\n",
+ 						__func__, ts->touch_noise_status == 0 ? "OFF" : "ON",
+ 						p_event_status->status_data_2, p_event_status->status_data_3);
+ 
+@@ -1312,14 +1338,14 @@
+ 			if ((p_event_status->stype == TYPE_STATUS_EVENT_VENDOR_INFO) &&
+ 					(p_event_status->status_id == SEC_TS_VENDOR_ACK_PRE_NOISE_STATUS_NOTI)) {
+ 				ts->touch_pre_noise_status = !!p_event_status->status_data_1;
+-				input_info(true, &ts->client->dev, "%s: TSP PRE NOISE MODE %s\n",
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: TSP PRE NOISE MODE %s\n",
+ 						__func__, ts->touch_pre_noise_status == 0 ? "OFF" : "ON");
+ 			}
+ 
+ 			if(ts->plat_data->support_ear_detect && ts->ed_enable){
+ 				if ((p_event_status->stype == TYPE_STATUS_EVENT_VENDOR_INFO) &&
+ 					(p_event_status->status_id == STATUS_EVENT_VENDOR_PROXIMITY)) {
+-						input_info(true, &ts->client->dev, "%s: EAR_DETECT(%d)\n",
++						SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: EAR_DETECT(%d)\n",
+ 							__func__, p_event_status->status_data_1);
+ 						input_report_abs(ts->input_dev_proximity, ABS_MT_CUSTOM,
+ 									p_event_status->status_data_1);
+@@ -1402,7 +1428,7 @@
+ 
+ 						location_detect(ts, location, ts->coord[t_id].x, ts->coord[t_id].y);
+ #if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+-						input_info(true, &ts->client->dev,
++						SEC_TS_QUIET_INFO(true, &ts->client->dev,
+ 								"[R] tID:%d loc:%s dd:%d,%d mc:%d tc:%d lx:%d ly:%d mx:%d my:%d p:%d noise:(%x,%d%d) nlvl:%d, maxS:%d, hid:%d\n",
+ 								t_id, location,
+ 								ts->coord[t_id].x - ts->coord[t_id].p_x,
+@@ -1414,7 +1440,7 @@
+ 								ts->coord[t_id].noise_status, ts->touch_noise_status, ts->touch_pre_noise_status,
+ 								ts->coord[t_id].noise_level, ts->coord[t_id].max_strength, ts->coord[t_id].hover_id_num);
+ #else
+-						input_info(true, &ts->client->dev,
++						SEC_TS_QUIET_INFO(true, &ts->client->dev,
+ 								"[R] tID:%d loc:%s dd:%d,%d mp:%d,%d mc:%d tc:%d p:%d noise:(%x,%d%d) nlvl:%d, maxS:%d, hid:%d\n",
+ 								t_id, location,
+ 								ts->coord[t_id].x - ts->coord[t_id].p_x,
+@@ -1474,7 +1500,7 @@
+ 						}
+ 
+ #if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+-						input_info(true, &ts->client->dev,
++						SEC_TS_QUIET_INFO(true, &ts->client->dev,
+ 								"[P] tID:%d.%d x:%d y:%d z:%d major:%d minor:%d loc:%s tc:%d type:%X noise:(%x,%d%d), nlvl:%d, maxS:%d, hid:%d\n",
+ 								t_id, (ts->input_dev->mt->trkid - 1) & TRKID_MAX,
+ 								ts->coord[t_id].x, ts->coord[t_id].y, ts->coord[t_id].z,
+@@ -1484,7 +1510,7 @@
+ 								ts->coord[t_id].noise_status, ts->touch_noise_status, ts->touch_pre_noise_status,
+ 								ts->coord[t_id].noise_level, ts->coord[t_id].max_strength, ts->coord[t_id].hover_id_num);
+ #else
+-						input_info(true, &ts->client->dev,
++						SEC_TS_QUIET_INFO(true, &ts->client->dev,
+ 								"[P] tID:%d.%d z:%d major:%d minor:%d loc:%s tc:%d type:%X noise:(%x,%d%d), nlvl:%d, maxS:%d, hid:%d\n",
+ 								t_id, (ts->input_dev->mt->trkid - 1) & TRKID_MAX,
+ 								ts->coord[t_id].z, ts->coord[t_id].major,
+@@ -1502,7 +1528,7 @@
+ 						if (pre_action == SEC_TS_COORDINATE_ACTION_NONE || pre_action == SEC_TS_COORDINATE_ACTION_RELEASE) {
+ 							location_detect(ts, location, ts->coord[t_id].x, ts->coord[t_id].y);
+ #if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+-							input_info(true, &ts->client->dev,
++							SEC_TS_QUIET_INFO(true, &ts->client->dev,
+ 									"[M] tID:%d.%d x:%d y:%d z:%d major:%d minor:%d loc:%s tc:%d type:%X noise:(%x,%d%d), nlvl:%d, maxS:%d, hid:%d\n",
+ 									t_id, ts->input_dev->mt->trkid & TRKID_MAX,
+ 									ts->coord[t_id].x, ts->coord[t_id].y, ts->coord[t_id].z,
+@@ -1510,7 +1536,7 @@
+ 									ts->coord[t_id].ttype, ts->coord[t_id].noise_status, ts->touch_noise_status, ts->touch_pre_noise_status,
+ 									ts->coord[t_id].noise_level, ts->coord[t_id].max_strength, ts->coord[t_id].hover_id_num);
+ #else
+-							input_info(true, &ts->client->dev,
++							SEC_TS_QUIET_INFO(true, &ts->client->dev,
+ 									"[M] tID:%d.%d z:%d major:%d minor:%d loc:%s tc:%d type:%X noise:(%x,%d%d), nlvl:%d, maxS:%d, hid:%d\n",
+ 									t_id, ts->input_dev->mt->trkid & TRKID_MAX, ts->coord[t_id].z, 
+ 									ts->coord[t_id].major, ts->coord[t_id].minor, location, ts->touch_count,
+@@ -1548,7 +1574,7 @@
+ 					if ((ts->coord[t_id].action == SEC_TS_COORDINATE_ACTION_PRESS)
+ 							|| (ts->coord[t_id].action == SEC_TS_COORDINATE_ACTION_MOVE)) {
+ 						if (ts->coord[t_id].ttype != pre_ttype) {
+-							input_info(true, &ts->client->dev, "%s : tID:%d ttype(%x->%x)\n",
++							SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s : tID:%d ttype(%x->%x)\n",
+ 									__func__, ts->coord[t_id].id,
+ 									pre_ttype, ts->coord[t_id].ttype);
+ 						}
+@@ -1568,7 +1594,7 @@
+ 			switch (p_gesture_status->stype) {
+ 			case SEC_TS_GESTURE_CODE_SWIPE:
+ 				ts->scrub_id = SPONGE_EVENT_TYPE_SPAY;
+-				input_info(true, &ts->client->dev, "%s: SPAY: %d\n", __func__, ts->scrub_id);
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: SPAY: %d\n", __func__, ts->scrub_id);
+ 				input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+ 				ts->all_spay_count++;
+ 				break;
+@@ -1580,15 +1606,15 @@
+ 					ts->scrub_y = (p_gesture_status->gesture_data_2 << 4)
+ 								| (p_gesture_status->gesture_data_3 & 0x0F);
+ #ifdef CONFIG_SAMSUNG_PRODUCT_SHIP
+-					input_info(true, &ts->client->dev, "%s: AOD: %d\n", __func__, ts->scrub_id);
++					SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: AOD: %d\n", __func__, ts->scrub_id);
+ #else
+-					input_info(true, &ts->client->dev, "%s: AOD: %d, %d, %d\n",
++					SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: AOD: %d, %d, %d\n",
+ 							__func__, ts->scrub_id, ts->scrub_x, ts->scrub_y);
+ #endif
+ 					input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+ 					ts->all_aod_tap_count++;
+ 				} else if (p_gesture_status->gesture_id == SEC_TS_GESTURE_ID_DOUBLETAP_TO_WAKEUP) {
+-					input_info(true, &ts->client->dev, "%s: AOT\n", __func__);
++					SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: AOT\n", __func__);
+ 					input_report_key(ts->input_dev, KEY_WAKEUP, 1);
+ 					input_sync(ts->input_dev);
+ 					input_report_key(ts->input_dev, KEY_WAKEUP, 0);
+@@ -1601,15 +1627,15 @@
+ 				ts->scrub_y = (p_gesture_status->gesture_data_2 << 4)
+ 							| (p_gesture_status->gesture_data_3 & 0x0F);
+ #ifdef CONFIG_SAMSUNG_PRODUCT_SHIP
+-				input_info(true, &ts->client->dev, "%s: SINGLE TAP: %d\n", __func__, ts->scrub_id);
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: SINGLE TAP: %d\n", __func__, ts->scrub_id);
+ #else
+-				input_info(true, &ts->client->dev, "%s: SINGLE TAP: %d, %d, %d\n",
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: SINGLE TAP: %d, %d, %d\n",
+ 						__func__, ts->scrub_id, ts->scrub_x, ts->scrub_y);
+ #endif
+ 				input_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+ 				break;
+ 			case SEC_TS_GESTURE_CODE_PRESS:
+-				input_info(true, &ts->client->dev, "%s: FOD: %sPRESS\n",
++				SEC_TS_QUIET_INFO(true, &ts->client->dev, "%s: FOD: %sPRESS\n",
+ 						__func__, p_gesture_status->gesture_id ? "" : "LONG");
+ 				break;
+ 			}

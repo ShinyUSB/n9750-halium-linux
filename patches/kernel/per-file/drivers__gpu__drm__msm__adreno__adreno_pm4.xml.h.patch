@@ -1,0 +1,13 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_pm4.xml.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_pm4.xml.h
+@@ -65,6 +65,10 @@
+ 	CACHE_FLUSH_AND_INV_EVENT = 22,
+ 	PERFCOUNTER_START = 23,
+ 	PERFCOUNTER_STOP = 24,
++	/* a6xx only; absent from the CAF tree. Duplicate values are fine
++	 * here - upstream reuses the same numbers in enum cp_event. */
++	PC_CCU_INVALIDATE_DEPTH = 24,
++	PC_CCU_INVALIDATE_COLOR = 25,
+ 	VS_FETCH_DONE = 27,
+ 	FACENESS_FLUSH = 28,
+ 	FLUSH_SO_0 = 17,

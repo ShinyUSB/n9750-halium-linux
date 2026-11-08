@@ -1,0 +1,69 @@
+--- a/drivers/soc/qcom/service-locator.c
++++ b/drivers/soc/qcom/service-locator.c
+@@ -274,19 +274,40 @@
+ 		goto inited;
+ 	}
+ 
+-	qmi_add_lookup(&service_locator.clnt_handle,
+-			SERVREG_LOC_SERVICE_ID_V01,
+-			SERVREG_LOC_SERVICE_VERS_V01,
+-			SERVREG_LOC_SERVICE_INSTANCE_ID);
+-
+-	rc = wait_for_completion_interruptible_timeout(
+-				&service_locator.service_available,
+-				msecs_to_jiffies(LOCATOR_SERVICE_TIMEOUT));
+-	if (rc < 0) {
+-		pr_err("Wait for locator service interrupted by signal\n");
+-		goto inited;
++	/*
++	 * D2Q: the QRTR name service runs in userspace and binds the ctrl
++	 * port seconds AFTER the kernel audio/slimbus drivers probe and send
++	 * their one-shot NEW_LOOKUP. A single wait therefore always times out
++	 * on this device and the static latch below poisoned the locator for
++	 * the whole boot (audio PDR, slimbus NGD, fastrpc audio-PD all dead).
++	 * Re-send the lookup periodically instead of latching; keep the latch
++	 * as the final fallback after the retry budget is exhausted.
++	 */
++	{
++		int tries;
++
++		for (tries = 0; tries < 60; tries++) {
++			qmi_add_lookup(&service_locator.clnt_handle,
++					SERVREG_LOC_SERVICE_ID_V01,
++					SERVREG_LOC_SERVICE_VERS_V01,
++					SERVREG_LOC_SERVICE_INSTANCE_ID);
++
++			rc = wait_for_completion_interruptible_timeout(
++					&service_locator.service_available,
++					msecs_to_jiffies(10000));
++			if (rc > 0)
++				break;
++			if (rc < 0) {
++				pr_err("Wait for locator service interrupted by signal\n");
++				goto inited;
++			}
++			/* completion may have been completed by del_server
++			 * (service lost) - re-lookup if not connected */
++			if (service_locator.connected)
++				break;
++		}
+ 	}
+-	if (!rc) {
++	if (!service_locator.connected) {
+ 		pr_err("%s: wait for locator service timed out\n", __func__);
+ 		service_timedout = true;
+ 		rc = -ETIME;
+@@ -363,9 +384,10 @@
+ 	if (rc) {
+ 		pr_err("Failed to get process domains for %s for client %s rc:%d\n",
+ 			data->service_name, data->client_name, rc);
+-#ifdef CONFIG_SLIMBUS_DEBUG
+-		panic("Failed to get process domains");
+-#endif
++		/* D2Q: no panic here — CONFIG_SLIMBUS_DEBUG made any locator
++		 * hiccup (userspace daemon not yet answering, QMI decode
++		 * failure) a hard reset of the whole phone. The notifier
++		 * fallback (SSR) is the correct recovery path. */
+ 		pdqw->notifier->notifier_call(pdqw->notifier,
+ 			LOCATOR_DOWN, NULL);
+ 		goto err_servloc_send_msg;

@@ -1,0 +1,266 @@
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -236,6 +236,98 @@
+ }
+ 
+ 
++/*
++ * IMAGE 249 -- map user GPU buffers writecombine.
++ *
++ * The GPU on this platform is NOT coherent with the CPU cache. The tree says so
++ * itself, twice:
++ *
++ *   msm_gem.c: "Make sure to flush the CPU cache for newly allocated memory so
++ *               we don't get ourselves into trouble with a dirty cache"
++ *   msm_gem.c: "For non-cached buffers, ensure the new pages are clean because
++ *               display controller, GPU, etc. are not coherent"
++ *
++ * and it acts on that -- but ONLY for objects flagged MSM_BO_WC/MSM_BO_UNCACHED,
++ * with explicit sync_for_device()/sync_for_cpu(). Those flags cover the
++ * ringbuffer, scanout FBOs, the cursor and imported dmabufs. They are NOT
++ * reachable from userspace (the DRM alloc ioctl exposes no equivalent), so every
++ * GL buffer Mesa allocates falls into the cached branch below.
++ *
++ * Consequence, and it is the whole rendering failure:
++ *
++ *   userspace writes the shader ISA / buffer data through a CACHEABLE mapping
++ *     -> it stays as dirty cache lines
++ *     -> it is never written back to DRAM
++ *     -> the GPU DMAs from DRAM and reads ZEROS
++ *
++ * A zero ISA is a no-op, not a fault. Hence: CP domain perfect, ring drains,
++ * fences signal, CP_INTERRUPT_STATUS always 0, no GMU error, no hang-detect
++ * trigger -- and nothing rendered, ever. It also explains the case an empty-ISA
++ * theory could not: glClear produces nothing either, because the render
++ * target's contents are equally invisible to the GPU.
++ *
++ * Proof it is coherency and not lost data: writing a pattern via
++ * glMapBufferRange and reading it back from the SAME pointer returns the
++ * pattern, while glGetBufferSubData and the kernel's own BOS[] dump (which
++ * reads via pgprot_writecombine, a non-shareable mapping) both return zeros.
++ *
++ * The fix is to stop handing userspace a cacheable mapping for GPU memory. WC
++ * writes go straight through to memory, which is exactly why the ringbuffer
++ * (already MSM_BO_WC) has always worked.
++ *
++ * IMAGE 251 -- DEFAULT BACK TO OFF.
++ *
++ * This was measured and it changes nothing: with bo_mmap_wc both Y and N the
++ * kernel's view of a BO disagrees with userspace's in the same way, so the
++ * writecombine mapping is not the cause of anything observed. It costs
++ * performance and it was adopted on the strength of a measurement that later
++ * turned out to be reading the wrong memory. Left in place, default OFF, so it
++ * can still be A/B'd if a future experiment makes it relevant.
++ *
++ * IMAGE 258 -- RETRACTION. The sentence above is no longer trustworthy. The
++ * "kernel's view disagrees with userspace's" observation came from the
++ * pattern test, which has since been shown to be a NULL TEST: the buffers it
++ * wrote were never submitted, so the kernel never had a chance to observe
++ * them. See CORRECTION-PATTERN-TEST-WAS-A-NULL-TEST.md. Separately, image 258
++ * showed this whole line of inquiry was reading submit->bos[b].flags instead
++ * of bo->flags, so no cache-mode conclusion was ever actually under test.
++ * Default stays 0, but "no effect has been measured" should be read as
++ * "never properly measured".
++ */
++static bool bo_mmap_wc;
++module_param(bo_mmap_wc, bool, 0644);
++MODULE_PARM_DESC(bo_mmap_wc, "Map userspace GPU buffer mappings writecombine instead of cacheable. Default 0");
++
++/*
++ * IMAGE 258 -- force every BO to be mapped cacheable.
++ *
++ * freedreno picks the cachiness in msm_bo.c new_handle():
++ *
++ *	if (flags & FD_BO_CACHED_COHERENT)
++ *		req.flags |= MSM_BO_CACHED_COHERENT;
++ *	else
++ *		req.flags |= MSM_BO_WC;
++ *
++ * and marks exactly three things FD_BO_NOMAP -- the shader ISA
++ * (ir3_gallium.c), pvtmem (fd6_program.c), tess factors (fd6_program.c).
++ * So every GPU-only buffer is writecombine, while command streams are cached
++ * coherent and do have data. That is the one structural asymmetry left
++ * standing, and it is currently UNTESTED: the BOS dump used to print
++ * submit->bos[b].flags (internal submit bookkeeping, decoded 0x6003), not
++ * bo->flags, so no correlation between cache mode and content could ever be
++ * observed. Image 258 prints bo->flags properly; this parameter is the
++ * follow-up, so that if the correlation confirms, the next boot needs no
++ * rebuild.
++ *
++ * Set 1 to rewrite MSM_BO_WC / MSM_BO_UNCACHED to MSM_BO_CACHED at allocation
++ * time, which changes BOTH the userspace VMA (msm_gem_mmap_obj) and the
++ * kernel's own view (msm_gem_get_vaddr) in one go. Default 0, so the
++ * diagnostic boot is untouched.
++ */
++static bool bo_force_cached;
++module_param(bo_force_cached, bool, 0644);
++MODULE_PARM_DESC(bo_force_cached, "Force MSM_BO_CACHED on all BOs regardless of what userspace asked for. Diagnostic A/B for the shader-ISA upload anomaly. Default 0");
++
+ int msm_gem_mmap_obj(struct drm_gem_object *obj,
+ 		struct vm_area_struct *vma)
+ {
+@@ -244,10 +336,29 @@
+ 	vma->vm_flags &= ~VM_PFNMAP;
+ 	vma->vm_flags |= VM_MIXEDMAP;
+ 
++	/*
++	 * IMAGES 255/256 -- the mmap trace now lives in msm_gem_mmap() itself,
++	 * at entry and on failure. It used to live here, which meant a mmap that
++	 * was attempted and REJECTED by drm_gem_mmap() logged nothing at all --
++	 * and a rejected mmap is exactly what gives fd_bo_map() a NULL and makes
++	 * fd_bo_upload() skip the ISA memcpy in silence.
++	 */
++
+ 	if (msm_obj->flags & MSM_BO_WC) {
+ 		vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+ 	} else if (msm_obj->flags & MSM_BO_UNCACHED) {
+ 		vma->vm_page_prot = pgprot_noncached(vm_get_page_prot(vma->vm_flags));
++	} else if (bo_mmap_wc) {
++		/*
++		 * IMAGE 249: same treatment as MSM_BO_WC, but for objects the
++		 * GPU must be able to see writes to -- i.e. everything userspace
++		 * allocates. See the long comment above bo_mmap_wc.
++		 *
++		 * Deliberately does NOT do the shmem shunting the cached branch
++		 * does: that exists so unmap_mapping_range() behaves, and the WC
++		 * path (already used by the ringbuffer) does not need it.
++		 */
++		vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+ 	} else {
+ 		/*
+ 		 * Shunt off cached objs to shmem file so they have their own
+@@ -268,13 +379,52 @@
+ int msm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+ 	int ret;
++	struct drm_gem_object *gobj = vma->vm_private_data;
++	struct msm_gem_object *msm_obj = NULL;
++
++	if (gobj)
++		msm_obj = to_msm_bo(gobj);
++
++	/*
++	 * IMAGE 256 -- move the trace to BEFORE the failure point.
++	 *
++	 * Image 255 logged inside msm_gem_mmap_obj(), which is only reached
++	 * AFTER drm_gem_mmap() succeeds. So a mmap that was attempted and
++	 * REJECTED produced no log line at all, and the trace showed "Mesa
++	 * never mmaps the shader ISA buffer" when the truth could equally have
++	 * been "the mmap failed silently".
++	 *
++	 * That distinction is the whole question, because a failed mmap gives
++	 * fd_bo_map() a NULL, fd_bo_upload() then skips its memcpy with no
++	 * error, and the ISA buffer stays zero at exactly the right size:
++	 *
++	 * 	char *dst = fd_bo_map(bo);
++	 * 	if (dst) { memcpy(dst + offset, src, size); }
++	 * 	...and with no else branch, and no log, either.
++	 *
++	 * The firmware upload path is not a guess either: this tree has
++	 * image-167 "PROMOTE (Mesa UAPI compat)" edits to msm_ioctl_gem_info(),
++	 * and Mesa 22.x reaches GEM mapping through the mmap_offset ioctl, so
++	 * a mismatched offset there would fail every mmap for affected
++	 * objects without anything appearing in the log.
++	 */
++	pr_info("MMAP256: mmap requested obj=%px size=%zu flags=0x%x pgoff=%lu\n",
++		(void *)gobj, gobj ? gobj->size : 0,
++		msm_obj ? msm_obj->flags : 0, vma->vm_pgoff);
+ 
+ 	ret = drm_gem_mmap(filp, vma);
+ 	if (ret) {
+ 		DBG("mmap failed: %d", ret);
++		pr_info("MMAP256: *** drm_gem_mmap FAILED obj=%px rc=%d (%s) -- userspace will get NULL and fd_bo_upload() will silently skip ***\n",
++			(void *)vma->vm_private_data, ret,
++			ret == -ENODEV ? "offset not found" :
++			ret == -EINVAL ? "bad offset/flags" :
++			ret == -ENOMEM ? "no memory" : "other");
+ 		return ret;
+ 	}
+ 
++	pr_info("MMAP256: drm_gem_mmap OK obj=%px\n", (void *)vma->vm_private_data);
++
+ 	return msm_gem_mmap_obj(vma->vm_private_data, vma);
+ }
+ 
+@@ -773,6 +923,61 @@
+ 	WARN_ON(!is_purgeable(msm_obj));
+ 	WARN_ON(obj->import_attach);
+ 
++	/*
++	 * IMAGE 252 -- do not purge while a vmap is outstanding.
++	 *
++	 * This is a real, reproducible dangling-pointer bug, and it was
++	 * corrupting every buffer-content measurement in this project.
++	 *
++	 * The sequence:
++	 *
++	 *  1. msm_gem_get_vaddr() caches msm_obj->vaddr and increments
++	 *     vmap_count.
++	 *  2. The shrinker reaches us now. msm_gem_vunmap_locked() checks
++	 *
++	 *	(is_vunmapable() = vmap_count == 0 && vaddr)
++	 *
++	 *     so with vmap_count > 0 it RETURNS EARLY -- and its only
++	 *     "vaddr = NULL" is on the success path, so the cached pointer
++	 *     SURVIVES.
++	 *  3. We then call put_pages(), which frees msm_obj->pages and NULLs
++	 *     it -- but still never clears msm_obj->vaddr.
++	 *  4. The next msm_gem_get_vaddr() sees vaddr != NULL and hands back
++	 *     that pointer to the FREED pages, without re-mapping. The object
++	 *     meanwhile gets fresh pages at new physical addresses.
++	 *
++	 * Measured directly, every submitted BO:
++	 *
++	 *  virt_to_phys=0x97f46000  sgt_phys=0x3cb3f9000  != MISMATCH
++	 *
++	 * i.e. the diagnostic was reading a freed allocation, in a completely
++	 * different physical range from the memory the GPU was given. That is
++	 * where every "the buffer is all zeros" result in this project came
++	 * from -- including the (withdrawn) empty-shader-ISA finding.
++	 *
++	 * Note our own instrumentation is what opens the window: the BOS[] dump
++	 * takes a vaddr around every submit, so it is what drives vmap_count up
++	 * at exactly the moment the shrinker can fire.
++	 *
++	 * The fix is to refuse to purge while the mapping is in use. Simply
++	 * NULLing vaddr instead would be WRONG: whoever is inside
++	 * msm_gem_get_vaddr() right now is about to dereference that pointer,
++	 * and zeroing it would hand them a use-after-free. Leaving it set
++	 * while freeing the pages underneath is equally bad. The only safe
++	 * answer is to not free anything until the mapping is released.
++	 *
++	 * The object stays purgeable and the shrinker will simply take another
++	 * pass later, when vmap_count is back to zero.
++	 */
++	if (msm_obj->vmap_count) {
++		mutex_lock_nested(&msm_obj->lock, subclass);
++		pr_info("GEM252: deferring purge of %s (vmap_count=%u, vaddr=%px)\n",
++			obj->name ? obj->name : "?", msm_obj->vmap_count,
++			msm_obj->vaddr);
++		mutex_unlock(&msm_obj->lock);
++		return;
++	}
++
+ 	mutex_lock_nested(&msm_obj->lock, subclass);
+ 
+ 	put_iova(obj);
+@@ -1103,6 +1308,19 @@
+ 	msm_obj->flags = flags;
+ 	msm_obj->madv = MSM_MADV_WILLNEED;
+ 
++	/*
++	 * IMAGE 258 -- optional diagnostic A/B. Done here, at allocation, so
++	 * that every consumer of bo->flags sees the same value: the userspace
++	 * VMA page prot in msm_gem_mmap_obj(), the vmap prot in
++	 * msm_gem_get_vaddr(), and the sync_for_device()/sync_for_cpu()
++	 * decisions in get_pages()/put_pages(). Rewriting the flag here rather
++	 * than in each consumer keeps them from disagreeing, which is how the
++	 * earlier coherency measurements went wrong.
++	 */
++	if (bo_force_cached && (msm_obj->flags & MSM_BO_CACHE_MASK))
++		msm_obj->flags = (msm_obj->flags & ~MSM_BO_CACHE_MASK) |
++				 MSM_BO_CACHED;
++
+ 	if (resv) {
+ 		msm_obj->resv = resv;
+ 	} else {

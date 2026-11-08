@@ -1,0 +1,13 @@
+--- a/arch/arm64/configs/d2q_chn_hk_defconfig
++++ b/arch/arm64/configs/d2q_chn_hk_defconfig
+@@ -2449,7 +2449,9 @@
+ CONFIG_OKL4_VTTY=y
+ CONFIG_OKL4_VTTY_CONSOLE=y
+ CONFIG_LDISC_AUTOLOAD=y
+-# CONFIG_DEVMEM is not set
++CONFIG_DEVMEM=y
++# CONFIG_STRICT_DEVMEM is not set
++# CONFIG_IO_STRICT_DEVMEM is not set
+ 
+ #
+ # Serial drivers

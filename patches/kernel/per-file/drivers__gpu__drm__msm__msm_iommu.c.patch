@@ -1,0 +1,58 @@
+--- a/drivers/gpu/drm/msm/msm_iommu.c
++++ b/drivers/gpu/drm/msm/msm_iommu.c
+@@ -90,12 +90,55 @@
+ 	kfree(iommu);
+ }
+ 
++/*
++ * IMAGE 270 -- page table base + ASID, for CP_SMMU_TABLE_UPDATE.
++ *
++ * Upstream equivalent: msm_iommu_pagetable_params().  This tree's SMMU returns
++ * the page table base with the ASID already folded in, at bit 48
++ * (drivers/iommu/arm-smmu.c:3627):
++ *
++ *     val  = pgtbl_cfg.arm_lpae_s1_cfg.ttbr[0];
++ *     val |= (u64)asid << TTBRn_ASID_SHIFT;      (that shift is 48)
++ *
++ * The packet wants TTBR0_LO = bits[31:0] and TTBR0_HI = bits[63:32], so the
++ * correct emission is simply the two halves of this value -- the ASID rides
++ * into the high dword on its own.  Masking it out and re-shifting it (as
++ * upstream does, because upstream stores ttbr and asid separately) would be
++ * equivalent but is unnecessary here.  Returning the raw value avoids having
++ * to hardcode the shift, which lives in a private IOMMU header
++ * (drivers/iommu/arm-smmu-regs.h:235) that msm cannot include.
++ *
++ * Returns -EINVAL when the domain has no page table yet, which is what arm-smmu
++ * reports before the domain is attached.  The caller must treat that as
++ * "skip", never as a submit failure.
++ */
++static int msm_iommu_get_pagetable_params(struct msm_mmu *mmu,
++		uint64_t *ttbr, int *asid)
++{
++	struct msm_iommu *iommu = to_msm_iommu(mmu);
++	uint64_t val;
++
++	if (!iommu || !iommu->domain)
++		return -EINVAL;
++
++	if (iommu_domain_get_attr(iommu->domain, DOMAIN_ATTR_TTBR0, &val))
++		return -EINVAL;
++
++	if (ttbr)
++		*ttbr = val;	/* ASID already at bit 48 -- do not mask */
++	if (asid)
++		*asid = (int)(val >> 48);	/* for logging only */
++
++	return 0;
++}
++
+ static const struct msm_mmu_funcs funcs = {
+ 		.attach = msm_iommu_attach,
+ 		.detach = msm_iommu_detach,
+ 		.map = msm_iommu_map,
+ 		.unmap = msm_iommu_unmap,
+ 		.destroy = msm_iommu_destroy,
++		.get_pagetable_params = msm_iommu_get_pagetable_params,
+ };
+ 
+ struct msm_mmu *msm_iommu_new(struct device *dev, struct iommu_domain *domain)

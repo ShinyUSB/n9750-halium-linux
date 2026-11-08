@@ -1,0 +1,31 @@
+NOTICE — what is deliberately NOT in this repository
+=====================================================
+
+This project contains research notes, GPL kernel patches and MIT mesa patches only.
+The following material was intentionally excluded. None of it is required to read or
+understand the research; the docs describe how to obtain it from your own device.
+
+1. Proprietary firmware and vendor binaries (no redistribution license):
+   - Samsung/Qualcomm: boot images, dtbo images, ABL/firmware dumps, vendor partition
+     contents, camera HAL libraries (camera.qcom.so, com.samsung.chi.override.so,
+     libTOFProc_interface.so, ...), sensor modules, ADSP/MPSS/SLPI firmware images.
+   - Broadcom: WLAN firmware (bcmdhd), BT patchram (bcm4375B1_murata.hcd), NVRAM.
+   - Qualcomm GPU firmware (a630_sqe.fw, a640_gmu.bin).
+   - Any unmapped "blob" dumps (.raw frames, .so files, .bin dumps).
+
+2. Per-device secrets:
+   - SSH host/device private keys.
+   - wpa_supplicant.conf with plaintext Wi-Fi PSKs.
+
+3. Device-specific calibration data (IMEI-adjacent, per-unit):
+   - modemst/EFS dumps, persist partition contents, sensor calibration blobs.
+
+4. Large build artifacts:
+   - Kernel object trees, rootfs/chroot images, boot image binaries, .deb/.tar caches.
+
+If you are the rights holder of something you believe should be here or not here, open an
+issue.
+
+Licensing of what IS here: kernel patches are GPL-2.0 (Samsung SM8150 kernel lineage);
+mesa deltas are MIT (Mesa); everything written by this project (docs, scripts, configs)
+is offered under CC BY-SA 4.0 unless a file states otherwise.

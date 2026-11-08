@@ -1,0 +1,850 @@
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -39,6 +39,8 @@
+ 
+ #include <linux/of_address.h>
+ #include <linux/kthread.h>
++#include <linux/delay.h>
++#include <linux/string.h>
+ #include <uapi/linux/sched/types.h>
+ #include <drm/drm_of.h>
+ #include <soc/qcom/boot_stats.h>
+@@ -57,7 +59,45 @@
+  * - 1.2.0 - adds explicit fence support for submit ioctl
+  */
+ #define MSM_VERSION_MAJOR	1
+-#define MSM_VERSION_MINOR	2
++/*
++ * TEMPORARY image 190 -- PROMOTE. THE ACTUAL BLOCKER.
++ *
++ * Was 2. Freedreno selects its submit path purely from the version minor we
++ * advertise via DRM_IOCTL_VERSION (src/freedreno/drm/msm/msm_pipe.c:255):
++ *
++ *     if (fd_device_version(dev) >= FD_VERSION_SOFTPIN)  [== 4]
++ *             pipe->funcs = &sp_funcs;
++ *     else
++ *             pipe->funcs = &legacy_funcs;
++ *
++ * legacy_funcs has NO .flush member -- it is left NULL. Mesa's fd_pipe_flush()
++ * guards that, but the legacy submit path calls through a different, unguarded
++ * pointer and jumps to 0. Observed directly:
++ *
++ *     unhandled level 2 translation fault at 0x00000000, esr 0x82000006
++ *     pc : 0x0
++ *     lr : 0x7faf2bb54c   ->  msm_dri.so + 0x9db548
++ *     0x9db548: d63f0080   BLR x4        (x4 == 0)
++ *
++ * A staged harness proved it is the flush path and not teardown: stages that
++ * build context/FBO/program produce ZERO faults; only the stage that adds
++ * glClear+glFlush produces one.
++ *
++ * 4 is the minimum that fixes it, and deliberately stops there. Each gate at
++ * or below 4 maps to something this driver really implements:
++ *
++ *   FD_VERSION_UNLIMITED_CMDS (1)  - growable ringbuffers: implemented
++ *   FD_VERSION_FENCE_FD        (2)  - in/out fence_fd in submit: implemented
++ *   FD_VERSION_SUBMIT_QUEUES   (3)  - MSM_SUBMITQUEUE_NEW (0x0A) exists here
++ *   FD_VERSION_GMEM_BASE       (3)  - MSM_PARAM_GMEM_BASE implemented
++ *   FD_VERSION_SOFTPIN         (4)  - selects sp_funcs, which HAS .flush
++ *
++ * Not claiming 5/7/8: ROBUSTNESS(5) would make Mesa call
++ * DRM_MSM_SUBMITQUEUE_QUERY (0x0C), which this driver does NOT implement, and
++ * CACHED_COHERENT(8) would trigger a test allocation we have not verified.
++ * Advertising exactly 4 keeps every gate mapped to a real capability.
++ */
++#define MSM_VERSION_MINOR	4
+ #define MSM_VERSION_PATCHLEVEL	0
+ 
+ static BLOCKING_NOTIFIER_HEAD(msm_drm_notifier_list);
+@@ -113,10 +153,64 @@
+  * RETURNS
+  * Zero for success or -errorno.
+  */
++/*
++ * IMAGE 297: D2Q guard -- keep xserver from replacing its own framebuffer
++ * with the fbcon/fbdev one.
++ *
++ * xserver 21.1.7 (modesetting) re-applies its cached "desired" state on every
++ * damage event, and the fb id it uses is the framebuffer that was on the CRTC
++ * when X started -- the fbcon/fbdev framebuffer.  Nothing draws into that
++ * buffer (fbcon=map:2), so the panel goes black although X's own framebuffer
++ * is perfectly fine.  Refuse a *userspace* commit that puts the fbdev fb onto
++ * a plane whose current fb is a different (client) fb.  Kernel-context commits
++ * (boot splash handoff, fbcon restore) are not affected.
++ */
++static int d2q_guard_fbdev_fb(struct drm_device *dev,
++			      struct drm_atomic_state *state)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++	struct drm_plane *plane;
++	struct drm_plane_state *new_ps, *old_ps;
++	int i;
++
++	if (!priv || !priv->fbdev || !priv->fbdev->fb)
++		return 0;
++	if (!current->mm)	/* kernel context: never interfere */
++		return 0;
++
++	for_each_new_plane_in_state(state, plane, new_ps, i) {
++		old_ps = plane->state;
++		if (!new_ps->crtc || new_ps->fb != priv->fbdev->fb)
++			continue;
++		if (!old_ps || !old_ps->fb || old_ps->fb == priv->fbdev->fb)
++			continue;
++
++		/*
++		 * IMAGE 298: substitute instead of rejecting.  Rejecting the
++		 * whole commit threw away the very commit that programs the
++		 * hardware and left the DPU black (flicker: lit/dark/lit).
++		 * Keeping the commit but pinning the client fb keeps both the
++		 * DRM state and the hardware consistent.
++		 */
++		pr_info("D2QGUARD: substituting fb %u for fbcon fb %u on '%s' (crtc%d, comm=%s/%d)\n",
++			old_ps->fb->base.id, priv->fbdev->fb->base.id, plane->name,
++			old_ps->crtc ? (int)old_ps->crtc->index : -1,
++			current->comm, current->pid);
++		drm_atomic_set_fb_for_plane(new_ps, old_ps->fb);
++	}
++
++	return 0;
++}
++
+ int msm_atomic_check(struct drm_device *dev,
+ 			    struct drm_atomic_state *state)
+ {
+ 	struct msm_drm_private *priv;
++	int d2q_ret;
++
++	d2q_ret = d2q_guard_fbdev_fb(dev, state);
++	if (d2q_ret)
++		return d2q_ret;	/* never happens now; kept for safety */
+ 
+ 	priv = dev->dev_private;
+ 	if (priv && priv->kms && priv->kms->funcs &&
+@@ -185,6 +279,71 @@
+ 	return clk;
+ }
+ 
++/* Ported verbatim from upstream v4.19 msm_drv.c - required by a6xx_gpu.c */
++int msm_clk_bulk_get(struct device *dev, struct clk_bulk_data **bulk)
++{
++	struct property *prop;
++	const char *name;
++	struct clk_bulk_data *local;
++	int i = 0, ret, count;
++
++	count = of_property_count_strings(dev->of_node, "clock-names");
++	if (count < 1)
++		return 0;
++
++	/*
++	 * Must be sizeof(struct clk_bulk_data) (16: id + clk), not sizeof
++	 * pointer (8). The kernel clk_bulk_*() helpers index this array with
++	 * 16-byte stride, so the pointer size under-allocates: for the 5 GMU
++	 * clocks that is 40 bytes allocated but 80 written, corrupting the
++	 * adjacent slab objects. Same typo exists in upstream v4.19.
++	 */
++	local = devm_kcalloc(dev, sizeof(struct clk_bulk_data),
++		count, GFP_KERNEL);
++	if (!local)
++		return -ENOMEM;
++
++	of_property_for_each_string(dev->of_node, "clock-names", prop, name) {
++		local[i].id = devm_kstrdup(dev, name, GFP_KERNEL);
++		if (!local[i].id) {
++			devm_kfree(dev, local);
++			return -ENOMEM;
++		}
++
++		i++;
++	}
++
++	ret = devm_clk_bulk_get(dev, count, local);
++
++	if (ret) {
++		for (i = 0; i < count; i++)
++			devm_kfree(dev, (void *) local[i].id);
++		devm_kfree(dev, local);
++
++		return ret;
++	}
++
++	*bulk = local;
++	return count;
++}
++
++/* Ported verbatim from upstream v4.19 msm_drv.c - required by a6xx_gpu.c */
++struct clk *msm_clk_bulk_get_clock(struct clk_bulk_data *bulk, int count,
++		const char *name)
++{
++	int i;
++	char n[32];
++
++	snprintf(n, sizeof(n), "%s_clk", name);
++
++	for (i = 0; bulk && i < count; i++) {
++		if (!strcmp(bulk[i].id, name) || !strcmp(bulk[i].id, n))
++			return bulk[i].clk;
++	}
++
++	return NULL;
++}
++
+ void __iomem *msm_ioremap(struct platform_device *pdev, const char *name,
+ 		const char *dbgname)
+ {
+@@ -515,6 +674,12 @@
+ 	return sde_power_resource_enable(handle, client, enable);
+ }
+ 
++/* Defined with its trigger below, next to load_gpu_real(). */
++static struct device_attribute dev_attr_a6xx_gpu_load;
++
++/* TEMPORARY image 185 -- defined with its trigger further down. */
++static struct device_attribute dev_attr_a6xx_gpu_cpstate;
++
+ static int msm_drm_init(struct device *dev, struct drm_driver *drv)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+@@ -543,6 +708,14 @@
+ 	}
+ 
+ 	ddev->dev_private = priv;
++
++	/*
++	 * Diagnostics: expose the on-demand GPU attach trigger. Harmless when
++	 * unused -- writing to it is the only thing that starts the attach.
++	 */
++	device_create_file(&pdev->dev, &dev_attr_a6xx_gpu_load);
++	/* TEMPORARY image 185 -- CP/IRQ state probe; see a6xx_gpu_cpstate_store(). */
++	device_create_file(&pdev->dev, &dev_attr_a6xx_gpu_cpstate);
+ 	priv->dev = ddev;
+ 
+ 	ret = msm_mdss_init(ddev);
+@@ -822,24 +995,393 @@
+  * DRM operations:
+  */
+ 
+-#ifdef CONFIG_QCOM_KGSL
+-static void load_gpu(struct drm_device *dev)
+-{
+-}
+-#else
+-static void load_gpu(struct drm_device *dev)
++/*
++ * IMAGE 288 (2026-10-23) — the KGSL pivot (PLAN-GPU-TRANSITION-2026-10-23 §B).
++ *
++ * Everything between this #if and load_gpu() below is the drm/adreno
++ * bring-up instrumentation (images 185-287).  With CONFIG_QCOM_KGSL=y the
++ * adreno objects are excluded from the build (Makefile ifneq gate), so the
++ * whole block must compile out too; the original CAF KGSL stub below is
++ * restored verbatim.  Display-only DRM + KGSL is the pristine shape of this
++ * tree (ShinyKernel/Kernel msm_drv.c:825).
++ */
++#if !defined(CONFIG_QCOM_KGSL)
++/*
++ * EXPERIMENTAL A6xx BUILD: the CONFIG_QCOM_KGSL no-op stub that made
++ * priv->gpu stay NULL (and made the GPU_ID ioctl return ENXIO) has been
++ * removed. The #else branch that was already present in the tree is now
++ * the unconditional implementation, so the pre-existing
++ * adreno_load_gpu() attach path executes.
++ */
++extern unsigned int gpu_init_delay_ms;
++
++/*
++ * TEMPORARY image 185/186 -- DIAGNOSTIC ONLY.
++ * Defined in adreno/a6xx_gpu.c. Read-only CP/IRQ state dump.
++ * Declared up here because load_gpu_thread() now calls it, and that is
++ * above where the sysfs trigger lives.
++ */
++extern int a6xx_cp_state_dump(struct msm_gpu *gpu, const char *tag);
++
++/*
++ * TEMPORARY image 185: hoisted from load_gpu_real()'s function-local static so
++ * the a6xx_gpu_cpstate probe below can take the same lock. Still one mutex,
++ * same initialisation, same semantics -- it was always a single instance.
++ */
++static DEFINE_MUTEX(init_lock);
++
++/*
++ * TEMPORARY image 210 -- bring-up is STRICTLY ONCE per boot.
++ *
++ * The existing `if (!priv->gpu)` guard is not sufficient, for two independent
++ * reasons, both of which were measured as hard freezes on image 209:
++ *
++ *   1. adreno_load_gpu() allocates a *fresh* msm_gpu every time it is called
++ *      (a6xx_gpu_init -> kzalloc). So even if the first bring-up left the old
++ *      object behind, a second call builds a brand new one whose
++ *      needs_hw_init is then set to true by the pm_runtime_get_sync() ->
++ *      msm_gpu_pm_runtime_resume() path (msm_gpu.c:176). The result is a FULL
++ *      adreno_hw_init() executed against a GPU that is already programmed and
++ *      running, which reprograms RB_BASE/CNTL, re-runs a6xx_cp_init and
++ *      re-enables the SQE on top of live state.
++ *
++ *   2. Whatever priv->gpu happens to be at the moment of the second trigger is
++ *      not something we can rely on. Observed on image 209: trigger 1 at
++ *      t=60 completed cleanly (hw_init ret=0, CPDUMP auto-post end at t=73),
++ *      yet trigger 2 at t=140 ran the entire bring-up again and wedged.
++ *
++ * Observed failures, image 209, two separate freezes:
++ *
++ *   freeze A: trigger 2 reached "RINGHW[05] a6xx_cp_init enter" and never
++ *             emitted another line. Log simply stops. No panic, no oops.
++ *   freeze B: trigger 2 completed "hw_init returned (ret=0)" and the machine
++ *             still hung later. So the wedge is not reliably inside
++ *             a6xx_cp_init; re-initialising a live GPU corrupts state and the
++ *             machine dies somewhere downstream of it.
++ *
++ * Both freezes cost a manual reboot and produced no diagnostics, because the
++ * harness could not reach the phone to collect any.
++ *
++ * The fix is to make re-entry impossible rather than to try to make a second
++ * bring-up safe. Bring-up has been reliable for many consecutive boots; there
++ * is no legitimate need to run it twice, and a failed first attempt has never
++ * been usefully retried on this tree.
++ *
++ * gpu_load_done is set on the FIRST attempt whether it succeeded or not, so
++ * the trigger is genuinely one-shot per boot.
++ */
++static bool gpu_load_done;
++
++static void load_gpu_real(struct drm_device *dev)
+ {
+-	static DEFINE_MUTEX(init_lock);
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 
+ 	mutex_lock(&init_lock);
+ 
++	if (gpu_load_done) {
++		pr_info("a6xx: REFUSING repeat bring-up (already attempted this boot)\n");
++		mutex_unlock(&init_lock);
++		return;
++	}
++	gpu_load_done = true;
++
+ 	if (!priv->gpu)
+ 		priv->gpu = adreno_load_gpu(dev);
+ 
+ 	mutex_unlock(&init_lock);
+ }
+-#endif
++
++/*
++ * Manual form of load_gpu_real(), driven by the a6xx_gpu_load sysfs node.
++ *
++ * With real a630_sqe.fw/a640_gmu.bin in place the GPU core gets far enough to
++ * wedge before WiFi exists, so the log can never be captured by waiting on
++ * the network: the machine is unreachable by the time anything interesting
++ * happens.
++ *
++ * An earlier version deferred this with schedule_delayed_work(). That was
++ * unreliable here -- the work was queued and never ran, across two boots,
++ * with no system suspend to account for it. Triggering it explicitly means no
++ * dependency on timers, suspend or the screen-off freeze.
++ *
++ * Diagnostics only.
++ */
++static int load_gpu_thread(void *data)
++{
++	struct drm_device *dev = data;
++	struct msm_drm_private *priv = dev->dev_private;
++
++	/*
++	 * Image 182 -- PROMOTE (survivability). The sysfs writer used to
++	 * run all of hw_init synchronously: when pm_suspend wedged inside
++	 * printk (console_unlock, CPU3, images 179-181), the writing shell
++	 * wedged with it, and with CPU3 stuck the phone stopped answering
++	 * SSH and OTG while looking alive. A kthread (timer-free, proven
++	 * by sw165) decouples the writer from the work: the write returns
++	 * immediately, and a wedged bring-up costs a stuck kthread instead
++	 * of the machine's responsiveness.
++	 */
++	pr_info("a6xx: on-demand GPU core load requested\n");
++	load_gpu_real(dev);
++
++	if (priv && !priv->gpu)
++		pr_info("a6xx: on-demand GPU core load produced no GPU\n");
++
++	/*
++	 * TEMPORARY image 186 -- AUTOMATIC CP state capture. Remove once the
++	 * glFinish wedge is understood.
++	 *
++	 * Image 185 asked for this dump over sysfs, on the theory that it had
++	 * to be taken at a precise moment. That was a bad design and it cost
++	 * two boots: the whole reason we cannot trust a lost link is that
++	 * losing the link is what happens every time, so a dump that depends
++	 * on an ssh round-trip is a dump we will never collect.
++	 *
++	 * Do it here instead. This is the same kthread that is already proven
++	 * to survive a wedged bring-up, it needs no shell and no timing luck,
++	 * and both dumps land in the kernel ring buffer where crashwatch
++	 * archives them on the next reboot -- so the data survives the link
++	 * dying, which is the failure mode we actually have.
++	 *
++	 * "rest" is immediately after the bring-up with the GPU idle. "post"
++	 * is 12 s later, by which time an egl6.py run has submitted and is
++	 * blocked in glFinish. Comparing the two is the whole experiment.
++	 */
++	/*
++	 * TEMPORARY image 211 -- the auto-rest/auto-post dumps are REMOVED.
++	 *
++	 * Evidence (IMAGE-210-RESULTS.md, captures/freeze210-last_kmsg.log):
++	 *
++	 *   [  64.695312] a6xx-load:1148  CPDUMP[auto-rest] ... ---- end ----
++	 *   "auto-post" occurrences: 0
++	 *
++	 * auto-rest completed at t=64.7 and auto-post was due at ~t=76.7 after
++	 * msleep(12000). It never ran. The a6xx-load thread stops emitting at
++	 * exactly that point, so it is wedged taking dev->struct_mutex for the
++	 * second dump, or inside a6xx_cp_state_dump()'s register reads.
++	 *
++	 * These are our own diagnostics, added in image 186, and they run on the
++	 * critical path twelve seconds after every single bring-up. That is the
++	 * worst possible place for a diagnostic, and it is now the only thing we
++	 * have evidence for wedging.
++	 *
++	 * They have already given us what they were added for -- rb_iova=0x1000,
++	 * RB_CNTL=0x20c, RB_RPTR_ADDR=0x0 -- on an earlier run. They are not
++	 * earning their keep, and every run costs a bring-up thread.
++	 *
++	 * If the ring measurement (RINGCPU, in a6xx_submit()) comes back clean
++	 * and we still need live register state, it should be triggered from
++	 * userspace on demand via the a6xx_gpu_cpstate node, never scheduled
++	 * automatically from inside the load path.
++	 */
++	return 0;
++}
++
++static void load_gpu_manually(struct drm_device *dev)
++{
++	struct task_struct *t;
++
++	t = kthread_run(load_gpu_thread, dev, "a6xx-load");
++	if (IS_ERR(t))
++		pr_err("a6xx: on-demand load kthread failed: %ld\n",
++			PTR_ERR(t));
++	else
++		pr_info("a6xx: on-demand load handed to a6xx-load thread\n");
++}
++
++static ssize_t a6xx_gpu_load_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct drm_device *ddev = platform_get_drvdata(pdev);
++
++	if (!ddev)
++		return -ENODEV;
++
++	load_gpu_manually(ddev);
++	return count;
++}
++
++static DEVICE_ATTR(a6xx_gpu_load, 0200, NULL, a6xx_gpu_load_store);
++
++/*
++ * TEMPORARY image 185 -- DIAGNOSTIC ONLY.
++ * Defined in adreno/a6xx_gpu.c. Read-only CP/IRQ state dump.
++ */
++
++/*
++ * TEMPORARY image 185 -- DIAGNOSTIC ONLY.
++ * Write anything to this node to dump the a6xx CP ring + interrupt state.
++ *
++ * Deliberately synchronous and deliberately does NOT go on a kthread: the
++ * whole point is to catch the ring while userspace is still blocked inside
++ * glFinish, so the dump has to happen in that window, and it must be
++ * read-only so a hung bring-up cannot be made worse by poking at it.
++ * struct_mutex is held so we cannot race a concurrent submit.
++ */
++static ssize_t a6xx_gpu_cpstate_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct drm_device *ddev;
++	struct msm_drm_private *priv;
++	char tag[32];
++	size_t n;
++
++	/*
++	 * Copy and sanitise the caller's tag before we take any lock. The
++	 * writer is root-only (0200 root:root) but this buffer ends up as a
++	 * pr_info format argument, so bound and terminate it properly rather
++	 * than trusting the store buffer's contents.
++	 */
++	n = min(count, sizeof(tag) - 1);
++	memcpy(tag, buf, n);
++	tag[n] = '\0';
++	strim(tag);
++	if (!tag[0])
++		strscpy(tag, "sysfs", sizeof(tag));
++
++	if (mutex_lock_interruptible(&init_lock))
++		return -ERESTARTSYS;
++
++	ddev = platform_get_drvdata(pdev);
++	priv = ddev ? ddev->dev_private : NULL;
++
++	if (!priv || !priv->gpu) {
++		pr_info("a6xx: cpstate: no GPU attached yet (write a6xx_gpu_load first)\n");
++		mutex_unlock(&init_lock);
++		return count;
++	}
++
++	mutex_lock(&ddev->struct_mutex);
++	/*
++	 * TEMPORARY image 188 -- DIAGNOSTIC ONLY. Two tags:
++	 *   "sysfs"       - the plain manual trigger, unchanged from image 185.
++	 *   "flushprobe"  - same dump, but tagged so a userspace harness can
++	 *                   attribute output to its own stage of a GL sequence.
++	 * harness/flushprobe.py writes here between glFlush/glFinish/glReadPixels
++	 * and asks "did a submit reach the driver yet?" without inferring from
++	 * timestamps. The tag comes from the caller writing "flushprobe\n".
++	 */
++	a6xx_cp_state_dump(priv->gpu, tag);
++	mutex_unlock(&ddev->struct_mutex);
++
++	mutex_unlock(&init_lock);
++	return count;
++}
++
++/*
++ * TEMPORARY image 196 -- a READABLE cpstate.
++ *
++ * Why this exists
++ * ---------------
++ * Now that the GPU really executes (image 195), submitting GL work hard-resets
++ * the system with NO kernel record at all: no panic, no oops, no SMMU fault, no
++ * watchdog bite. dmesg simply stops mid-stream, and /proc/last_kmsg cannot help
++ * because a hard reset writes no pstore record. The existing probe therefore
++ * fails at exactly the moment it is needed: its output goes to the ring buffer,
++ * which the reset discards.
++ *
++ * /dev/mem does not exist on this system and msm's debugfs register interface is
++ * non-functional in this CAF tree (the `gpu` file is empty and writes are
++ * rejected), so there is NO pure-userspace way to read these registers today.
++ * Hence this: make the probe RETURN its values instead of printing them.
++ *
++ * Why userspace must own the write
++ * --------------------------------
++ * If the kernel merely logged the dump, a hard reset would still lose it. The
++ * point of this read path is that a userspace poller can sample it at high rate
++ * and fsync each sample to disk itself, so the last samples taken before the
++ * reset survive on the phone. The kernel hands the values over early; userspace
++ * decides when they are durable.
++ *
++ * Read format: one "key value" pair per line, so it is trivially greppable and
++ * trivially parsed.
++ */
++extern int a6xx_cp_state_read(struct msm_gpu *gpu, char *page, size_t size);
++
++static ssize_t a6xx_gpu_cpstate_show(struct device *dev,
++		struct device_attribute *attr, char *page)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct drm_device *ddev;
++	struct msm_drm_private *priv;
++	struct msm_gpu *gpu;
++	int n;
++
++	(void)attr;
++
++	if (mutex_lock_interruptible(&init_lock))
++		return -ERESTARTSYS;
++
++	/* Exactly the lookup the store handler uses. */
++	ddev = platform_get_drvdata(pdev);
++	priv = ddev ? ddev->dev_private : NULL;
++	if (!priv || !priv->gpu) {
++		mutex_unlock(&init_lock);
++		return scnprintf(page, PAGE_SIZE, "nogpu\n");
++	}
++	gpu = priv->gpu;
++
++	/*
++	 * Serialised against the store path, which probes under struct_mutex.
++	 * The reads themselves live in a6xx_gpu.c because that file has the
++	 * adreno/a6xx register definitions; msm_drv.c cannot see them.
++	 *
++	 * Deliberately NO msm_gpu_retire() here. Reading these registers must
++	 * not wake the GPU or change power state -- the whole point is to
++	 * observe a dying machine without perturbing it.
++	 */
++	mutex_lock(&gpu->dev->struct_mutex);
++	n = a6xx_cp_state_read(gpu, page, PAGE_SIZE);
++	mutex_unlock(&gpu->dev->struct_mutex);
++
++	mutex_unlock(&init_lock);
++	return n;
++}
++
++/*
++ * 0640, not 0440.
++ *
++ * Image 196 shipped this as 0440 to make the node readable, which silently
++ * stripped write permission and broke the ORIGINAL store path -- `echo x >
++ * a6xx_gpu_cpstate` failed with EACCES. That was a regression I introduced
++ * while trying to add a capability.
++ *
++ * The mode must be read-write for root: the store path is how every existing
++ * probe (CPDUMP, the auto-rest/auto-post dumps) is triggered, and losing it
++ * cost us the only working register-dump mechanism on the system.
++ */
++static DEVICE_ATTR(a6xx_gpu_cpstate, 0640, a6xx_gpu_cpstate_show,
++		a6xx_gpu_cpstate_store);
++
++/*
++ * When gpu_init_delay_ms is set, the GPU is deliberately NOT attached on
++ * open(). That keeps the machine bootable and lets the attach be triggered
++ * from userspace via the sysfs node above. The default of 0 leaves the
++ * original behaviour untouched.
++ */
++static void load_gpu(struct drm_device *dev)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++
++	if (gpu_init_delay_ms) {
++		if (!priv->gpu_load_queued) {
++			priv->gpu_load_queued = true;
++			pr_info("a6xx: GPU core load held for on-demand "
++				"trigger via sysfs\n");
++		}
++		return;
++	}
++
++	load_gpu_real(dev);
++}
++#else
++/* pristine CAF shape: display-only DRM when KGSL owns the GPU */
++static void load_gpu(struct drm_device *dev)
++{
++}
++#endif /* !CONFIG_QCOM_KGSL */
+ 
+ #if defined(CONFIG_DISPLAY_SAMSUNG_LEGO)
+ struct msm_file_private *msm_ioctl_power_ctrl_ctx;
+@@ -1120,6 +1662,16 @@
+ 	if (!kms)
+ 		return;
+ 	DBG("dev=%pK, crtc=%u", dev, pipe);
++	{
++		/* IMAGE 296: name whoever turns our vblank off */
++		static int d2q_vb_cnt;
++		if (d2q_vb_cnt < 3) {
++			d2q_vb_cnt++;
++			pr_info("D2QVBL[disable] pipe=%u comm=%s/%d\n",
++				pipe, current->comm, current->pid);
++			dump_stack();
++		}
++	}
+ 	vblank_ctrl_queue_work(priv, pipe, false);
+ }
+ 
+@@ -1227,21 +1779,70 @@
+ 	struct drm_gem_object *obj;
+ 	int ret = 0;
+ 
+-	if (args->flags & ~MSM_INFO_FLAGS)
++	/*
++	 * IMAGE 257 -- upstream semantics, using the `info` and `value` field
++	 * names. The ioctl number only matches Mesa at all because the struct
++	 * layout in msm_drm.h was restored to upstream's 24-byte version; see
++	 * the long comment there. Getting here at all means the layout matches.
++	 */
++	if (args->info > MSM_INFO_SET_IOVA)
+ 		return -EINVAL;
+ 
+ 	obj = drm_gem_object_lookup(file, args->handle);
+ 	if (!obj)
+ 		return -ENOENT;
+ 
+-	if (args->flags & MSM_INFO_IOVA) {
++	switch (args->info) {
++	case MSM_INFO_GET_IOVA: {
+ 		uint64_t iova;
+ 
+ 		ret = msm_ioctl_gem_info_iova(dev, obj, &iova);
+ 		if (!ret)
+-			args->offset = iova;
+-	} else {
+-		args->offset = msm_gem_mmap_offset(obj);
++			args->value = iova;
++		break;
++	}
++	case MSM_INFO_SET_NAME: {
++		/*
++		 * IMAGE 258 -- actually store the name.
++		 *
++		 * This was "accept and ignore", which is why every buffer
++		 * identification in this project has been guesswork based on
++		 * size correlation. Mesa labels each BO at creation
++		 * ("fs:...", "vs:...", "pvtmem_per_fiber", "cmdstream",
++		 * "gmem:..."), so storing it makes the BOS dump self-labelling.
++		 *
++		 * len counts bytes NOT including the NUL, per upstream Mesa's
++		 * fd_bo_set_name().
++		 */
++		struct msm_gem_object *msm_obj = to_msm_bo(obj);
++		unsigned long len = args->len;
++
++		if (len > sizeof(msm_obj->name) - 1) {
++			ret = -EINVAL;
++			break;
++		}
++
++		if (copy_from_user(msm_obj->name,
++				   u64_to_user_ptr(args->value),
++				   len)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		msm_obj->name[len] = '\0';
++		ret = 0;
++		break;
++	}
++	case MSM_INFO_GET_OFFSET:
++	default:
++		/*
++		 * The path that was silently broken. Mesa calls this to get an
++		 * mmap() offset; it used to fail, which made bo_map() return
++		 * NULL and fd_bo_upload() skip the shader ISA write.
++		 */
++		args->value = msm_gem_mmap_offset(obj);
++		ret = 0;
++		break;
+ 	}
+ 
+ 	drm_gem_object_unreference_unlocked(obj);
+@@ -1249,6 +1850,30 @@
+ 	return ret;
+ }
+ 
++/*
++ * TEMPORARY image 167 -- PROMOTE (Mesa UAPI compat): single-queue
++ * submitqueue support. Mesa 22.x creates a queue per context; it maps
++ * to our one legacy ring (id ignored on submit). Prios accepted
++ * (PRIORITIES param reports 1; Mesa sizes its request accordingly).
++ */
++static int msm_ioctl_submitqueue_new(struct drm_device *dev, void *data,
++		struct drm_file *file)
++{
++	struct drm_msm_submitqueue *args = data;
++
++	if (args->flags)
++		return -EINVAL;
++
++	args->id = 1;
++	return 0;
++}
++
++static int msm_ioctl_submitqueue_close(struct drm_device *dev, void *data,
++		struct drm_file *file)
++{
++	return 0;
++}
++
+ static int msm_ioctl_wait_fence(struct drm_device *dev, void *data,
+ 		struct drm_file *file)
+ {
+@@ -1702,6 +2327,8 @@
+ 	DRM_IOCTL_DEF_DRV(MSM_GEM_SUBMIT,   msm_ioctl_gem_submit,   DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_WAIT_FENCE,   msm_ioctl_wait_fence,   DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(MSM_GEM_MADVISE,  msm_ioctl_gem_madvise,  DRM_AUTH|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(MSM_SUBMITQUEUE_NEW,   msm_ioctl_submitqueue_new,   DRM_AUTH|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(MSM_SUBMITQUEUE_CLOSE, msm_ioctl_submitqueue_close, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(SDE_WB_CONFIG, sde_wb_config, DRM_UNLOCKED|DRM_AUTH),
+ 	DRM_IOCTL_DEF_DRV(MSM_REGISTER_EVENT,  msm_ioctl_register_event,
+ 			  DRM_UNLOCKED|DRM_CONTROL_ALLOW),
+@@ -1732,12 +2359,39 @@
+ };
+ 
+ static struct drm_driver msm_driver = {
++	/*
++	 * TEMPORARY image 187 -- PROMOTE. The first change in this whole series
++	 * that is an actual fix rather than a diagnostic.
++	 *
++	 * DRIVER_SYNCOBJ was never set here, and that is why nothing has ever
++	 * been submitted. drm_syncobj.c:499 refuses drm_syncobj_create_ioctl
++	 * with -EOPNOTSUPP unless this feature bit is present, and drm_ioctl.c
++	 * reports DRM_CAP_SYNCOBJ as 0. Mesa's DRI2 loader reads that, decides
++	 * it cannot build a fence chain, and freedreno's fence_batch() has
++	 * nowhere to signal completion -- so tu_flush() never issues
++	 * DRM_IOCTL_MSM_GEM_SUBMIT at all.
++	 *
++	 * Observed signature of exactly this, on #128:
++	 *   strace: 76x MSM_GEM_INFO, 39x MSM_GEM_NEW, 9x MSM_GET_PARAM,
++	 *           and ZERO GEM_SUBMIT and ZERO SYNCOBJ ioctls.
++	 *   ring:    wptr_dw=99, CP_RB_RPTR == CP_RB_WPTR == 0x63 -- exactly
++	 *           where the bring-up selftest left it, never appended to.
++	 *   freedreno under TU_DEBUG=bail,sync,sched,ioctl: silent.
++	 *   CHIP_ID core=6 (correct 6xx), MSM_PARAM_FAULTS=0 (never executed).
++	 *
++	 * The plumbing is present (syncobj landed in 4.13, this is a 4.14 CAF
++	 * tree) so only the bit is missing. Caveat, recorded in
++	 * ROOT-CAUSE-NO-SUBMIT.md: enabling it makes fences real for the first
++	 * time, so glFinish will now wait on a CACHE_FLUSH_TS interrupt whose
++	 * count is still 0. Expect this to move the wedge, not end it.
++	 */
+ 	.driver_features    = DRIVER_HAVE_IRQ |
+ 				DRIVER_GEM |
+ 				DRIVER_PRIME |
+ 				DRIVER_RENDER |
+ 				DRIVER_ATOMIC |
+-				DRIVER_MODESET,
++				DRIVER_MODESET |
++				DRIVER_SYNCOBJ,
+ 	.open               = msm_open,
+ 	.preclose           = msm_preclose,
+ 	.postclose          = msm_postclose,
+@@ -1770,7 +2424,7 @@
+ 	.ioctls             = msm_ioctls,
+ 	.num_ioctls         = ARRAY_SIZE(msm_ioctls),
+ 	.fops               = &fops,
+-	.name               = "msm_drm",
++	.name               = "msm",
+ 	.desc               = "MSM Snapdragon DRM",
+ 	.date               = "20130625",
+ 	.major              = MSM_VERSION_MAJOR,
+@@ -2092,6 +2746,8 @@
+ 	{ },
+ };
+ 
++/* EXPERIMENTAL A6xx BUILD: KGSL no-op removed - see load_gpu() above. */
++/* IMAGE 288: under KGSL the DRM side owns no GPU component (pristine shape) */
+ #ifdef CONFIG_QCOM_KGSL
+ static int add_gpu_components(struct device *dev,
+ 			      struct component_match **matchptr)
+@@ -2219,6 +2875,20 @@
+ 	},
+ };
+ 
++/*
++ * EXPERIMENTAL A6xx BUILD: the CONFIG_QCOM_KGSL duplicate empty
++ * adreno_register()/adreno_unregister() stubs are removed. The real
++ * implementations live in adreno/adreno_device.c; keeping the stubs
++ * under KGSL=y and the real ones under KGSL=n is what stopped the
++ * adreno platform driver (and therefore the GPU component) from ever
++ * registering.
++ */
++
++/*
++ * IMAGE 288: restore the pristine KGSL stubs.  Under CONFIG_QCOM_KGSL=y the
++ * real adreno_register/unregister do not exist (Makefile gate), and
++ * msm_drm_register() still calls them unconditionally.
++ */
+ #ifdef CONFIG_QCOM_KGSL
+ void __init adreno_register(void)
+ {
+@@ -2229,6 +2899,11 @@
+ }
+ #endif
+ 
++/*
++static void adreno_register(void)
++{
++}
++*/
+ static int __init msm_drm_register(void)
+ {
+ 	if (!modeset)

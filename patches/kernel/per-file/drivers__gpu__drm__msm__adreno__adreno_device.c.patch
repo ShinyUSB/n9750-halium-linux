@@ -1,0 +1,102 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -88,6 +88,39 @@
+ 		.gpmufw = "a530v3_gpmu.fw2",
+ 		.zapfw = "a530_zap.mdt",
+ 	},
++	/*
++	 * A640 (Adreno 640 v2, Snapdragon 855+/SM8150).
++	 *
++	 * This entry is NOT present in any upstream tree up to and including
++	 * v5.8, nor in CAF msm-4.19; it is authored here for this port.
++	 *
++	 * Chip ID note (milestone E): the vendor DT declares
++	 *   qcom,chipid = <0x06040000>   -> rev 6.4.0.0
++	 * while newer upstream catalogues list 0x06040001 -> rev 6.4.0.1.
++	 * Rather than change the vendor DT value, the patch-id component is
++	 * wildcarded with ANY_ID so that BOTH revisions resolve to this entry.
++	 * The value read back from the hardware register is logged at probe
++	 * time and recorded in the bring-up log before any judgement is made.
++	 */
++	{
++		.rev   = ADRENO_REV(6, 4, 0, ANY_ID),
++		.revn  = 640,
++		.name  = "A640",
++		.fw = {
++			[ADRENO_FW_SQE] = "a630_sqe.fw",
++			[ADRENO_FW_GMU] = "a640_gmu.bin",
++		},
++		.gmem  = SZ_1M,
++		.init  = a6xx_gpu_init,
++		.zapfw = "a640_zap.mdt",
++		/*
++		 * Take the GPU out of GDSC bounce between frames the same way
++		 * the A630 entry does, to avoid GDSC instability.
++		 */
++		.inactive_period = 250,
++		.quirks = ADRENO_QUIRK_TWO_PASS_USE_WFI |
++			ADRENO_QUIRK_FAULT_DETECT_MASK,
++	},
+ };
+ 
+ MODULE_FIRMWARE("a300_pm4.fw");
+@@ -98,6 +131,12 @@
+ MODULE_FIRMWARE("a420_pfp.fw");
+ MODULE_FIRMWARE("a530_fm4.fw");
+ MODULE_FIRMWARE("a530_pfp.fw");
++MODULE_FIRMWARE("a630_sqe.fw");
++MODULE_FIRMWARE("a640_gmu.bin");
++MODULE_FIRMWARE("a640_zap.mdt");
++MODULE_FIRMWARE("a640_zap.b00");
++MODULE_FIRMWARE("a640_zap.b01");
++MODULE_FIRMWARE("a640_zap.b02");
+ 
+ static inline bool _rev_match(uint8_t entry, uint8_t id)
+ {
+@@ -157,6 +196,46 @@
+ 
+ 	if (gpu) {
+ 		int ret;
++		struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++
++		/*
++		 * a6xx: load the SQE/GMU firmware blobs before hw init.
++		 * Upstream v4.19 does this in adreno_load_gpu() before
++		 * msm_gpu_hw_init(); the legacy CAF path loaded pm4/pfp
++		 * inside adreno_hw_init() instead, so we keep both.
++		 */
++		ret = adreno_load_fw(adreno_gpu);
++		if (ret) {
++			dev_err(dev->dev, "failed to load firmware: %d\n", ret);
++
++			/*
++			 * msm_gpu_init() claimed the GPU IRQ with
++			 * devm_request_irq(), which is only released when the GPU
++			 * platform device is released -- destroy() does not do
++			 * that. Leave it held and every later load_gpu() retry
++			 * gets -EBUSY from devm_request_irq(), which then turns
++			 * into "failed to load adreno gpu" for good.
++			 *
++			 * pdev is priv->gpu_pdev here, the same device the IRQ was
++			 * claimed on, so devm_free_irq() pairs with it correctly.
++			 */
++			if (gpu->irq >= 0)
++				devm_free_irq(&pdev->dev, gpu->irq, gpu);
++
++			gpu->funcs->destroy(gpu);
++			return NULL;
++		}
++
++		/*
++		 * a6xx addresses the ring fence/rptr memptrs through the
++		 * ring (rbmemptr(ring, ...)), while the legacy CAF code
++		 * addresses them through adreno_gpu. Point the ring at the
++		 * same allocation so both forms resolve to one object.
++		 */
++		if (gpu->rb[0]) {
++			gpu->rb[0]->memptrs       = adreno_gpu->memptrs;
++			gpu->rb[0]->memptrs_iova  = adreno_gpu->memptrs_iova;
++		}
+ 
+ 		pm_runtime_get_sync(&pdev->dev);
+ 		mutex_lock(&dev->struct_mutex);

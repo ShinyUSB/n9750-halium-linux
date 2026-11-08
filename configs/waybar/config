@@ -1,0 +1,28 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 28,
+    "modules-left": ["custom/launcher", "custom/term"],
+    "modules-center": ["clock"],
+    "modules-right": ["battery", "custom/audio"],
+    "custom/launcher": {
+        "format": "MENU",
+        "on-click": "wofi --show drun"
+    },
+    "custom/term": {
+        "format": "TERM",
+        "on-click": "qterminal"
+    },
+    "clock": {
+        "format": "{:%H:%M}"
+    },
+    "battery": {
+        "format": "{capacity}%",
+        "bat": "battery"
+    },
+    "custom/audio": {
+        "format": "VOL",
+        "on-click": "sh -c 'pactl set-sink-mute @DEFAULT_SINK@ toggle'",
+        "on-click-right": "sh -c 'pactl set-sink-volume @DEFAULT_SINK@ +5%'"
+    }
+}

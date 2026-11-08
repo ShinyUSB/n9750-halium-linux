@@ -1,0 +1,452 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -18,6 +18,8 @@
+  */
+ 
+ #include "adreno_gpu.h"
++
++extern int reg_match;	/* IMAGE 286 */
+ #include "msm_gem.h"
+ #include "msm_mmu.h"
+ 
+@@ -47,14 +49,48 @@
+ 	case MSM_PARAM_MAX_FREQ:
+ 		*value = adreno_gpu->base.fast_rate;
+ 		return 0;
++	/*
++	 * TEMPORARY image 167 -- PROMOTE (Mesa UAPI compat). Values from
++	 * the vendor DT (highest-bank-bit 15, UBWC 3.0 defaults) and the
++	 * single-queue reality of this port. Revisit UBWC swizzle/
++	 * macrotile on rendering artifacts (FD_MESA_DEBUG=noubwc bypasses
++	 * UBWC entirely for testing).
++	 */
++	case MSM_PARAM_PRIORITIES:
++		*value = 3;
++		return 0;
++	case MSM_PARAM_FAULTS:
++		*value = 0;
++		return 0;
++	case MSM_PARAM_SUSPENDS:
++		*value = 0;
++		return 0;
++	case MSM_PARAM_HIGHEST_BANK_BIT:
++		*value = 15;
++		return 0;
++	case MSM_PARAM_UBWC_SWIZZLE:
++		*value = 0;
++		return 0;
++	case MSM_PARAM_MACROTILE_MODE:
++		*value = 0;
++		return 0;
+ 	case MSM_PARAM_TIMESTAMP:
+ 		if (adreno_gpu->funcs->get_timestamp) {
+ 			int ret;
+ 
+-			pm_runtime_get_sync(&gpu->pdev->dev);
++			/*
++			 * TEMPORARY image 184 -- PROMOTE (Mesa unblock).
++			 * No pm_runtime_get_sync here. This is the first ioctl
++			 * Mesa issues on context create; taking a power
++			 * transition we do not need is what wedged python3 in
++			 * D inside rpm_resume when the bring-up left the GPU
++			 * powered (see MESA-RENDER-ATTEMPT-1.md). a6xx_get_timestamp
++			 * checks the GMU OOB result and reads regardless, so a
++			 * quiet firmware cannot hang us here. If a future
++			 * suspend path really powers the GPU down, re-add the
++			 * ref behind a real "is it on" check -- not blind.
++			 */
+ 			ret = adreno_gpu->funcs->get_timestamp(gpu, value);
+-			pm_runtime_put_autosuspend(&gpu->pdev->dev);
+-
+ 			return ret;
+ 		}
+ 		return -EINVAL;
+@@ -71,7 +107,7 @@
+ 
+ 	DBG("%s", gpu->name);
+ 
+-	ret = msm_gem_get_iova(gpu->rb->bo, gpu->aspace, &gpu->rb_iova);
++	ret = msm_gem_get_iova(gpu->rb[0]->bo, gpu->aspace, &gpu->rb_iova);
+ 	if (ret) {
+ 		gpu->rb_iova = 0;
+ 		dev_err(gpu->dev->dev, "could not map ringbuffer: %d\n", ret);
+@@ -79,37 +115,196 @@
+ 	}
+ 
+ 	/* reset ringbuffer: */
+-	gpu->rb->cur = gpu->rb->start;
++	gpu->rb[0]->cur = gpu->rb[0]->start;
+ 
+ 	/* reset completed fence seqno: */
+ 	adreno_gpu->memptrs->fence = gpu->fctx->completed_fence;
+ 	adreno_gpu->memptrs->rptr  = 0;
+ 
+ 	/* Setup REG_CP_RB_CNTL: */
++	pr_info("RINGHW-W: CP_RB_CNTL before=0x%x\n",
++		adreno_gpu_read(adreno_gpu, REG_ADRENO_CP_RB_CNTL));
+ 	adreno_gpu_write(adreno_gpu, REG_ADRENO_CP_RB_CNTL,
+ 			/* size is log2(quad-words): */
+-			AXXX_CP_RB_CNTL_BUFSZ(ilog2(gpu->rb->size / 8)) |
++			AXXX_CP_RB_CNTL_BUFSZ(ilog2(gpu->rb[0]->size / 8)) |
+ 			AXXX_CP_RB_CNTL_BLKSZ(ilog2(RB_BLKSIZE / 8)) |
++			/*
++			 * IMAGE 287: do NOT set NO_UPDATE here.  The WORKING
++			 * device reads back 0x0800020c (the bit is set
++			 * there), but copying the readback into our ring
++			 * setup hangs the attach: the CP never becomes
++			 * idle, so hw_init never completes (image 286).
++			 * The bit means something different for the a640
++			 * than for the a430, and the working device reaches
++			 * that value by a different route.  Reverted.
++			 */
+ 			(adreno_is_a430(adreno_gpu) ? AXXX_CP_RB_CNTL_NO_UPDATE : 0));
++	pr_info("RINGHW-W: CP_RB_CNTL after=0x%x\n",
++		adreno_gpu_read(adreno_gpu, REG_ADRENO_CP_RB_CNTL));
+ 
+ 	/* Setup ringbuffer address: */
++	pr_info("RINGHW-W: CP_RB_BASE before=0x%x:%08x val=0x%llx\n",
++		adreno_gpu_read(adreno_gpu, REG_ADRENO_CP_RB_BASE_HI),
++		adreno_gpu_read(adreno_gpu, REG_ADRENO_CP_RB_BASE),
++		(unsigned long long)gpu->rb_iova);
+ 	adreno_gpu_write64(adreno_gpu, REG_ADRENO_CP_RB_BASE,
+ 		REG_ADRENO_CP_RB_BASE_HI, gpu->rb_iova);
++	pr_info("RINGHW-W: CP_RB_BASE after=0x%x:%08x\n",
++		adreno_gpu_read(adreno_gpu, REG_ADRENO_CP_RB_BASE_HI),
++		adreno_gpu_read(adreno_gpu, REG_ADRENO_CP_RB_BASE));
+ 
+ 	if (!adreno_is_a430(adreno_gpu)) {
++		pr_info("RINGHW-W: CP_RB_RPTR_ADDR before=0x%x:%08x val=0x%llx\n",
++			adreno_gpu_read(adreno_gpu,
++				REG_ADRENO_CP_RB_RPTR_ADDR_HI),
++			adreno_gpu_read(adreno_gpu,
++				REG_ADRENO_CP_RB_RPTR_ADDR),
++			(unsigned long long)adreno_rbmemptr(adreno_gpu, rptr));
+ 		adreno_gpu_write64(adreno_gpu, REG_ADRENO_CP_RB_RPTR_ADDR,
+ 			REG_ADRENO_CP_RB_RPTR_ADDR_HI,
+-			rbmemptr(adreno_gpu, rptr));
++			adreno_rbmemptr(adreno_gpu, rptr));
++		pr_info("RINGHW-W: CP_RB_RPTR_ADDR after=0x%x:%08x\n",
++			adreno_gpu_read(adreno_gpu,
++				REG_ADRENO_CP_RB_RPTR_ADDR_HI),
++			adreno_gpu_read(adreno_gpu,
++				REG_ADRENO_CP_RB_RPTR_ADDR));
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static uint32_t get_wptr(struct msm_ringbuffer *ring)
++/* -------------------------------------------------------------------------
++ * Firmware loading for a6xx. Ported verbatim from upstream v4.19
++ * adreno_gpu.c. The legacy CAF path below used to do its own
++ * request_firmware() for pm4fw/pfpfw; that code is left untouched.
++ * ------------------------------------------------------------------------- */
++
++const struct firmware *
++adreno_request_fw(struct adreno_gpu *adreno_gpu, const char *fwname)
++{
++	struct drm_device *drm = adreno_gpu->base.dev;
++	const struct firmware *fw = NULL;
++	char *newname;
++	int ret;
++
++	newname = kasprintf(GFP_KERNEL, "qcom/%s", fwname);
++	if (!newname)
++		return ERR_PTR(-ENOMEM);
++
++	if ((adreno_gpu->fwloc == FW_LOCATION_UNKNOWN) ||
++	    (adreno_gpu->fwloc == FW_LOCATION_NEW)) {
++
++		pr_info("A6XX_TRACE: fw_direct enter '%s'\n", newname);
++		ret = request_firmware_direct(&fw, newname, drm->dev);
++		pr_info("A6XX_TRACE: fw_direct returned '%s' ret=%d\n",
++			newname, ret);
++		if (!ret) {
++			dev_info(drm->dev, "loaded %s from new location\n",
++				newname);
++			adreno_gpu->fwloc = FW_LOCATION_NEW;
++			goto out;
++		} else if (adreno_gpu->fwloc != FW_LOCATION_UNKNOWN) {
++			dev_err(drm->dev, "failed to load %s: %d\n",
++				newname, ret);
++			fw = ERR_PTR(ret);
++			goto out;
++		}
++	}
++
++	if ((adreno_gpu->fwloc == FW_LOCATION_UNKNOWN) ||
++	    (adreno_gpu->fwloc == FW_LOCATION_LEGACY)) {
++
++		ret = request_firmware_direct(&fw, fwname, drm->dev);
++		if (!ret) {
++			dev_info(drm->dev, "loaded %s from legacy location\n",
++				newname);
++			adreno_gpu->fwloc = FW_LOCATION_LEGACY;
++			goto out;
++		} else if (adreno_gpu->fwloc != FW_LOCATION_UNKNOWN) {
++			dev_err(drm->dev, "failed to load %s: %d\n",
++				fwname, ret);
++			fw = ERR_PTR(ret);
++			goto out;
++		}
++	}
++
++	if ((adreno_gpu->fwloc == FW_LOCATION_UNKNOWN) ||
++	    (adreno_gpu->fwloc == FW_LOCATION_HELPER)) {
++
++		ret = request_firmware(&fw, newname, drm->dev);
++		if (!ret) {
++			dev_info(drm->dev, "loaded %s with helper\n",
++				newname);
++			adreno_gpu->fwloc = FW_LOCATION_HELPER;
++			goto out;
++		} else if (adreno_gpu->fwloc != FW_LOCATION_UNKNOWN) {
++			dev_err(drm->dev, "failed to load %s: %d\n",
++				newname, ret);
++			fw = ERR_PTR(ret);
++			goto out;
++		}
++	}
++
++	dev_err(drm->dev, "failed to load %s\n", fwname);
++	fw = ERR_PTR(-ENOENT);
++out:
++	kfree(newname);
++	return fw;
++}
++
++int adreno_load_fw(struct adreno_gpu *adreno_gpu)
+ {
+-	return ring->cur - ring->start;
++	int i;
++
++	pr_info("A6XX_TRACE: enter adreno_load_fw\n");
++
++	for (i = 0; i < ARRAY_SIZE(adreno_gpu->info->fw); i++) {
++		const struct firmware *fw;
++
++		if (!adreno_gpu->info->fw[i])
++			continue;
++
++		/* Skip if the firmware has already been loaded */
++		if (adreno_gpu->fw[i])
++			continue;
++
++		pr_info("A6XX_TRACE: requesting fw[%d] '%s'\n", i,
++			adreno_gpu->info->fw[i]);
++		fw = adreno_request_fw(adreno_gpu, adreno_gpu->info->fw[i]);
++		if (IS_ERR(fw))
++			return PTR_ERR(fw);
++		pr_info("A6XX_TRACE: fw[%d] loaded\n", i);
++
++		adreno_gpu->fw[i] = fw;
++	}
++
++	return 0;
++}
++
++struct drm_gem_object *adreno_fw_create_bo(struct msm_gpu *gpu,
++		const struct firmware *fw, u64 *iova)
++{
++	struct drm_gem_object *bo;
++	void *ptr;
++
++	ptr = msm_gem_kernel_new_locked(gpu->dev, fw->size - 4,
++		MSM_BO_UNCACHED | MSM_BO_GPU_READONLY, gpu->aspace, &bo, iova);
++
++	if (IS_ERR(ptr))
++		return ERR_CAST(ptr);
++
++	memcpy(ptr, &fw->data[4], fw->size - 4);
++
++	msm_gem_put_vaddr(bo);
++
++	return bo;
+ }
+ 
++/* get_wptr() moved to adreno_gpu.h as a static inline so that the a6xx
++ * sources (ported from upstream v4.19) can use it; upstream keeps it in
++ * the header for exactly this reason.
++ */
++
+ /* Use this helper to read rptr, since a430 doesn't update rptr in memory */
+ static uint32_t get_rptr(struct adreno_gpu *adreno_gpu)
+ {
+@@ -149,9 +344,13 @@
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct msm_drm_private *priv = gpu->dev->dev_private;
+-	struct msm_ringbuffer *ring = gpu->rb;
++	struct msm_ringbuffer *ring = gpu->rb[0];
+ 	unsigned i;
+ 
++	/* TEMPORARY image 141 -- first real userspace submit tripwire. */
++	pr_info("SUBMIT141: nr_cmds=%u nr_bos=%u valid=%d\n",
++		submit->nr_cmds, submit->nr_bos, (int)submit->valid);
++
+ 	for (i = 0; i < submit->nr_cmds; i++) {
+ 		switch (submit->cmd[i].type) {
+ 		case MSM_SUBMIT_CMD_IB_TARGET_BUF:
+@@ -188,7 +387,7 @@
+ 
+ 	OUT_PKT3(ring, CP_EVENT_WRITE, 3);
+ 	OUT_RING(ring, CACHE_FLUSH_TS);
+-	OUT_RING(ring, rbmemptr(adreno_gpu, fence));
++	OUT_RING(ring, adreno_rbmemptr(adreno_gpu, fence));
+ 	OUT_RING(ring, submit->fence->seqno);
+ 
+ 	/* we could maybe be clever and only CP_COND_EXEC the interrupt: */
+@@ -228,7 +427,7 @@
+ 	 * to account for the possibility that the last command fit exactly into
+ 	 * the ringbuffer and rb->next hasn't wrapped to zero yet
+ 	 */
+-	wptr = get_wptr(gpu->rb) & ((gpu->rb->size / 4) - 1);
++	wptr = get_wptr(gpu->rb[0]) & ((gpu->rb[0]->size / 4) - 1);
+ 
+ 	/* ensure writes to ringbuffer have hit system memory: */
+ 	mb();
+@@ -236,10 +435,10 @@
+ 	adreno_gpu_write(adreno_gpu, REG_ADRENO_CP_RB_WPTR, wptr);
+ }
+ 
+-bool adreno_idle(struct msm_gpu *gpu)
++bool adreno_idle(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+-	uint32_t wptr = get_wptr(gpu->rb);
++	uint32_t wptr = get_wptr(gpu->rb[0]);
+ 
+ 	/* wait for CP to drain ringbuffer: */
+ 	if (!spin_until(get_rptr(adreno_gpu) == wptr))
+@@ -264,7 +463,7 @@
+ 	seq_printf(m, "fence:    %d/%d\n", adreno_gpu->memptrs->fence,
+ 			gpu->fctx->last_fence);
+ 	seq_printf(m, "rptr:     %d\n", get_rptr(adreno_gpu));
+-	seq_printf(m, "rb wptr:  %d\n", get_wptr(gpu->rb));
++	seq_printf(m, "rb wptr:  %d\n", get_wptr(gpu->rb[0]));
+ 
+ 	/* dump these out in a form that can be parsed by demsm: */
+ 	seq_printf(m, "IO:region %s 00000000 00020000\n", gpu->name);
+@@ -299,7 +498,7 @@
+ 	printk("fence:    %d/%d\n", adreno_gpu->memptrs->fence,
+ 			gpu->fctx->last_fence);
+ 	printk("rptr:     %d\n", get_rptr(adreno_gpu));
+-	printk("rb wptr:  %d\n", get_wptr(gpu->rb));
++	printk("rb wptr:  %d\n", get_wptr(gpu->rb[0]));
+ }
+ 
+ /* would be nice to not have to duplicate the _show() stuff with printk(): */
+@@ -325,8 +524,8 @@
+ static uint32_t ring_freewords(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+-	uint32_t size = gpu->rb->size / 4;
+-	uint32_t wptr = get_wptr(gpu->rb);
++	uint32_t size = gpu->rb[0]->size / 4;
++	uint32_t wptr = get_wptr(gpu->rb[0]);
+ 	uint32_t rptr = get_rptr(adreno_gpu);
+ 	return (rptr + (size - 1) - wptr) % size;
+ }
+@@ -338,7 +537,8 @@
+ }
+ 
+ int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+-		struct adreno_gpu *adreno_gpu, const struct adreno_gpu_funcs *funcs)
++		struct adreno_gpu *adreno_gpu, const struct adreno_gpu_funcs *funcs,
++		int nr_rings)
+ {
+ 	struct adreno_platform_config *config = pdev->dev.platform_data;
+ 	struct msm_gpu_config adreno_gpu_config  = { 0 };
+@@ -357,6 +557,9 @@
+ 	gpu->bus_scale_table = config->bus_scale_table;
+ #endif
+ 
++	/* a6xx passes nr_rings; MSM_GPU_MAX_RINGS is 1 in this tree */
++	gpu->nr_rings = nr_rings;
++
+ 	DBG("fast_rate=%u, slow_rate=27000000, bus_freq=%u",
+ 			gpu->fast_rate, gpu->bus_freq);
+ 
+@@ -377,22 +580,71 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = request_firmware(&adreno_gpu->pm4, adreno_gpu->info->pm4fw, drm->dev);
+-	if (ret) {
+-		dev_err(drm->dev, "failed to load %s PM4 firmware: %d\n",
+-				adreno_gpu->info->pm4fw, ret);
+-		return ret;
++	/* a6xx has no pm4/pfp (it uses the SQE/GMU blobs loaded later by
++	 * adreno_load_fw()), so only the legacy generations request these.
++	 */
++	if (adreno_gpu->info->pm4fw) {
++		ret = request_firmware(&adreno_gpu->pm4,
++				adreno_gpu->info->pm4fw, drm->dev);
++		if (ret) {
++			dev_err(drm->dev, "failed to load %s PM4 firmware: %d\n",
++					adreno_gpu->info->pm4fw, ret);
++			return ret;
++		}
+ 	}
+ 
+-	ret = request_firmware(&adreno_gpu->pfp, adreno_gpu->info->pfpfw, drm->dev);
+-	if (ret) {
+-		dev_err(drm->dev, "failed to load %s PFP firmware: %d\n",
+-				adreno_gpu->info->pfpfw, ret);
+-		return ret;
++	if (adreno_gpu->info->pfpfw) {
++		ret = request_firmware(&adreno_gpu->pfp,
++				adreno_gpu->info->pfpfw, drm->dev);
++		if (ret) {
++			dev_err(drm->dev, "failed to load %s PFP firmware: %d\n",
++					adreno_gpu->info->pfpfw, ret);
++			return ret;
++		}
+ 	}
+ 
++	/*
++	 * TEMPORARY image 215 -- memptrs must be MSM_BO_WC, not MSM_BO_UNCACHED.
++	 *
++	 * Evidence, image 214. Reading CP_SQE_STAT with the correct indexed
++	 * protocol (write index, then pop DATA) gives:
++	 *
++	 *   SQE214: sqe_pc=0x0000012e sqe_cur_pkt=0x70460004
++	 *
++	 * sqe_pc is NON-ZERO, so the SQE microcode is running and is not at
++	 * its reset vector. sqe_cur_pkt = 0x70460004 is exactly the
++	 * CACHE_FLUSH_TS packet header from a6xx_submit(). The sequencer ran
++	 * the whole stream and is stopped on that packet, with
++	 * RBBM_INT_0_STATUS=0, CP_INTERRUPT_STATUS=0, CP_BUSY clear
++	 * (RBBM_STATUS=0x1 == idle), and no fence written. It is waiting for
++	 * a cache-flush-timestamp that can never complete.
++	 *
++	 * Why it cannot complete: on THIS tree the two flags are inverted
++	 * relative to mainline (arch/arm64/include/asm/pgtable.h):
++	 *
++	 *   pgprot_noncached   -> MT_DEVICE_nGnRnE   (Device memory)
++	 *   pgprot_writecombine -> MT_NORMAL_NC        (Normal Non-cacheable)
++	 *
++	 * CACHE_FLUSH_TS is a cache-flush timestamp: it must observe the
++	 * cache state of its target address and raise CP_CACHE_FLUSH_TS on
++	 * completion. Device memory has no cache. The operation has nothing to
++	 * flush and never signals, so the SQE blocks on it indefinitely --
++	 * with no fault, no error bit, and no interrupt. That is precisely
++	 * the observed signature, and it also explains why the fence never
++	 * advances and why no IRQ fires on submit.
++	 *
++	 * Upstream allocates memptrs as MSM_BO_WC
++	 * (msm_gpu.c: check_apriv(gpu, MSM_BO_WC)), which on this tree is
++	 * Normal Non-cacheable: a coherent, cacheable-target memory type that
++	 * a cache-flush timestamp can actually act on. We used
++	 * MSM_BO_UNCACHED, which here is Device memory.
++	 *
++	 * Only line 595 changes. Line 279 (the a5xx-era scratch allocation)
++	 * is a different structure and is left alone.
++	 */
+ 	adreno_gpu->memptrs = msm_gem_kernel_new(drm,
+-		sizeof(*adreno_gpu->memptrs), MSM_BO_UNCACHED, gpu->aspace,
++		sizeof(*adreno_gpu->memptrs) + ADRENO_IBCAP_LEN, MSM_BO_WC,
++		gpu->aspace,
+ 		&adreno_gpu->memptrs_bo, &adreno_gpu->memptrs_iova);
+ 
+ 	if (IS_ERR(adreno_gpu->memptrs)) {

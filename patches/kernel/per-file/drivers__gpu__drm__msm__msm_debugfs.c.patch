@@ -1,0 +1,31 @@
+--- a/drivers/gpu/drm/msm/msm_debugfs.c
++++ b/drivers/gpu/drm/msm/msm_debugfs.c
+@@ -20,6 +20,20 @@
+ #include "msm_gpu.h"
+ #include "msm_kms.h"
+ #include "msm_debugfs.h"
++#include "adreno/a6xx_gmu.h"
++
++static int msm_gmu_log_show(struct drm_device *dev, struct seq_file *m)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++
++	/* TEMPORARY image 174: GMU firmware log (this port drives A640 only) */
++#ifndef CONFIG_QCOM_KGSL
++	/* IMAGE 288: a6xx_gmu_log_show lives in the KGSL-excluded a6xx_gmu.o */
++	if (priv->gpu)
++		a6xx_gmu_log_show(priv->gpu, m);
++#endif
++	return 0;
++}
+ 
+ static int msm_gpu_show(struct drm_device *dev, struct seq_file *m)
+ {
+@@ -109,6 +123,7 @@
+ 		{"gem", show_locked, 0, msm_gem_show},
+ 		{ "mm", show_locked, 0, msm_mm_show },
+ 		{ "fb", show_locked, 0, msm_fb_show },
++		{"gmu_log", show_locked, 0, msm_gmu_log_show},
+ };
+ 
+ static int late_init_minor(struct drm_minor *minor)

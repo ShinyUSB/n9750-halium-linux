@@ -1,0 +1,82 @@
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -1706,6 +1706,18 @@
+ 	return "No Device";
+ }
+ 
++/*
++ * TEMPORARY GMU post-mortem hook -- REMOVE ONCE A6xx BRING-UP IS DONE.
++ * Called in IRQ context immediately before the SMMU-fault panic, so the
++ * snapshot lands in the kernel log (and thus last_kmsg) before reset.
++ * Default is a no-op; the A6xx DRM override dumps GMU state. No locks,
++ * no allocations, MMIO reads + printk only.
++ */
++__weak void a6xx_gmu_snapshot_on_smmu_fault(const char *smmu_name,
++		unsigned long iova,
++		int cbndx, u32 sid, u32 fsr, u32 fsynr0, u32 fsynr1,
++		u64 ttbr0, u64 ttbr1, u32 sctlr) { }
++
+ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
+ {
+ 	int flags, ret, tmp;
+@@ -1808,6 +1820,25 @@
+ 			dev_err(smmu->dev,
+ 				"Unhandled arm-smmu context fault!\n");
+ 
++			{
++				u32 fi;
++				for (fi = 0; fi < smmu->num_mapping_groups; fi++) {
++					if (!smmu->smrs || !smmu->smrs[fi].valid)
++						continue;
++					pr_info("FAULTTBL146: idx=%d sid=0x%x mask=0x%x cb=%d count=%d\n",
++						fi, smmu->smrs[fi].id,
++						smmu->smrs[fi].mask,
++						smmu->s2crs[fi].cbndx,
++						smmu->s2crs[fi].count);
++				}
++			}
++			a6xx_gmu_snapshot_on_smmu_fault(dev_name(smmu->dev),
++				iova, cfg->cbndx,
++				frsynra, fsr, fsynr0, fsynr1,
++				readq_relaxed(cb_base + ARM_SMMU_CB_TTBR0),
++				readq_relaxed(cb_base + ARM_SMMU_CB_TTBR1),
++				readl_relaxed(cb_base + ARM_SMMU_CB_SCTLR));
++
+ 			sec_debug_save_smmu_info_fatal();
+ 			// BUG();
+ 			panic("%s SMMU Fault - SID=0x%x", arm_smmu_get_devname(smmu_domain, frsynra), frsynra);
+@@ -2679,6 +2710,25 @@
+ 			smrs[idx].valid = true;
+ 		}
+ 		smmu->s2crs[idx].count++;
++		pr_info("SMR146: alloc dev=%s sid=0x%x mask=0x%x idx=%d cb=%d %s\n",
++			dev_name(dev), sid, mask, idx,
++			smmu->s2crs[idx].cbndx,
++			smmu->s2crs[idx].count > 1 ?
++				"REUSED-existing" : "fresh");
++		{
++			u32 gi;
++			for (gi = 0; gi < smmu->num_mapping_groups; gi++) {
++				if (!smmu->smrs)
++					break;
++				if (!smmu->smrs[gi].valid)
++					continue;
++				pr_info("SMR146: table idx=%d sid=0x%x mask=0x%x cb=%d count=%d\n",
++					gi, smmu->smrs[gi].id,
++					smmu->smrs[gi].mask,
++					smmu->s2crs[gi].cbndx,
++					smmu->s2crs[gi].count);
++			}
++		}
+ 		cfg->smendx[i] = (s16)idx;
+ 	}
+ 	mutex_unlock(&smmu->stream_map_mutex);
+@@ -4566,6 +4616,8 @@
+ 		bitmap_set(smmu->context_map, s2cr.cbndx, 1);
+ 		dev_dbg(smmu->dev, "Handoff smr: %x s2cr: %x cb: %d\n",
+ 			raw_smr, raw_s2cr, s2cr.cbndx);
++		pr_info("SMR146: handoff idx=%d sid=0x%x mask=0x%x cb=%d\n",
++			i, smr.id, smr.mask, s2cr.cbndx);
+ 	}
+ 
+ 	return 0;

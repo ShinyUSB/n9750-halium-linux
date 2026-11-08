@@ -1,0 +1,4275 @@
+--- /dev/null
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -0,0 +1,4272 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2017-2018 The Linux Foundation. All rights reserved. */
++
++#include <linux/clk.h>
++#include <linux/iopoll.h>
++#include <linux/mm.h>
++#include <linux/mailbox_client.h>
++#include <linux/mailbox/qmp.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/of_address.h>
++#include <linux/pm_opp.h>
++#include <linux/pm_opp.h>
++#include <linux/seq_file.h>
++#include <soc/qcom/cmd-db.h>
++#include "msm_mmu.h"
++#include "msm_drv.h"
++#include <linux/msm-bus.h>
++
++#include "a6xx_gpu.h"
++#include "a6xx.xml.h"
++#include "a6xx_gmu.xml.h"
++
++/*
++ * TEMPORARY GMU post-mortem -- REMOVE ONCE A6xx BRING-UP IS DONE.
++ * Live GMU for the SMMU-fault snapshot hook below. Set once at probe.
++ */
++static struct a6xx_gmu *a6xx_snapshot_gmu;
++static void a6xx_gmu_capture_boot_state(struct a6xx_gmu *gmu,
++		const char *when);
++static void a6xx_gmu_scratch_check(struct a6xx_gmu *gmu, const char *when);
++static unsigned long a6xx_start_jiffies;
++
++/*
++ * TEMPORARY diagnostic stop -- REMOVE AFTER RESULT. Last a6xx resume result;
++ * msm_gpu_hw_init() refuses to run hw_init while this is nonzero so the
++ * device stays alive after a GMU boot timeout instead of hanging in hw_init.
++ */
++int a6xx_gmu_boot_error;
++
++/*
++ * TEMPORARY experiment image 117 -- REMOVE OR PROMOTE ON RESULT. True while
++ * message-level HFI bootstrap runs; async DCVS OOB is suppressed meanwhile.
++ */
++static bool a6xx_gmu_bootstrap_active;
++static bool gmu_clks_live;
++struct a6xx_gmu *keepalive156_gmu;
++static bool keepalive156;
++/* TEMPORARY image 124 -- REMOVE AFTER RESULT. IRQ entry counters. */
++unsigned long bw124_gmu_irqs;
++unsigned long bw124_hfi_irqs;
++
++/*
++ * TEMPORARY image 166 -- PROMOTE: GMU fault recovery (replaces the two
++ * image-139 BUG()s in the IRQ handlers). A firmware WDT bite / CM3
++ * fault schedules a cold re-bootstrap from process context instead of
++ * panicking the machine. schedule_work dedupes while pending.
++ */
++static void recover166_fn(struct work_struct *work);
++static DECLARE_WORK(recover166_work, recover166_fn);
++static struct a6xx_gpu *recover166_ag;
++extern bool experimental_nonlegacy;
++extern bool a6xx_instr;
++
++/* IMAGE 226: module parameter, defined with the other params near the bottom */
++static bool enable_gx_gdsc;
++
++/*
++ * IMAGE 227: BRUTE-FORCE DIAGNOSTIC. Force the GX leaf clock gate.
++ *
++ * gpu_cc_gx_gmu_clk is a plain software gate at GPU_CC + 0x162, mask 0x0F
++ * (drivers/clk/qcom/debugcc-sm8150.c:785:
++ *    { "gpu_cc_gx_gmu_clk", 0x162, 1, GPU_CC, 0xF, 0xFF, ... })
++ *
++ * Its parent chain is already fully enabled (gpll0 en=2 600MHz ->
++ * gpll0_out_even en=2 300MHz -> gcc_gpu_gpll0_div_clk_src en=1), so the leaf
++ * bit is the only thing missing. Image 226 proved this is NOT the GX GDSC
++ * regulator: regulator_enable(gmu->gx) returned 0 and the gate stayed shut.
++ *
++ * This asks the one question that separates the two remaining worlds:
++ *
++ *   gate forced ON + fence completes  -> the firmware simply never opens it.
++ *                                     The fault is the GMU->AOP path and the
++ *                                     fix is the AOP/QMP ACD notification.
++ *   gate forced ON + still no fence  -> the break is deeper than power at all
++ *                                     (RB init, UBWC, address mode), and the
++ *                                     power story was a red herring.
++ *
++ * We write the register directly because clock_gpucc exposes no clock-names,
++ * so the clock cannot be requested through the clk framework. That bypasses
++ * refcounting, which is acceptable for a one-shot experiment but is NOT a fix.
++ */
++static bool force_gx_clk;
++static bool send_acd;
++/* IMAGE 274c/275: set the CX GDSC regulator's mode (KGSL does; we never did) */
++static unsigned int cxgdm;
++/*
++ * TEMPORARY image 170 -- PROMOTE with fast recovery. Recovery resume
++ * runs a single bootstrap attempt: on silent firmware the 3-attempt
++ * lottery burns 15s+ while the HW fuse runs out mid-recovery. When
++ * firmware answers, attempt 0 almost always succeeds.
++ */
++static bool recover166_fast;
++
++
++/*
++ * TEMPORARY bring-up tracing -- REMOVE ONCE GMU RESUME IS STABLE.
++ *
++ * Distinguishes a silent successful GMU resume from one that stalls inside a
++ * specific stage. Unique, unmistakable prefix so host-side capture can filter
++ * on it alone.
++ */
++#define A6XX_TRACE(fmt, ...) pr_info("A6XX_TRACE: " fmt, ##__VA_ARGS__)
++
++static irqreturn_t a6xx_gmu_irq(int irq, void *data)
++{
++	struct a6xx_gmu *gmu = data;
++	u32 status;
++
++	bw124_gmu_irqs++;
++
++	status = gmu_read(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_STATUS);
++	gmu_write(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_CLR, status);
++
++	if (status & A6XX_GMU_AO_HOST_INTERRUPT_STATUS_WDOG_BITE) {
++		dev_err_ratelimited(gmu->dev, "GMU watchdog expired\n");
++		/* TEMPORARY image 139 WDT forensics -- state before BUG. */
++		pr_info("WDT139: AO_STATUS=0x%x NMI=0x%x INITRES=0x%x FWBUSY=0x%x SPTPRAC=0x%x RPMHPWR=0x%x OOB_H2G=0x%x\n",
++			status,
++			gmu_read(gmu, REG_A6XX_GMU_NMI_CONTROL_STATUS),
++			gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT),
++			gmu_read(gmu, REG_A6XX_GMU_CM3_FW_BUSY),
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++			gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++			gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO));
++
++		/*
++		 * TEMPORARY image 166 -- PROMOTE: never BUG in an IRQ
++		 * handler on a firmware event (that panic was
++		 * self-inflicted). Recover from process context instead.
++		 */
++		pr_info("RECOVER166: GMU WDT bite, scheduling recovery\n");
++		recover166_ag = container_of(gmu, struct a6xx_gpu, gmu);
++		schedule_work(&recover166_work);
++	}
++
++	if (status &  A6XX_GMU_AO_HOST_INTERRUPT_STATUS_HOST_AHB_BUS_ERROR)
++		dev_err_ratelimited(gmu->dev, "GMU AHB bus error\n");
++
++	if (status & A6XX_GMU_AO_HOST_INTERRUPT_STATUS_FENCE_ERR)
++		dev_err_ratelimited(gmu->dev, "GMU fence error: 0x%x\n",
++			gmu_read(gmu, REG_A6XX_GMU_AHB_FENCE_STATUS));
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t a6xx_hfi_irq(int irq, void *data)
++{
++	struct a6xx_gmu *gmu = data;
++	u32 status;
++
++	bw124_hfi_irqs++;
++
++	status = gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO);
++	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, status);
++
++	if (status & A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ)
++		tasklet_schedule(&gmu->hfi_tasklet);
++
++	if (status & A6XX_GMU_GMU2HOST_INTR_INFO_CM3_FAULT) {
++		dev_err_ratelimited(gmu->dev, "GMU firmware fault\n");
++		/* TEMPORARY image 139 WDT forensics -- state before BUG. */
++		pr_info("WDT139: CM3FAULT INITRES=0x%x FWBUSY=0x%x NMI=0x%x SPTPRAC=0x%x\n",
++			gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT),
++			gmu_read(gmu, REG_A6XX_GMU_CM3_FW_BUSY),
++			gmu_read(gmu, REG_A6XX_GMU_NMI_CONTROL_STATUS),
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++		/*
++		 * TEMPORARY image 166 -- PROMOTE: never BUG in an IRQ
++		 * handler on a firmware event. Recover instead.
++		 */
++		pr_info("RECOVER166: GMU CM3 fault, scheduling recovery\n");
++		recover166_ag = container_of(gmu, struct a6xx_gpu, gmu);
++		schedule_work(&recover166_work);
++	}
++
++	return IRQ_HANDLED;
++}
++
++/* Check to see if the GX rail is still powered */
++static bool a6xx_gmu_gx_is_on(struct a6xx_gmu *gmu)
++{
++	u32 val = gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS);
++
++	/*
++	 * IMAGE 226: a reading of 0x0 is NOT proof of life.
++	 *
++	 * captures/221-full.txt shows SPTPRAC==0x0 at every GVIT157 sample
++	 * while clk_summary on that very boot proves the GX clocks were
++	 * unenabled. So the all-clear value is ambiguous on this part --
++	 * it is what the register reads when nobody is driving the FSM.
++	 * Treat it as UNKNOWN and only trust the GX_HM bits when the
++	 * SPTPRAC power FSM itself reports a settled state.
++	 *
++	 * Ground truth for "is GX up" is the clock tree
++	 * (gpu_cc_gx_gmu_clk enable count), not this register.
++	 */
++	if (!(val & (A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWER_ON |
++		     A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_SPTPRAC_GDSC_POWER_OFF)))
++		return false;
++
++	return !(val &
++		(A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_GDSC_POWER_OFF |
++		A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_CLK_OFF));
++}
++
++/*
++ * IMAGE 230: notify AOP of the GPU's ACD state.
++ *
++ * THE MISSING STEP. KGSL calls this as the FIRST statement of gmu_start(),
++ * before gmu_enable_gdsc(), before gmu_enable_clks() and before the RPMh/GX
++ * vote. Both reference implementations have it; our port never did, and the
++ * project logged it as "open" in KGSL-DRM-POWER-COMPARE.md:46 from image 77
++ * onward without ever attempting it.
++ *
++ * Transcribed verbatim from vendor KGSL drivers/gpu/msm/kgsl_gmu.c:1255
++ * (/home/usb/ShinyKernel/Kernel, Samsung SM8150/d2q 4.14 tree for this board):
++ *
++ *	msg.len = scnprintf(msg_buf, sizeof(msg_buf),
++ *			"{class: gpu, res: acd, value: %d}", state);
++ *	msg.msg = msg_buf;
++ *	ret = mbox_send_message(mailbox->channel, &msg);
++ *
++ * Three details that are NOT optional:
++ *
++ *  1. The key is "value", not upstream msm's "val". Different strings.
++ *  2. KGSL sends state=1 (ACD ON), because gmu_aop_mailbox_init() does
++ *     set_bit(ADRENO_ACD_CTRL) and the cached "enabled" starts false. My
++ *     earlier assumption that this was an "off notification, zero risk" was
++ *     backwards. A faithful port turns ACD ON.
++ *  3. struct mbox_message { u32 len; void *msg; } in KGSL is a layout shim
++ *     for struct qmp_pkt { u32 size; void *data; }; qmp_send_data() in
++ *     drivers/mailbox/msm_qmp.c:376 casts the argument to struct qmp_pkt.
++ *     We use qmp_pkt directly since it is the same layout.
++ *
++ * tx_block = true with a 1 s timeout means the stack buffer is only alive
++ * for the duration of the call -- do not set tx_block = false here.
++ */
++static int a6xx_gmu_send_acd_state(struct a6xx_gmu *gmu, bool state)
++{
++	struct qmp_pkt pkt = { 0 };
++	char msg_buf[33];
++	int ret;
++
++	if (!gmu->aop_chan)
++		return -ENODEV;
++
++	if (gmu->aop_sent && state)
++		return 0;	/* already ON; KGSL caches and early-returns */
++
++	pkt.size = scnprintf(msg_buf, sizeof(msg_buf),
++			     "{class: gpu, res: acd, value: %d}", state);
++	pkt.data = msg_buf;
++
++	ret = mbox_send_message(gmu->aop_chan, &pkt);
++
++	pr_info("ACD230: '{class: gpu, res: acd, value: %d}' len=%u mbox_send_message ret=%d\n",
++		state, pkt.size, ret);
++
++	if (!ret && state)
++		gmu->aop_sent = true;
++
++	return ret;
++}
++
++static int a6xx_gmu_set_freq(struct a6xx_gmu *gmu, int index)
++{
++	int oob_ret;
++
++	/*
++	 * IMAGE 226: don't take power (or block in the 5s HFI waiter) for a
++	 * devfreq event that arrives while the GPU is idle. Upstream v5.8 does
++	 * this check in its public wrapper; our entry point is the internal
++	 * function and had lost it.
++	 */
++	if (pm_runtime_suspended(gmu->dev))
++		return 0;
++
++	/*
++	 * IMAGE 225 -- THE FIX. Non-legacy (HFI v2: A640/A650) must go over HFI.
++	 *
++	 * Upstream v5.8 a6xx_gmu.c:
++	 *
++	 *	if (gmu->legacy)
++	 *		__a6xx_gmu_set_freq(gmu, perf_index);
++	 *	else
++	 *		a6xx_hfi_set_freq(gmu, perf_index);
++	 *
++	 * and again at the tail of a6xx_gmu_resume(). Our port had only the
++	 * first half and called it unconditionally, so an A640 ran the v1
++	 * DCVS-register + DCVS-OOB path that v2 firmware does not implement.
++	 *
++	 * HFI_H2F_MSG_GX_BW_PERF_VOTE is the only message that carries a GX
++	 * corner to v2 firmware, and acting on it is what raises the GX rail
++	 * and gpu_cc_gx_gmu_clk. Without it the firmware is never asked, and
++	 * holding GX collapsed is the correct behaviour. Every observed symptom
++	 * follows: GMU alive and ACKing HFI, CX domain running, GX_VOTE_IDX
++	 * consumed and cleared, and gpu_cc_gx_gmu_clk permanently en=0.
++	 *
++	 * The DCVS OOB ack-wait timeout observed on every boot is the *same*
++	 * bug seen from the other side: DCVS OOB request bit 23 is undefined
++	 * on v2, so it is never acknowledged. Do not treat that timeout as an
++	 * independent fault.
++	 */
++	if (!gmu->legacy)
++		return a6xx_hfi_set_freq(gmu, index);
++
++	/* TEMPORARY image 132 DCVS audit -- REMOVE AFTER RESULT. */
++	pr_info("DCVS132-A: enter index=%d PERF_SET=0x%x BW_SET=0x%x RETURN(before)=0x%x SPTPRAC=0x%x RPMHPWR=0x%x ms=%u\n",
++		index,
++		gmu_read(gmu, REG_A6XX_GMU_DCVS_PERF_SETTING),
++		gmu_read(gmu, REG_A6XX_GMU_DCVS_BW_SETTING),
++		gmu_read(gmu, REG_A6XX_GMU_DCVS_RETURN),
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		jiffies_to_msecs(jiffies));
++	gmu_write(gmu, REG_A6XX_GMU_DCVS_ACK_OPTION, 0);
++
++	/*
++	 * IMAGE 225: also fix the packing. Upstream is
++	 * `((3 & 0xf) << 28) | index`. Ours was `((index << 24) & 0xff)`, whose
++	 * 0xff mask discards every bit at or above 8, so the perf index could
++	 * never reach the register even on legacy hardware.
++	 */
++	gmu_write(gmu, REG_A6XX_GMU_DCVS_PERF_SETTING,
++		((3 & 0xf) << 28) | index);
++
++	/*
++	 * Send an invalid index as a vote for the bus bandwidth and let the
++	 * firmware decide on the right vote
++	 */
++	gmu_write(gmu, REG_A6XX_GMU_DCVS_BW_SETTING, 0xff);
++
++	/* Set and clear the OOB for DCVS to trigger the GMU */
++	oob_ret = a6xx_gmu_set_oob(gmu, GMU_OOB_DCVS_SET);
++	pr_info("DCVS132-B: OOB set ret=%d\n", oob_ret);
++	a6xx_gmu_clear_oob(gmu, GMU_OOB_DCVS_SET);
++	pr_info("DCVS132-C: OOB cleared\n");
++
++	pr_info("DCVS132-D: RETURN(after)=0x%x SPTPRAC=0x%x RPMHPWR=0x%x\n",
++		gmu_read(gmu, REG_A6XX_GMU_DCVS_RETURN),
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE));
++	return gmu_read(gmu, REG_A6XX_GMU_DCVS_RETURN);
++}
++
++static bool a6xx_gmu_check_idle_level(struct a6xx_gmu *gmu)
++{
++	u32 val;
++	int local = gmu->idle_level;
++
++	/* SPTP and IFPC both report as IFPC */
++	if (gmu->idle_level == GMU_IDLE_STATE_SPTP)
++		local = GMU_IDLE_STATE_IFPC;
++
++	val = gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE);
++
++	if (val == local) {
++		if (gmu->idle_level != GMU_IDLE_STATE_IFPC ||
++			!a6xx_gmu_gx_is_on(gmu))
++			return true;
++	}
++
++	return false;
++}
++
++/* Wait for the GMU to get to its most idle state */
++int a6xx_gmu_wait_for_idle(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++
++	return spin_until(a6xx_gmu_check_idle_level(gmu));
++}
++
++/*
++ * TEMPORARY post-mortem dump -- REMOVE AFTER RESULT. Full ITCM (16K),
++ * DTCM low 16K, DEADB scratch (4K) and HFI (16K) contents, 4 words/line.
++ * ITCM/DTCM via the same MMIO aperture used for loading (proven safe by
++ * image-90 IRQ-context reads); buffers via host virt. No locks, no allocs.
++ */
++static void __maybe_unused a6xx_gmu_dump_tcm(struct a6xx_gmu *gmu, const char *tag)
++{
++	int i;
++	u32 w0, w1, w2, w3;
++
++	for (i = 0; i < 0x4000; i += 16) {
++		w0 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2));
++		w1 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2) + 1);
++		w2 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2) + 2);
++		w3 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2) + 3);
++		pr_info("A6XX_DUMP %s ITCM+%04x %08x %08x %08x %08x\n",
++			tag, i, w0, w1, w2, w3);
++	}
++	for (i = 0; i < 0x4000; i += 16) {
++		w0 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2));
++		w1 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2) + 1);
++		w2 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2) + 2);
++		w3 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2) + 3);
++		pr_info("A6XX_DUMP %s DTCM+%04x %08x %08x %08x %08x\n",
++			tag, 0x40000 + i, w0, w1, w2, w3);
++	}
++	if (gmu->sentinel && gmu->sentinel->virt) {
++		u32 *v = gmu->sentinel->virt;
++		for (i = 0; i < 0x1000; i += 16)
++			pr_info("A6XX_DUMP %s DEADB+%03x %08x %08x %08x %08x\n",
++				tag, i, v[i>>2], v[(i>>2)+1], v[(i>>2)+2], v[(i>>2)+3]);
++	}
++	if (gmu->hfi && gmu->hfi->virt) {
++		u32 *v = gmu->hfi->virt;
++		for (i = 0; i < 0x5000; i += 16)
++			pr_info("A6XX_DUMP %s HFI+%04x %08x %08x %08x %08x\n",
++				tag, i, v[i>>2], v[(i>>2)+1], v[(i>>2)+2], v[(i>>2)+3]);
++	}
++	if (gmu->log && gmu->log->virt) {
++		u32 *v = gmu->log->virt;
++		for (i = 0; i < 0x1000; i += 16)
++			pr_info("A6XX_DUMP %s LOG+%03x %08x %08x %08x %08x\n",
++				tag, i, v[i>>2], v[(i>>2)+1], v[(i>>2)+2], v[(i>>2)+3]);
++	}
++	pr_info("A6XX_DUMP %s done\n", tag);
++}
++
++/*
++ * TEMPORARY image 174 -- PROMOTE with firmware visibility. Dump the GMU
++ * firmware log buffer (written by the firmware via CP_MSG since img 102,
++ * never read until now) to debugfs. Read-only host RAM, no MMIO: safe
++ * on a dead/hung GMU. This kernel only ever drives A640.
++ */
++void a6xx_gmu_log_show(struct msm_gpu *gpu, struct seq_file *m)
++{
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(to_adreno_gpu(gpu));
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	u32 *v;
++	int i, n;
++
++	if (!gmu->log || !gmu->log->virt) {
++		seq_printf(m, "no GMU log buffer\n");
++		return;
++	}
++	v = (u32 *)gmu->log->virt;
++	n = gmu->log->size >> 2;
++	seq_printf(m, "GMU log: iova=0x%llx size=0x%zx\n",
++		(unsigned long long)gmu->log->iova, gmu->log->size);
++	for (i = 0; i < n; i += 4)
++		seq_printf(m, "%04x: %08x %08x %08x %08x\n", i,
++			v[i], v[i + 1], v[i + 2], v[i + 3]);
++}
++
++/*
++ * TEMPORARY experiment image 118 -- REMOVE AFTER RESULT. Forensic capture
++ * of GMU firmware self-init (GOOD=BABEFACE vs BAD=BADDFACE). Read-only:
++ * no init write, no reset, no HFI, no retry semantics are changed.
++ */
++#define F118_ITCM_A_OFF 0x0000
++#define F118_ITCM_A_N 256
++#define F118_ITCM_B_OFF 0x1e00
++#define F118_ITCM_B_N 72
++#define F118_ITCM_C_OFF 0x0200
++#define F118_ITCM_C_N 96
++#define F118_DTCM_A_OFF 0x40000
++#define F118_DTCM_A_N 128
++#define F118_DTCM_B_OFF 0x40e00
++#define F118_DTCM_B_N 128
++#define F118_DTCM_C_OFF 0x0ff0
++#define F118_DTCM_C_N 8
++static u32 f118_pre_itcm_a[F118_ITCM_A_N];
++static u32 f118_pre_itcm_b[F118_ITCM_B_N];
++static u32 f118_pre_itcm_c[F118_ITCM_C_N];
++static u32 f118_pre_dtcm_a[F118_DTCM_A_N];
++static u32 f118_pre_dtcm_b[F118_DTCM_B_N];
++static u32 f118_pre_dtcm_c[F118_DTCM_C_N];
++static bool f118_pre_valid;
++
++static u32 f118_rd_itcm(struct a6xx_gmu *gmu, u32 byte_off)
++{
++	return gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (byte_off >> 2));
++}
++
++static u32 f118_rd_dtcm(struct a6xx_gmu *gmu, u32 byte_off)
++{
++	u32 ap = (byte_off >= 0x40000) ? (byte_off - 0x40000) : byte_off;
++	return gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (ap >> 2));
++}
++
++static void f118_store_pre(struct a6xx_gmu *gmu)
++{
++	u32 i;
++	for (i = 0; i < F118_ITCM_A_N; i++)
++		f118_pre_itcm_a[i] = f118_rd_itcm(gmu, F118_ITCM_A_OFF + (i << 2));
++	for (i = 0; i < F118_ITCM_B_N; i++)
++		f118_pre_itcm_b[i] = f118_rd_itcm(gmu, F118_ITCM_B_OFF + (i << 2));
++	for (i = 0; i < F118_ITCM_C_N; i++)
++		f118_pre_itcm_c[i] = f118_rd_itcm(gmu, F118_ITCM_C_OFF + (i << 2));
++	for (i = 0; i < F118_DTCM_A_N; i++)
++		f118_pre_dtcm_a[i] = f118_rd_dtcm(gmu, F118_DTCM_A_OFF + (i << 2));
++	for (i = 0; i < F118_DTCM_B_N; i++)
++		f118_pre_dtcm_b[i] = f118_rd_dtcm(gmu, F118_DTCM_B_OFF + (i << 2));
++	for (i = 0; i < F118_DTCM_C_N; i++)
++		f118_pre_dtcm_c[i] = f118_rd_dtcm(gmu, F118_DTCM_C_OFF + (i << 2));
++	f118_pre_valid = true;
++}
++
++static void f118_snap_regs(struct a6xx_gmu *gmu, const char *tag)
++{
++	pr_info("FORENSIC REGS %s SYSRESET=0x%x INITRES=0x%x BOOTCFG=0x%x CM3CFG=0x%x WFI=0x%x FWBUSY=0x%x NMI=0x%x\n",
++		tag,
++		gmu_read(gmu, REG_A6XX_GMU_CM3_SYSRESET),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_BOOT_CONFIG),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_CFG),
++		gmu_read(gmu, REG_A6XX_GMU_CX_GMU_WFI_CONFIG),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_FW_BUSY),
++		gmu_read(gmu, REG_A6XX_GMU_NMI_CONTROL_STATUS));
++	pr_info("FORENSIC REGS %s QTBL=0x%x QTBLINFO=0x%x SFR=0x%x CPMSG=0x%x G7=0x%x FENCE0=0x%x FENCE1=0x%x\n",
++		tag,
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_ADDR),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_SFR_ADDR),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_MSG),
++		gmu_read(gmu, REG_A6XX_GMU_GENERAL_7),
++		gmu_read(gmu, REG_A6XX_GMU_AHB_FENCE_RANGE_0),
++		gmu_read(gmu, REG_A6XX_GMU_AHB_FENCE_RANGE_1));
++	pr_info("FORENSIC REGS %s HFISTAT=0x%x G2HINFO=0x%x G2HMASK=0x%x H2GRAW=0x%x H2GINFO0=0x%x RPMHPWR=0x%x KEEPALIVE=0x%x\n",
++		tag,
++		gmu_read(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_INFO_0),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		gmu_read(gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE));
++	pr_info("FORENSIC NOTE %s G2HRAW=N/A-no-such-reg-in-this-gmu\n", tag);
++}
++
++static void f118_dump_log(struct a6xx_gmu *gmu)
++{
++	u32 *v;
++	int i;
++	if (!gmu->log || !gmu->log->virt) {
++		pr_info("FORENSIC LOG no-log-buffer\n");
++		return;
++	}
++	v = (u32 *)gmu->log->virt;
++	pr_info("FORENSIC LOGHDR w0=0x%08x w1=0x%08x w2=0x%08x w3=0x%08x w4=0x%08x w5=0x%08x w6=0x%08x w7=0x%08x (write-ptr-unknown-no-reg)\n",
++		v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++	for (i = 0; i < 0x1000; i += 16)
++		pr_info("FORENSIC LOG+%03x %08x %08x %08x %08x\n",
++			i, v[i>>2], v[(i>>2)+1], v[(i>>2)+2], v[(i>>2)+3]);
++	pr_info("FORENSIC LOG done\n");
++}
++
++static void f118_dump_focused(struct a6xx_gmu *gmu, const char *tag)
++{
++	int i;
++	u32 a, b, c, d;
++	for (i = 0; i < 0x400; i += 16) {
++		a = f118_rd_itcm(gmu, 0x0000 + i);
++		b = f118_rd_itcm(gmu, 0x0000 + i + 4);
++		c = f118_rd_itcm(gmu, 0x0000 + i + 8);
++		d = f118_rd_itcm(gmu, 0x0000 + i + 12);
++		pr_info("FORENSIC MEM %s ITCM+%04x %08x %08x %08x %08x\n", tag, i, a, b, c, d);
++	}
++	for (i = 0; i < 0x120; i += 16) {
++		a = f118_rd_itcm(gmu, 0x1e00 + i);
++		b = f118_rd_itcm(gmu, 0x1e00 + i + 4);
++		c = f118_rd_itcm(gmu, 0x1e00 + i + 8);
++		d = f118_rd_itcm(gmu, 0x1e00 + i + 12);
++		pr_info("FORENSIC MEM %s ITCM+%04x %08x %08x %08x %08x\n", tag, 0x1e00 + i, a, b, c, d);
++	}
++	for (i = 0; i < 0x180; i += 16) {
++		a = f118_rd_itcm(gmu, 0x0200 + i);
++		b = f118_rd_itcm(gmu, 0x0200 + i + 4);
++		c = f118_rd_itcm(gmu, 0x0200 + i + 8);
++		d = f118_rd_itcm(gmu, 0x0200 + i + 12);
++		pr_info("FORENSIC MEM %s ITCM+%04x %08x %08x %08x %08x\n", tag, 0x0200 + i, a, b, c, d);
++	}
++	for (i = 0; i < 0x200; i += 16) {
++		a = f118_rd_dtcm(gmu, 0x40000 + i);
++		b = f118_rd_dtcm(gmu, 0x40000 + i + 4);
++		c = f118_rd_dtcm(gmu, 0x40000 + i + 8);
++		d = f118_rd_dtcm(gmu, 0x40000 + i + 12);
++		pr_info("FORENSIC MEM %s DTCM+%05x %08x %08x %08x %08x\n", tag, 0x40000 + i, a, b, c, d);
++	}
++	for (i = 0; i < 0x200; i += 16) {
++		a = f118_rd_dtcm(gmu, 0x40e00 + i);
++		b = f118_rd_dtcm(gmu, 0x40e00 + i + 4);
++		c = f118_rd_dtcm(gmu, 0x40e00 + i + 8);
++		d = f118_rd_dtcm(gmu, 0x40e00 + i + 12);
++		pr_info("FORENSIC MEM %s DTCM+%05x %08x %08x %08x %08x\n", tag, 0x40e00 + i, a, b, c, d);
++	}
++	a = f118_rd_dtcm(gmu, 0x0ff0);
++	b = f118_rd_dtcm(gmu, 0x0ff4);
++	c = f118_rd_dtcm(gmu, 0x0ff8);
++	d = f118_rd_dtcm(gmu, 0x0ffc);
++	pr_info("FORENSIC MEM %s DTCM+00ff0 %08x %08x %08x %08x\n", tag, a, b, c, d);
++	a = f118_rd_dtcm(gmu, 0x1000);
++	b = f118_rd_dtcm(gmu, 0x1004);
++	c = f118_rd_dtcm(gmu, 0x1008);
++	d = f118_rd_dtcm(gmu, 0x100c);
++	pr_info("FORENSIC MEM %s DTCM+01000 %08x %08x %08x %08x\n", tag, a, b, c, d);
++	pr_info("FORENSIC MEM %s done\n", tag);
++}
++
++static void f118_diff(struct a6xx_gmu *gmu)
++{
++	u32 i, cur;
++	if (!f118_pre_valid) {
++		pr_info("FORENSIC DIFF no-pre-snapshot\n");
++		return;
++	}
++	for (i = 0; i < F118_ITCM_A_N; i++) {
++		cur = f118_rd_itcm(gmu, F118_ITCM_A_OFF + (i << 2));
++		if (cur != f118_pre_itcm_a[i])
++			pr_info("FORENSIC DIFF ITCM+%04x before=%08x after=%08x\n",
++				(unsigned)(F118_ITCM_A_OFF + (i << 2)), f118_pre_itcm_a[i], cur);
++	}
++	for (i = 0; i < F118_ITCM_B_N; i++) {
++		cur = f118_rd_itcm(gmu, F118_ITCM_B_OFF + (i << 2));
++		if (cur != f118_pre_itcm_b[i])
++			pr_info("FORENSIC DIFF ITCM+%04x before=%08x after=%08x\n",
++				(unsigned)(F118_ITCM_B_OFF + (i << 2)), f118_pre_itcm_b[i], cur);
++	}
++	for (i = 0; i < F118_ITCM_C_N; i++) {
++		cur = f118_rd_itcm(gmu, F118_ITCM_C_OFF + (i << 2));
++		if (cur != f118_pre_itcm_c[i])
++			pr_info("FORENSIC DIFF ITCM+%04x before=%08x after=%08x\n",
++				(unsigned)(F118_ITCM_C_OFF + (i << 2)), f118_pre_itcm_c[i], cur);
++	}
++	for (i = 0; i < F118_DTCM_A_N; i++) {
++		cur = f118_rd_dtcm(gmu, F118_DTCM_A_OFF + (i << 2));
++		if (cur != f118_pre_dtcm_a[i])
++			pr_info("FORENSIC DIFF DTCM+%05x before=%08x after=%08x\n",
++				(unsigned)(F118_DTCM_A_OFF + (i << 2)), f118_pre_dtcm_a[i], cur);
++	}
++	for (i = 0; i < F118_DTCM_B_N; i++) {
++		cur = f118_rd_dtcm(gmu, F118_DTCM_B_OFF + (i << 2));
++		if (cur != f118_pre_dtcm_b[i])
++			pr_info("FORENSIC DIFF DTCM+%05x before=%08x after=%08x\n",
++				(unsigned)(F118_DTCM_B_OFF + (i << 2)), f118_pre_dtcm_b[i], cur);
++	}
++	for (i = 0; i < F118_DTCM_C_N; i++) {
++		cur = f118_rd_dtcm(gmu, F118_DTCM_C_OFF + (i << 2));
++		if (cur != f118_pre_dtcm_c[i])
++			pr_info("FORENSIC DIFF DTCM+%04x before=%08x after=%08x\n",
++				(unsigned)(F118_DTCM_C_OFF + (i << 2)), f118_pre_dtcm_c[i], cur);
++	}
++	pr_info("FORENSIC DIFF done\n");
++}
++
++static void f118_hit_word(const char *where, u32 off, u32 w)
++{
++	if (w == 0xdeadbeef || w == 0xbabeface || w == 0xbaddface ||
++	    (w >= 0x60000000 && w < 0x60010000))
++		pr_info("FORENSIC HIT %s+0x%x =0x%08x\n", where, off, w);
++}
++
++static void f118_scan(struct a6xx_gmu *gmu)
++{
++	u32 i, w;
++	u32 *v;
++	for (i = 0; i < F118_ITCM_A_N; i++) {
++		w = f118_rd_itcm(gmu, F118_ITCM_A_OFF + (i << 2));
++		f118_hit_word("ITCM", F118_ITCM_A_OFF + (i << 2), w);
++	}
++	for (i = 0; i < F118_ITCM_B_N; i++) {
++		w = f118_rd_itcm(gmu, F118_ITCM_B_OFF + (i << 2));
++		f118_hit_word("ITCM", F118_ITCM_B_OFF + (i << 2), w);
++	}
++	for (i = 0; i < F118_ITCM_C_N; i++) {
++		w = f118_rd_itcm(gmu, F118_ITCM_C_OFF + (i << 2));
++		f118_hit_word("ITCM", F118_ITCM_C_OFF + (i << 2), w);
++	}
++	for (i = 0; i < F118_DTCM_A_N; i++) {
++		w = f118_rd_dtcm(gmu, F118_DTCM_A_OFF + (i << 2));
++		f118_hit_word("DTCM", F118_DTCM_A_OFF + (i << 2), w);
++	}
++	for (i = 0; i < F118_DTCM_B_N; i++) {
++		w = f118_rd_dtcm(gmu, F118_DTCM_B_OFF + (i << 2));
++		f118_hit_word("DTCM", F118_DTCM_B_OFF + (i << 2), w);
++	}
++	for (i = 0; i < F118_DTCM_C_N; i++) {
++		w = f118_rd_dtcm(gmu, F118_DTCM_C_OFF + (i << 2));
++		f118_hit_word("DTCM", F118_DTCM_C_OFF + (i << 2), w);
++	}
++	if (gmu->log && gmu->log->virt) {
++		v = (u32 *)gmu->log->virt;
++		for (i = 0; i < (0x1000 >> 2); i++)
++			f118_hit_word("LOG", i << 2, v[i]);
++	}
++	pr_info("FORENSIC SCAN done\n");
++}
++
++static void f118_verdict(struct a6xx_gmu *gmu, const char *tag)
++{
++	f118_snap_regs(gmu, tag);
++	f118_dump_log(gmu);
++	f118_dump_focused(gmu, tag);
++	f118_diff(gmu);
++	f118_scan(gmu);
++}
++
++static int a6xx_gmu_start(struct a6xx_gmu *gmu)
++{
++	int ret;
++	u32 val;
++
++	a6xx_start_jiffies = jiffies;
++
++	/*
++	 * TEMPORARY experiment -- REMOVE OR PROMOTE ON RESULT. Vendor KGSL
++	 * writes WFI_CONFIG=0 immediately before SYSRESET release; our path
++	 * never did.
++	 */
++	A6XX_TRACE("before WFI_CONFIG write (off=0x%x value=0x0)", REG_A6XX_GMU_CX_GMU_WFI_CONFIG);
++	gmu_write(gmu, REG_A6XX_GMU_CX_GMU_WFI_CONFIG, 0x0);
++	A6XX_TRACE("after WFI_CONFIG write, readback=0x%x",
++		gmu_read(gmu, REG_A6XX_GMU_CX_GMU_WFI_CONFIG));
++	/*
++	 * TEMPORARY experiment image 97 -- REMOVE OR PROMOTE ON RESULT.
++	 * Vendor KGSL releases SYSRESET with a bare deassert (no 1->0 pulse).
++	 * Previous images asserted first; this single change drops the assert.
++	 * msm_writel() is ordered (writel), so no extra barrier is added.
++	 */
++	/* TEMPORARY image 118 forensic pre-snapshot (read-only). Focused
++	 * ITCM/DTCM stored + full register snapshot before SYSRESET release.
++	 * No init write changed. Full PRE megabyte dump dropped to protect
++	 * the kmsg ring for forensic output (dump function itself untouched).
++	 */
++	f118_snap_regs(gmu, "PRE");
++	/*
++	 * Image 183 -- PROMOTE (survivability). f118_store_pre() reads
++	 * 256+72+96 ITCM words and 264 DTCM words through the MMIO
++	 * aperture. That aperture is only safe on a cold power-on: after
++	 * a6xx_gmu_reset() cycles the clocks (retry path), the very same
++	 * read externally aborts (Synchronous External Abort at
++	 * GMU+0x3000 = ITCM_START, fw_start via gmu_start) and TZ takes
++	 * the machine down with TZBSP_ERR_FATAL_NOC_ERROR -- image 182's
++	 * first trigger died exactly here, 5s after a -110 retry, with
++	 * every control-reg read on the same path succeeding. Control
++	 * regs live on the always-on AHB; the TCM RAMs evidently sit
++	 * behind a switch the reset path does not restore. The PRE store
++	 * is pure forensics (pre/post diff input for a verdict era that
++	 * is over), so it runs only under a6xx_instr now. Post-boot
++	 * aperture reads (f118_verdict on GOOD/BAD, firmware alive) are
++	 * unaffected and stay.
++	 *
++	 * OPEN: why the TCM aperture dies across a clock disable/re-enable
++	 * cycle. Until root-caused, the retry path must not touch it.
++	 */
++	if (a6xx_instr) {
++		f118_store_pre(gmu);
++		pr_info("FORENSIC PRE stored focused regions\n");
++	}
++
++	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 0);
++
++	a6xx_gmu_capture_boot_state(gmu, "C-poll-enter");
++
++	/* TEMPORARY image 118 forensic poll -- REMOVE AFTER RESULT. Same
++	 * 100us x 10000 timing and same BABEFACE/BADDFACE breaks. Adds:
++	 * transition log, milestone samples (5/10/15/20/25/30/35/37/40/50ms),
++	 * and identical full forensic snapshot at either verdict.
++	 */
++	ret = -ETIMEDOUT;
++	{
++		int i;
++		u32 last = 0;
++		for (i = 0; i < 10000; i++) {
++			val = gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT);
++			if (val != last) {
++				pr_info("FORENSIC POLL ms~%u INITRES=0x%08x (change)\n",
++					(unsigned)(i / 10), val);
++				last = val;
++			} else if (i == 50 || i == 100 || i == 150 || i == 200 ||
++				   i == 250 || i == 300 || i == 350 || i == 370 ||
++				   i == 400 || i == 500) {
++				pr_info("FORENSIC POLL ms~%u INITRES=0x%08x (sample)\n",
++					(unsigned)(i / 10), val);
++			}
++			if (val == 0xbabeface) {
++				pr_info("FORENSIC VERDICT GOOD BABEFACE ms~%u\n",
++					(unsigned)(i / 10));
++				a6xx_gmu_capture_boot_state(gmu, "E-babeface");
++				f118_verdict(gmu, "GOOD");
++				ret = 0;
++				break;
++			}
++			if (val == 0xbaddface) {
++				pr_info("A6XX_SNAPSHOT: BADDFACE first seen @%ums\n",
++					jiffies_to_msecs(jiffies - a6xx_start_jiffies));
++				pr_info("FORENSIC VERDICT BAD BADDFACE ms~%u\n",
++					(unsigned)(i / 10));
++				a6xx_gmu_capture_boot_state(gmu, "E-baddface");
++				f118_verdict(gmu, "BAD");
++				ret = -EIO;
++				break;
++			}
++			udelay(100);
++		}
++	}
++
++if (ret == -ETIMEDOUT) {
++		dev_err(gmu->dev, "GMU firmware initialization timed out\n");
++		a6xx_gmu_capture_boot_state(gmu, "D-timeout");
++		a6xx_gmu_scratch_check(gmu, "at-timeout");
++	}
++
++	return ret;
++}
++
++static int a6xx_gmu_hfi_start(struct a6xx_gmu *gmu)
++{
++	u32 val;
++	int ret;
++
++	A6XX_TRACE("hfi_start entered");
++	gmu_rmw(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK,
++		A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ, 0);
++
++	gmu_write(gmu, REG_A6XX_GMU_HFI_CTRL_INIT, 1);
++
++	pr_info("POST_START: hfi poll enter (expect STATUS&1)\n");
++	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS, val,
++		val & 1, 100, 10000);
++	pr_info("POST_START: hfi poll %s (STATUS=0x%x)\n",
++		ret ? "TIMEOUT" : "ok",
++		gmu_read(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS));
++	if (ret)
++		dev_err(gmu->dev, "Unable to start the HFI queues\n");
++
++	return ret;
++}
++
++/* Trigger a OOB (out of band) request to the GMU */
++int a6xx_gmu_set_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
++{
++	int ret;
++
++
++	u32 val;
++	int request, ack, clear;
++	const char *name;
++
++	/*
++	 * TEMPORARY experiment image 117 -- REMOVE OR PROMOTE ON RESULT.
++	 * Suppress async DCVS OOB doorbells while HFI bootstrap runs; the
++	 * resume's own post-bootstrap set_freq is unaffected (flag cleared).
++	 * Suppressed, not faked: no write, no poll, return 0 (all in-tree
++	 * DCVS callers ignore the result).
++	 */
++	if (state == GMU_OOB_DCVS_SET && a6xx_gmu_bootstrap_active) {
++		pr_info("GPU_DCVS deferred during GMU bootstrap\n");
++		return 0;
++	}
++
++	switch (state) {
++	case GMU_OOB_GPU_SET:
++		/*
++		 * IMAGE 225: select the interrupt vector by firmware
++		 * generation. gmu->legacy is true only for HFI v1; our A640
++		 * firmware reports HFI_VERSION=0x20000001 (v2.1), so we must
++		 * use the *_NEW bits. See a6xx_gmu.h for the full account.
++		 */
++		if (gmu->legacy) {
++			request = GMU_OOB_GPU_SET_REQUEST;
++			ack = GMU_OOB_GPU_SET_ACK;
++			clear = GMU_OOB_GPU_SET_CLEAR;
++		} else {
++			request = GMU_OOB_GPU_SET_REQUEST_NEW;
++			ack = GMU_OOB_GPU_SET_ACK_NEW;
++			clear = GMU_OOB_GPU_SET_CLEAR_NEW;
++		}
++		name = "GPU_SET";
++		break;
++	case GMU_OOB_BOOT_SLUMBER:
++		if (!gmu->legacy) {
++			/*
++			 * Upstream has no non-legacy mapping for
++			 * BOOT_SLUMBER and returns -EINVAL here. A640's
++			 * GMU is woken over HFI, not OOB. gfx_rail_on() is
++			 * legacy-only so this should be unreachable; if it
++			 * is, the GMU never saw the request.
++			 */
++			pr_info("OOB225: BOOT_SLUMBER is legacy-only, "
++				"HFI_VERSION=0x%08x -- skipping\n",
++				gmu_read(gmu, REG_A6XX_GMU_HFI_VERSION_INFO));
++			return 0;
++		}
++		request = GMU_OOB_BOOT_SLUMBER_REQUEST;
++		ack = GMU_OOB_BOOT_SLUMBER_ACK;
++		clear = GMU_OOB_BOOT_SLUMBER_CLEAR;
++		name = "BOOT_SLUMBER";
++		break;
++	case GMU_OOB_DCVS_SET:
++		if (!gmu->legacy) {
++			/* Frequency is set over HFI on v2.x; see header. */
++			pr_info("OOB225: DCVS_SET is legacy-only -- "
++				"skipping (HFI handles freq on v2.x)\n");
++			return 0;
++		}
++		request = GMU_OOB_DCVS_REQUEST;
++		ack = GMU_OOB_DCVS_ACK;
++		clear = GMU_OOB_DCVS_CLEAR;
++		name = "GPU_DCVS";
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	pr_info("OOB225 %s: legacy=%d SET_MASK=0x%x ACK_MASK=0x%x CLEAR_MASK=0x%x\n",
++		name, gmu->legacy, 1 << request, 1 << ack, 1 << clear);
++	/* Trigger the equested OOB operation */
++	gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1 << request);
++
++	pr_info("POST_START: oob %s ack-wait enter\n", name);
++	/* Wait for the acknowledge interrupt */
++	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO, val,
++		val & (1 << ack), 100, 10000);
++	pr_info("POST_START: oob %s ack-wait %s (INTR_INFO=0x%x)\n", name,
++		ret ? "TIMEOUT" : "ok",
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++
++	if (ret)
++		dev_err(gmu->dev,
++			"Timeout waiting for GMU OOB set %s: 0x%x\n",
++				name,
++				gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++
++	/*
++	 * TEMPORARY image 223 -- GMU LIVENESS, read where it MATTERS.
++	 *
++	 * The GVIT157 poller that was supposed to print this never fired
++	 * (image 222: armed, then silent for 120s), so read it inline here,
++	 * in a code path that demonstrably executes.
++	 *
++	 * REG_A6XX_GMU_HFI_VERSION_INFO (0x5181) is the GMU firmware's own
++	 * version handshake reply. Nothing host-side writes this register --
++	 * only the running GMU firmware does.
++	 *
++	 *   real version    -> GMU firmware IS running; the fault is in the
++	 *                      OOB/boot-slumber sequencing we use
++	 *   0x00000000      -> GMU firmware is NOT executing at all
++	 *   0xffffffff      -> GMU register block not responding (bus/MMIO)
++	 *
++	 * Dumped only on failure, so no cost on the happy path.
++	 */
++	if (ret)
++		pr_info("GMUDEAD[%s]: HFI_VERSION=0x%08x OOB_G2H_INFO=0x%08x OOB_G2H_MASK=0x%08x HOST2GMU_RAW=0x%08x HOST2GMU_SET=0x%08x GX_VOTE=0x%08x MX_VOTE=0x%08x SPTPRAC_PWR=0x%08x\n",
++			name,
++			gmu_read(gmu, REG_A6XX_GMU_HFI_VERSION_INFO),
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK),
++			gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++			gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET),
++			gmu_read(gmu, REG_A6XX_GMU_GX_VOTE_IDX),
++			gmu_read(gmu, REG_A6XX_GMU_MX_VOTE_IDX),
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++	/* Clear the acknowledge interrupt */
++	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, 1 << ack);
++
++	pr_info("OOB132: set %s ret=%d\n", name, ret);
++	bc132("OOB_SET", ret);
++	return ret;
++}
++
++/* Clear a pending OOB state in the GMU */
++void a6xx_gmu_clear_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
++{
++	pr_info("OOB132: clear state=%d\n", state);
++	/* IMAGE 225: clear bit must match the request vector we rang. */
++	switch (state) {
++	case GMU_OOB_GPU_SET:
++		gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET,
++			1 << (gmu->legacy ? GMU_OOB_GPU_SET_CLEAR :
++					   GMU_OOB_GPU_SET_CLEAR_NEW));
++		break;
++	case GMU_OOB_BOOT_SLUMBER:
++		gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET,
++			1 << GMU_OOB_BOOT_SLUMBER_CLEAR);
++		break;
++	case GMU_OOB_DCVS_SET:
++		gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET,
++			1 << GMU_OOB_DCVS_CLEAR);
++		break;
++	}
++}
++
++/*
++ * IMAGE 224 -- REAL FIX. Power on SPTPRAC instead of skipping it.
++ *
++ * Image 198 replaced this function with a no-op that just logged, because the
++ * poll timed out on every boot and bring-up never reached HFI. That "fix" is
++ * the reason nothing has ever been rendered.
++ *
++ * Why the poll always timed out: the port polled for the WRONG BIT.
++ *
++ *   REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS (0x50d0) is not a pure status
++ *   register in this layout -- CAF writes it to COMMAND the power sequence:
++ *
++ *     0x01  SPTPRAC_GDSC_POWERING_OFF
++ *     0x02  SPTPRAC_GDSC_POWERING_ON   <- write this to start power-up
++ *     0x04  SPTPRAC_GDSC_POWER_ON      <- poll for THIS
++ *     0x08  SPTPRAC_GDSC_POWER_OFF     <- the old code polled for this
++ *
++ * The port polled BIT(3) = 0x08 = POWER_OFF, i.e. it waited for SPTPRAC to be
++ * switched OFF as a way of asking for it to come on. It could never succeed,
++ * so it always timed out, so image 198 made it a no-op, so SPTPRAC was never
++ * powered.
++ *
++ * The status we read confirms the consequence. The old 0xc0 decodes as:
++ *     0x40 = GX_HM_GDSC_POWER_OFF
++ *     0x80 = GX_HM_CLK_OFF
++ * i.e. the graphics hardware block is powered down, and SPTPRAC reads 0x0 --
++ * not powering on, not on, not off. The GMU firmware can answer plain MMIO
++ * (which is why HFI_VERSION=0x20000001 reads back fine) but cannot run its
++ * main loop without SPTPRAC. Hence: OOB requests unconsumed
++ * (HOST2GMU_RAW stays set), the GX vote written and immediately discarded
++ * (VOTE151 writes gx=0x9, readback 0x0), the GX clock domain never enabled
++ * (gpu_cc_gx_gmu_clk en=0), and therefore no blit and no render ever.
++ *
++ * This restores CAF's sequence.
++ */
++static int a6xx_sptprac_enable(struct a6xx_gmu *gmu)
++{
++	int ret;
++	u32 val;
++
++	/*
++	 * IMAGE 225: upstream's real sequence.
++	 *
++	 * Image 224 wrote POWERING_ON into SPTPRAC_PWR_CLK_STATUS (0x50d0),
++	 * which is why it read 0xc0 before AND after -- that register is
++	 * status-only and does not latch the write. The command goes to
++	 * REG_A6XX_GMU_GX_SPTPRAC_POWER_CONTROL (0x81), value 0x778000.
++	 *
++	 * The completion condition is also not a single bit: (val & 0x38)
++	 * == 0x28, i.e. SP_CLOCK_OFF clear and GMU_UP_POWER_STATE set.
++	 * Polling a single bit can pass on a half-finished power sequence.
++	 */
++	if (!gmu->legacy) {
++		/*
++		 * Upstream WARN_ONs here and only calls this under
++		 * `if (gmu->legacy)`. SPTPRAC on HFI v2.x is managed by the
++		 * GMU firmware itself; the host must not take it over.
++		 */
++		pr_info("SPTPRAC225: skipping, legacy=%d (GMU manages it on HFI v2.x)\n",
++			gmu->legacy);
++		return 0;
++	}
++
++	pr_info("SPTPRAC225: before PWR_CLK_STATUS=0x%x\n",
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++	gmu_write(gmu, REG_A6XX_GMU_GX_SPTPRAC_POWER_CONTROL, 0x778000);
++
++	pr_info("SPTPRAC225: after request 0x778000 PWR_CLK_STATUS=0x%x\n",
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS, val,
++			(val & 0x38) == 0x28, 1, 100);
++
++	pr_info("SPTPRAC225: poll %s status=0x%x\n",
++		ret ? "TIMEOUT" : "ok",
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++	if (ret)
++		dev_err(gmu->dev, "Unable to power on SPTPRAC: 0x%x\n",
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++	/* CAF/upstream return 0 even on timeout; keep that. */
++	return 0;
++}
++
++/* Disable CPU control of SPTP power power collapse */
++static void a6xx_sptprac_disable(struct a6xx_gmu *gmu)
++{
++	u32 val;
++	int ret;
++
++	/* Make sure retention is on */
++	gmu_rmw(gmu, REG_A6XX_GPU_CC_GX_GDSCR, 0, (1 << 11));
++
++	gmu_write(gmu, REG_A6XX_GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001);
++
++	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS, val,
++		(val & 0x04), 100, 10000);
++
++	if (ret)
++		dev_err(gmu->dev, "failed to power off SPTPRAC: 0x%x\n",
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++}
++
++/* Let the GMU know we are starting a boot sequence */
++static int a6xx_gmu_gfx_rail_on(struct a6xx_gmu *gmu)
++{
++	u32 vote;
++
++	/* Let the GMU know we are getting ready for boot */
++	gmu_write(gmu, REG_A6XX_GMU_BOOT_SLUMBER_OPTION, 0);
++
++	/* Choose the "default" power level as the highest available */
++	vote = gmu->gx_arc_votes[gmu->nr_gpu_freqs - 1];
++
++	gmu_write(gmu, REG_A6XX_GMU_GX_VOTE_IDX, vote & 0xff);
++	gmu_write(gmu, REG_A6XX_GMU_MX_VOTE_IDX, (vote >> 8) & 0xff);
++
++	/* Let the GMU know the boot sequence has started */
++	return a6xx_gmu_set_oob(gmu, GMU_OOB_BOOT_SLUMBER);
++}
++
++/* Let the GMU know that we are about to go into slumber */
++static int a6xx_gmu_notify_slumber(struct a6xx_gmu *gmu)
++{
++	int ret;
++
++	/* Disable the power counter so the GMU isn't busy */
++	gmu_write(gmu, REG_A6XX_GMU_CX_GMU_POWER_COUNTER_ENABLE, 0);
++
++	/* Disable SPTP_PC if the CPU is responsible for it */
++	if (gmu->idle_level < GMU_IDLE_STATE_SPTP)
++		a6xx_sptprac_disable(gmu);
++
++	/*
++	 * TEMPORARY image 170 -- PROMOTE with the slumber lifecycle.
++	 * Nonlegacy firmware takes PREPARE_SLUMBER over HFI (upstream);
++	 * try it first, then the legacy OOB dance regardless
++	 * (belt and suspenders; the 0x0f check below judges).
++	 */
++	if (experimental_nonlegacy) {
++		ret = a6xx_hfi_send_prep_slumber(gmu);
++		if (a6xx_instr)
++			pr_info("SLUM170: prep_slumber HFI ret=%d\n", ret);
++	}
++
++	/* Tell the GMU to get ready to slumber */
++	gmu_write(gmu, REG_A6XX_GMU_BOOT_SLUMBER_OPTION, 1);
++
++	ret = a6xx_gmu_set_oob(gmu, GMU_OOB_BOOT_SLUMBER);
++	a6xx_gmu_clear_oob(gmu, GMU_OOB_BOOT_SLUMBER);
++
++	if (!ret) {
++		/* Check to see if the GMU really did slumber */
++		if (gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE)
++			!= 0x0f) {
++			dev_err(gmu->dev, "The GMU did not go into slumber\n");
++			ret = -ETIMEDOUT;
++		}
++	}
++
++	/* Put fence into allow mode */
++	gmu_write(gmu, REG_A6XX_GMU_AO_AHB_FENCE_CTRL, 0);
++	return ret;
++}
++
++static int a6xx_rpmh_start(struct a6xx_gmu *gmu)
++{
++	int ret;
++	u32 val;
++
++	pr_info("RPMH132: rpmh_start enter\n");
++	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 1 << 1);
++	/* Wait for the register to finish posting */
++	wmb();
++
++	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_RSCC_CONTROL_ACK, val,
++		val & (1 << 1), 100, 10000);
++	if (ret) {
++		dev_err(gmu->dev, "Unable to power on the GPU RSC\n");
++		return ret;
++	}
++
++	ret = gmu_poll_timeout(gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0, val,
++		!val, 100, 10000);
++
++	if (!ret) {
++		gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
++
++		/* Re-enable the power counter */
++		gmu_write(gmu, REG_A6XX_GMU_CX_GMU_POWER_COUNTER_ENABLE, 1);
++		pr_info("RPMH132: rpmh_start ret=0 (TCS handshake ok)\n");
++		return 0;
++	}
++
++	dev_err(gmu->dev, "GPU RSC sequence stuck while waking up the GPU\n");
++	pr_info("RPMH132: rpmh_start TIMEOUT ret=%d\n", ret);
++	return ret;
++}
++
++static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
++{
++	int ret;
++	u32 val;
++
++	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 1);
++
++	ret = gmu_poll_timeout(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0,
++		val, val & (1 << 16), 100, 10000);
++	if (ret)
++		dev_err(gmu->dev, "Unable to power off the GPU RSC\n");
++
++	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
++}
++
++static void a6xx_gmu_rpmh_init(struct a6xx_gmu *gmu)
++{
++	pr_info("RPMH132: rpmh_init enter\n");
++	A6XX_TRACE("PRE_PDCSEQ mmio=%px pdc_mmio=%px seq_mmio=%px",
++		gmu->mmio, gmu->pdc_mmio, gmu->seq_mmio);
++	/* Disable SDE clock gating */
++	gmu_write(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0, BIT(24));
++
++	/* Setup RSC PDC handshake for sleep and wakeup */
++	gmu_write(gmu, REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0, 1);
++	gmu_write(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_DATA, 0);
++	gmu_write(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
++	gmu_write(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_DATA + 2, 0);
++	gmu_write(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 2, 0);
++	gmu_write(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_DATA + 4, 0x80000000);
++	gmu_write(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 4, 0);
++	gmu_write(gmu, REG_A6XX_RSCC_OVERRIDE_START_ADDR, 0);
++	gmu_write(gmu, REG_A6XX_RSCC_PDC_SEQ_START_ADDR, 0x4520);
++	gmu_write(gmu, REG_A6XX_RSCC_PDC_MATCH_VALUE_LO, 0x4510);
++	gmu_write(gmu, REG_A6XX_RSCC_PDC_MATCH_VALUE_HI, 0x4514);
++
++	/* Load RSC sequencer uCode for sleep and wakeup */
++	gmu_write(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0, 0xa7a506a0);
++	gmu_write(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 1, 0xa1e6a6e7);
++	gmu_write(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 2, 0xa2e081e1);
++	gmu_write(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 3, 0xe9a982e2);
++	gmu_write(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 4, 0x0020e8a8);
++
++	/*
++	 * Load PDC sequencer uCode for power up and power down sequence.
++	 *
++	 * Region-relative offsets, verified against working vendor KGSL
++	 * (a6xx_reg.h: PDC_GPU_SEQ_MEM_0 = 0x0) and upstream v5.8
++	 * (pdc_write(seqptr, SEQ_MEM_0, ...)).
++	 *
++	 * The transplanted v4.19 XML defines REG_A6XX_PDC_GPU_SEQ_MEM_0 as
++	 * 0xa0000 (block-relative within a combined PDC aperture this DT does
++	 * not provide). Samsung splits PDC into 64KB cfg (0xb290000, v2) +
++	 * 64KB seq (0xb490000, v2); KGSL writes SEQ_MEM at seq+0x0.
++	 * Using the XML value here targets seq+0x280000, far beyond the
++	 * 0x10000 mapping -- this was the image 78 data abort.
++	 */
++	pdcseq_write(gmu, 0x0, 0xfebea1e1);
++	pdcseq_write(gmu, 0x0 + 1, 0xa5a4a3a2);
++	pdcseq_write(gmu, 0x0 + 2, 0x8382a6e0);
++	pdcseq_write(gmu, 0x0 + 3, 0xbce3e284);
++	pdcseq_write(gmu, 0x0 + 4, 0x002081fc);
++
++	/*
++	 * Set TCS commands used by PDC sequence for low power modes.
++	 *
++	 * All target the cfg (pdc) region per upstream v5.8 (pdcptr) and vendor
++	 * KGSL (_regwrite(cfg, ...)). Offsets are region-relative: the v4.19
++	 * XML values are block-relative (ours = KGSL + 0x20000, e.g. 0x21573
++	 * vs 0x1573), so subtract the 0x20000 cfg-block prefix to fit the
++	 * 64KB cfg window (0xb290000 v2). Without this every TCS write lands
++	 * at cfg+0x855cc, beyond the mapping -- same fault class as SEQ_MEM.
++	 * TCS*_CMD0_ADDR+8 = 0x30090 for A640 per v5.8 pdc_address_offset
++	 * and KGSL (v4.19 used 0x30080 for older GPUs).
++	 */
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD_ENABLE_BANK - 0x20000 ), 7);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK - 0x20000 ), 0);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CONTROL - 0x20000 ), 0);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_MSGID - 0x20000 ), 0x10108);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_ADDR - 0x20000 ), 0x30010);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_DATA - 0x20000 ), 1);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_MSGID - 0x20000 ) + 4, 0x10108);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_ADDR - 0x20000 ) + 4, 0x30000);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_DATA - 0x20000 ) + 4, 0x0);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_MSGID - 0x20000 ) + 8, 0x10108);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_ADDR - 0x20000 ) + 8, 0x30090 /* A640 */);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS1_CMD0_DATA - 0x20000 ) + 8, 0x0);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD_ENABLE_BANK - 0x20000 ), 7);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK - 0x20000 ), 0);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CONTROL - 0x20000 ), 0);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_MSGID - 0x20000 ), 0x10108);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_ADDR - 0x20000 ), 0x30010);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_DATA - 0x20000 ), 2);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_MSGID - 0x20000 ) + 4, 0x10108);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_ADDR - 0x20000 ) + 4, 0x30000);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_DATA - 0x20000 ) + 4, 0x3);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_MSGID - 0x20000 ) + 8, 0x10108);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_ADDR - 0x20000 ) + 8, 0x30090 /* A640 per v5.8/KGSL */);
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_TCS3_CMD0_DATA - 0x20000 ) + 8, 0x3);
++
++	/* Setup GPU PDC */
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_SEQ_START_ADDR - 0x20000 ), 0); /* cfg per v5.8/KGSL; was pdcseq_write with block-relative const */
++	pdc_write(gmu->pdc_mmio, ( REG_A6XX_PDC_GPU_ENABLE_PDC - 0x20000 ), 0x80000001);
++
++	/* ensure no writes happen before the uCode is fully written */
++	wmb();
++}
++
++/*
++ * The lowest 16 bits of this value are the number of XO clock cycles for main
++ * hysteresis which is set at 0x1680 cycles (300 us).  The higher 16 bits are
++ * for the shorter hysteresis that happens after main - this is 0xa (.5 us)
++ */
++
++#define GMU_PWR_COL_HYST 0x000a1680
++
++/* Set up the idle state for the GMU */
++static void a6xx_gmu_power_config(struct a6xx_gmu *gmu)
++{
++	/* Disable GMU WB/RB buffer */
++	gmu_write(gmu, REG_A6XX_GMU_SYS_BUS_CONFIG, 0x1);
++
++	/*
++	 * TEMPORARY bring-up experiment -- REMOVE OR PROMOTE ON RESULT.
++	 * Upstream v5.8 enables the GMU caches here; our port never did.
++	 * Offsets converted from vendor KGSL byte offsets
++	 * (0x1F400/0x1F401 - gmu2gpu_offset 0x1A800 = 0x4C00/0x4C01),
++	 * cross-checked against GENERAL_7 which matches exactly.
++	 */
++	A6XX_TRACE("before ICACHE_CONFIG write (value=0x1)");
++	gmu_write(gmu, REG_A6XX_GMU_ICACHE_CONFIG, 0x1);
++	A6XX_TRACE("after ICACHE_CONFIG write");
++	A6XX_TRACE("before DCACHE_CONFIG write (value=0x1)");
++	gmu_write(gmu, REG_A6XX_GMU_DCACHE_CONFIG, 0x1);
++	A6XX_TRACE("after DCACHE_CONFIG write");
++
++	gmu_write(gmu, REG_A6XX_GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
++
++	switch (gmu->idle_level) {
++	case GMU_IDLE_STATE_IFPC:
++		gmu_write(gmu, REG_A6XX_GMU_PWR_COL_INTER_FRAME_HYST,
++			GMU_PWR_COL_HYST);
++		gmu_rmw(gmu, REG_A6XX_GMU_PWR_COL_INTER_FRAME_CTRL, 0,
++			A6XX_GMU_PWR_COL_INTER_FRAME_CTRL_IFPC_ENABLE |
++			A6XX_GMU_PWR_COL_INTER_FRAME_CTRL_HM_POWER_COLLAPSE_ENABLE);
++		/* Fall through */
++	case GMU_IDLE_STATE_SPTP:
++		gmu_write(gmu, REG_A6XX_GMU_PWR_COL_SPTPRAC_HYST,
++			GMU_PWR_COL_HYST);
++		gmu_rmw(gmu, REG_A6XX_GMU_PWR_COL_INTER_FRAME_CTRL, 0,
++			A6XX_GMU_PWR_COL_INTER_FRAME_CTRL_IFPC_ENABLE |
++			A6XX_GMU_PWR_COL_INTER_FRAME_CTRL_SPTPRAC_POWER_CONTROL_ENABLE);
++	}
++
++	/* Enable RPMh GPU client */
++	gmu_rmw(gmu, REG_A6XX_GMU_RPMH_CTRL, 0,
++		A6XX_GMU_RPMH_CTRL_RPMH_INTERFACE_ENABLE |
++		A6XX_GMU_RPMH_CTRL_LLC_VOTE_ENABLE |
++		A6XX_GMU_RPMH_CTRL_DDR_VOTE_ENABLE |
++		A6XX_GMU_RPMH_CTRL_MX_VOTE_ENABLE |
++		A6XX_GMU_RPMH_CTRL_CX_VOTE_ENABLE |
++		A6XX_GMU_RPMH_CTRL_GFX_VOTE_ENABLE);
++	pr_info("RPMH132: rpmh_init done (RPMH_CTRL=0x%x)\n",
++		gmu_read(gmu, REG_A6XX_GMU_RPMH_CTRL));
++}
++
++void a6xx_gmu_dump_mmio(struct platform_device *pdev,
++		struct a6xx_gmu *gmu, const char *when)
++{
++	static const char *names[] = {
++		"kgsl_gmu_reg", "kgsl_gmu_pdc_cfg", "kgsl_gmu_pdc_seq"
++	};
++	void __iomem *ptrs[3] = { gmu->mmio, gmu->pdc_mmio, gmu->seq_mmio };
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		struct resource *res = platform_get_resource_byname(pdev,
++				IORESOURCE_MEM, names[i]);
++
++		if (res)
++			A6XX_TRACE("%s %s=%px res start=%pa end=%pa size=%pa flags=%lx",
++				when, names[i], ptrs[i], &res->start, &res->end,
++				&(resource_size_t){ resource_size(res) },
++				res->flags);
++		else
++			A6XX_TRACE("%s %s=%px res MISSING", when, names[i],
++				ptrs[i]);
++	}
++}
++
++static int a6xx_rpmh_start(struct a6xx_gmu *gmu);
++static int a6xx_gmu_fw_load(struct a6xx_gmu *gmu);
++
++static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
++{
++	static bool rpmh_init;
++	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	int ret;
++	u32 chipid;
++
++	if (state == GMU_WARM_BOOT) {
++		ret = a6xx_rpmh_start(gmu);
++		if (ret)
++			return ret;
++	} else {
++		/* Turn on register retention */
++		gmu_write(gmu, REG_A6XX_GMU_GENERAL_7, 1);
++
++		/* We only need to load the RPMh microcode once */
++		if (!rpmh_init) {
++			{
++				struct device_node *pr_n =
++					of_node_get(gmu->dev->of_node);
++				struct platform_device *pr_p =
++					of_find_device_by_node(pr_n);
++				of_node_put(pr_n);
++				if (pr_p) {
++					a6xx_gmu_dump_mmio(pr_p, gmu, "PRE_RPMH");
++					put_device(&pr_p->dev);
++				} else {
++					A6XX_TRACE("PRE_RPMH pdev unresolved");
++				}
++			}
++			a6xx_gmu_rpmh_init(gmu);
++			rpmh_init = true;
++		} else if (state != GMU_RESET) {
++			ret = a6xx_rpmh_start(gmu);
++			if (ret)
++				return ret;
++		}
++
++		/*
++		 * Load the GMU firmware. A618/A630 take the legacy flat-ITCM
++		 * path (which enforces its 0x8000 cap); A640 takes the block
++		 * path, which has no such cap.
++		 */
++		ret = a6xx_gmu_fw_load(gmu);
++		if (ret)
++			return ret;
++
++		/*
++		 * TEMPORARY image 202 -- barrier between the firmware load and
++		 * the CM3_SYSRESET release further down this function.
++		 *
++		 * gmu_write_bulk() (the ITCM/DTCM path) already ends in wmb().
++		 * The fw_block_mem() path (icache/dcache) is a plain memcpy()
++		 * into normal memory and had NO barrier after it anywhere
++		 * before gmu_write(CM3_SYSRESET, 0).
++		 *
++		 * The CM3 is released by an MMIO (Device memory) store. Without
++		 * a barrier the Normal-memory stores holding the firmware are
++		 * not ordered before it, so the CM3 can be released while its
++		 * instruction image is still in this CPU's store buffer. Same
++		 * ordering class as images 195 and 200; this is the third and
++		 * last instance, on the load path.
++		 *
++		 * Redundant once alloc_fixed is coherent, but free and correct.
++		 */
++		wmb();
++
++	a6xx_gmu_scratch_check(gmu, "post-fw_load");
++	}
++
++	gmu_write(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, 0);
++	gmu_write(gmu, REG_A6XX_GMU_CM3_BOOT_CONFIG, 0x02);
++
++	/* Write the iova of the HFI table */
++	gmu_write(gmu, REG_A6XX_GMU_HFI_QTBL_ADDR, gmu->hfi->iova);
++	gmu_write(gmu, REG_A6XX_GMU_HFI_QTBL_INFO, 1);
++
++	/*
++	 * TEMPORARY experiment image 98 -- REMOVE OR PROMOTE ON RESULT.
++	 * Vendor KGSL GMU_FENCE_RANGE_MASK = 0x80A008A0; v5.8/ours used
++	 * 0x802800A0. Single-value change, ordering untouched.
++	 */
++	A6XX_TRACE("FENCE_RANGE_0 write (value=0x80A008A0)");
++	gmu_write(gmu, REG_A6XX_GMU_AHB_FENCE_RANGE_0,
++		(0x1 << 31) | ((0xA << 2) << 18) | (0x8A0));
++
++	chipid = adreno_gpu->rev.core << 24;
++	chipid |= adreno_gpu->rev.major << 16;
++	chipid |= adreno_gpu->rev.minor << 12;
++	chipid |= adreno_gpu->rev.patchid << 8;
++
++	gmu_write(gmu, REG_A6XX_GMU_HFI_SFR_ADDR, chipid);
++
++	/*
++	 * TEMPORARY experiment image 102 -- REMOVE OR PROMOTE ON RESULT.
++	 * CP_MSG = log.iova | (log.size/4K - 1), exactly as upstream v5.8
++	 * and vendor KGSL. With a 4 KiB log this evaluates to 0x60006000.
++	 */
++	A6XX_TRACE("before CP_MSG write (value=0x%llx)",
++		(unsigned long long)(gmu->log->iova | (gmu->log->size / SZ_4K - 1)));
++	gmu_write(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_MSG,
++		gmu->log->iova | (gmu->log->size / SZ_4K - 1));
++	A6XX_TRACE("after CP_MSG write, readback=0x%x",
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_MSG));
++
++	/*
++	 * CM3 boot correctness, matching vendor KGSL a6xx_gmu_fw_start()
++	 * exactly in ordering: QTBL regs -> FENCE -> CM3_CFG -> SFR ->
++	 * power_config -> gmu_start -> gfx_rail_on -> sptprac -> hfi_start.
++	 *
++	 * KGSL comment: snapshot changes the NMI bit; if GMU boots with NMI
++	 * set it jumps straight to the NMI handler and never executes
++	 * __main. 0x4052 puts CM3 back to its reset state before boot.
++	 * Without this the GMU runs unintended code and reads unintended
++	 * addresses -> the SMMU read faults seen at odd varying IOVAs.
++	 */
++	A6XX_TRACE("before CM3_CFG write (value=0x4052)");
++	gmu_write(gmu, REG_A6XX_GMU_CM3_CFG, 0x4052);
++	A6XX_TRACE("after CM3_CFG write");
++
++	/* Set up the lowest idle level on the GMU */
++	a6xx_gmu_power_config(gmu);
++	a6xx_gmu_scratch_check(gmu, "post-power_config");
++
++	A6XX_TRACE("before GMU start");
++	/*
++	 * TEMPORARY readback -- REMOVE WITH READBACK CODE. Verifies what the
++	 * GMU actually sees: every host-written value read back, plus CP_MSG
++	 * (never written; exposes reset value) and the HFI/icache/dcache
++	 * buffer heads from host RAM (ITCM/DTCM have no host copy and no
++	 * known-safe MMIO read path, so they are verified statically from
++	 * the blob + loader audit instead).
++	 */
++	A6XX_TRACE("RB QTBL_ADDR=0x%x (expect 0x%llx)",
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_ADDR),
++		(unsigned long long)(gmu->hfi ? gmu->hfi->iova : ~0ULL));
++	A6XX_TRACE("RB QTBL_INFO=0x%x (expect 1)",
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_INFO));
++	A6XX_TRACE("RB SFR_ADDR=0x%x BOOT_CONFIG=0x%x CM3_CFG=0x%x GENERAL_7=0x%x",
++		gmu_read(gmu, REG_A6XX_GMU_HFI_SFR_ADDR),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_BOOT_CONFIG),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_CFG),
++		gmu_read(gmu, REG_A6XX_GMU_GENERAL_7));
++	A6XX_TRACE("RB CP_MSG=0x%x (img102: written value)",
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_MSG));
++	if (gmu->hfi && gmu->hfi->virt) {
++		u32 *hv = gmu->hfi->virt;
++		int qi;
++		A6XX_TRACE("RB hfi[0..3]=%08x %08x %08x %08x",
++			hv[0], hv[1], hv[2], hv[3]);
++		for (qi = 0; qi < 4; qi++) {
++			u32 *qh = hv + 6 + qi * 12;
++			A6XX_TRACE("RB q%d status=%u type=0x%x iova=0x%x size=0x%x idx=%u/%u",
++				qi, qh[0], qh[2], qh[1], qh[3], qh[10], qh[11]);
++		}
++	}
++	if (gmu->icache && gmu->icache->virt)
++		A6XX_TRACE("RB icache[0..3]=%08x %08x %08x %08x",
++			((u32 *)gmu->icache->virt)[0], ((u32 *)gmu->icache->virt)[1],
++			((u32 *)gmu->icache->virt)[2], ((u32 *)gmu->icache->virt)[3]);
++	if (gmu->dcache && gmu->dcache->virt)
++		A6XX_TRACE("RB dcache[0..3]=%08x %08x %08x %08x",
++			((u32 *)gmu->dcache->virt)[0], ((u32 *)gmu->dcache->virt)[1],
++			((u32 *)gmu->dcache->virt)[2], ((u32 *)gmu->dcache->virt)[3]);
++	ret = a6xx_gmu_start(gmu);
++	A6XX_TRACE("after GMU start (ret=%d)", ret);
++	if (ret)
++		return ret;
++
++	/*
++	 * TEMPORARY experiment image 105 -- REMOVE OR PROMOTE ON RESULT.
++	 * Upstream v5.8 runs gfx_rail_on() ONLY when gmu->legacy; our A640
++	 * (legacy=false) wrongly executed it, and its BOOT_SLUMBER OOB has
++	 * no ack on the HFI-v2 path. sptprac keeps the upstream idle-level
++	 * guard unchanged (v5.8 runs it for A640 too).
++	 */
++	pr_info("POST_START: legacy=%d\n", gmu->legacy);
++	if (gmu->legacy) {
++		pr_info("POST_START: entering gfx_rail_on\n");
++		ret = a6xx_gmu_gfx_rail_on(gmu);
++		pr_info("POST_START: gfx_rail_on returned ret=%d\n", ret);
++		if (ret)
++			return ret;
++	} else {
++		/*
++		 * TEMPORARY image 151 -- PROMOTE IF STICKY. The legacy skip
++		 * threw out the vote-idx writes with the un-acked OOB. Do the
++		 * writes (plain MMIO, no ack needed), skip only the OOB.
++		 * Guarded: without OPP data there is no vote to cast.
++		 */
++		if (gmu->nr_gpu_freqs > 0) {
++			u32 vote = gmu->gx_arc_votes[gmu->nr_gpu_freqs - 1];
++
++			gmu_write(gmu, REG_A6XX_GMU_BOOT_SLUMBER_OPTION, 0);
++			gmu_write(gmu, REG_A6XX_GMU_GX_VOTE_IDX, vote & 0xff);
++			gmu_write(gmu, REG_A6XX_GMU_MX_VOTE_IDX,
++				(vote >> 8) & 0xff);
++			pr_info("VOTE151: gx=0x%x mx=0x%x (writes only, no OOB)\n",
++				vote & 0xff, (vote >> 8) & 0xff);
++		} else {
++			pr_info("VOTE151: skipped, no OPP data (nr_gpu_freqs=0)\n");
++		}
++	}
++
++	/* Enable SPTP_PC if the CPU is responsible for it */
++	pr_info("POST_START: enter sptprac_enable (idle=%d, threshold=%d)\n",
++		gmu->idle_level, GMU_IDLE_STATE_SPTP);
++	if (gmu->idle_level < GMU_IDLE_STATE_SPTP) {
++		/*
++		 * NOTE: a6xx_sptprac_enable() always returns 0 even when its
++		 * poll times out -- it logs "sptprac poll TIMEOUT" and returns
++		 * success. So ret here is 0 and the old `if (ret) return ret;`
++		 * was already dead code. An image-194 experiment that tried to
++		 * make this non-fatal was therefore a no-op and has been reverted.
++		 * The real -110 comes from a6xx_gmu_hfi_vote_probe() below.
++		 */
++		ret = a6xx_sptprac_enable(gmu);
++		if (ret)
++			return ret;
++	}
++
++	pr_info("POST_START: entering hfi_start\n");
++	ret = a6xx_gmu_hfi_start(gmu);
++	pr_info("POST_START: hfi_start returned ret=%d\n", ret);
++	if (ret)
++		return ret;
++
++	/* FIXME: Do we need this wmb() here? */
++	wmb();
++
++	return 0;
++}
++
++#define A6XX_HFI_IRQ_MASK \
++	(A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ | \
++	 A6XX_GMU_GMU2HOST_INTR_INFO_CM3_FAULT)
++
++#define A6XX_GMU_IRQ_MASK \
++	(A6XX_GMU_AO_HOST_INTERRUPT_STATUS_WDOG_BITE | \
++	 A6XX_GMU_AO_HOST_INTERRUPT_STATUS_HOST_AHB_BUS_ERROR | \
++	 A6XX_GMU_AO_HOST_INTERRUPT_STATUS_FENCE_ERR)
++
++static void a6xx_gmu_irq_enable(struct a6xx_gmu *gmu)
++{
++	gmu_write(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_CLR, ~0);
++	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, ~0);
++
++	gmu_write(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_MASK,
++		~A6XX_GMU_IRQ_MASK);
++	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK,
++		~A6XX_HFI_IRQ_MASK);
++
++	enable_irq(gmu->gmu_irq);
++	enable_irq(gmu->hfi_irq);
++}
++
++static void a6xx_gmu_irq_disable(struct a6xx_gmu *gmu)
++{
++	disable_irq(gmu->gmu_irq);
++	disable_irq(gmu->hfi_irq);
++
++	gmu_write(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_MASK, ~0);
++	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK, ~0);
++}
++
++int a6xx_gmu_reset(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	int ret;
++	u32 val;
++
++	/* Flush all the queues */
++	a6xx_hfi_stop(gmu);
++
++	/*
++	 * TEMPORARY image 160 -- PROMOTE IF RETRY RECOVERS. Re-zero HFI queue
++	 * memory so each retry attempt starts from identical clean state
++	 * (firmware may have scribbled partial responses). Queues are idle
++	 * here (just flushed); host-virt memset is safe.
++	 */
++	if (gmu->hfi && gmu->hfi->virt)
++		memset(gmu->hfi->virt, 0, gmu->hfi->size);
++	pr_info("RETRY160: HFI queues re-zeroed for fresh attempt\n");
++
++	/* Stop the interrupts */
++	a6xx_gmu_irq_disable(gmu);
++
++	/* Force off SPTP in case the GMU is managing it */
++	a6xx_sptprac_disable(gmu);
++
++	/* Make sure there are no outstanding RPMh votes */
++	gmu_poll_timeout(gmu, REG_A6XX_RSCC_TCS0_DRV0_STATUS, val,
++		(val & 1), 100, 10000);
++	gmu_poll_timeout(gmu, REG_A6XX_RSCC_TCS1_DRV0_STATUS, val,
++		(val & 1), 100, 10000);
++	gmu_poll_timeout(gmu, REG_A6XX_RSCC_TCS2_DRV0_STATUS, val,
++		(val & 1), 100, 10000);
++	gmu_poll_timeout(gmu, REG_A6XX_RSCC_TCS3_DRV0_STATUS, val,
++		(val & 1), 100, 1000);
++
++	/* Force off the GX GSDC */
++	/* TEMPORARY image 148 -- PROMOTE: never force-disable an un-enabled
++	 * regulator (unbalanced-disable BUG panics; our resume enables CX
++	 * only, never GX). Vendor enables both GDSCs; until then, guard. */
++	if (gmu->gx && !IS_ERR(gmu->gx) && gmu->gx_gdsc_enabled &&
++	    regulator_is_enabled(gmu->gx)) {
++		regulator_force_disable(gmu->gx);
++		gmu->gx_gdsc_enabled = false;
++	} else {
++		pr_info("GXGUARD148/226: gx not host-enabled here, skip force_disable\n");
++	}
++	gmu_clks_live = false;
++
++	/* Disable the resources */
++	gmu_clks_live = false;
++	clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
++	pm_runtime_put_sync(gmu->dev);
++
++	/* Re-enable the resources */
++	pm_runtime_get_sync(gmu->dev);
++
++	/* Use a known rate to bring up the GMU */
++	clk_set_rate(gmu->core_clk, 200000000);
++	ret = clk_bulk_prepare_enable(gmu->nr_clocks, gmu->clocks);
++	if (ret)
++		goto out;
++	gmu_clks_live = true;
++
++	a6xx_gmu_irq_enable(gmu);
++
++	/*
++	 * TEMPORARY image 202 -- re-assert CM3_SYSRESET before re-running
++	 * fw_start. Without this the retry cannot possibly work.
++	 *
++	 * The log proves it. On a good boot attempt 0 the PRE snapshot reads
++	 * SYSRESET=0x1 (the CM3 is still held in reset, then released). On every
++	 * retry the PRE snapshot reads SYSRESET=0x0 -- because
++	 * a6xx_gmu_fw_start() only ever DEASSERTS it. So a retry re-runs the
++	 * whole programming sequence and then writes 0 to a register that is
++	 * already 0: no reset edge, no CM3 restart, and INITRES can never
++	 * become 0xBABEFACE again. The "3 attempts" has always been one real
++	 * attempt per power cycle.
++	 *
++	 * Assert, let the CM3 quiesce, then let fw_start release it. The poll
++	 * for INITRES==0 confirms the CM3 is quiesced rather than racing us.
++	 */
++	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
++	gmu_poll_timeout(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, val,
++			val != 0xbabeface, 100, 1000);
++	A6XX_TRACE("RETRY202: CM3 re-asserted SYSRESET, INITRES now 0x%x\n",
++			gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT));
++
++	ret = a6xx_gmu_fw_start(gmu, GMU_RESET);
++	if (!ret) {
++		a6xx_gmu_bootstrap_active = true;
++		ret = a6xx_hfi_start(gmu, GMU_COLD_BOOT);
++		a6xx_gmu_bootstrap_active = false;
++	}
++
++	/* Set the GPU back to the highest power frequency */
++	a6xx_gmu_set_freq(gmu, gmu->nr_gpu_freqs - 1);
++
++out:
++	if (ret)
++		a6xx_gmu_clear_oob(gmu, GMU_OOB_BOOT_SLUMBER);
++
++	return ret;
++}
++
++/*
++ * TEMPORARY bring-up tracing -- REMOVE ONCE GMU RESUME IS STABLE.
++ *
++ * Local, A6xx-only stand-in for clk_bulk_prepare_enable() so each clock can be
++ * identified individually. It deliberately does NOT replace or wrap the
++ * generic helper: this kernel's clk_bulk_prepare_enable() is two passes
++ * (clk_bulk_prepare() then clk_bulk_enable()), so both are traced here in the
++ * same order, with no change to clock or power behaviour.
++ */
++static int a6xx_gmu_clk_bulk_prepare_enable_traced(int num,
++		struct clk_bulk_data *clks)
++{
++	int ret, i;
++
++	A6XX_TRACE("--- resolved GMU clock list: count=%d ---", num);
++	for (i = 0; i < num; i++)
++		A6XX_TRACE("clock[%d] '%s' clk=%p", i,
++			clks[i].id ? clks[i].id : "(null-id)",
++			(void *)clks[i].clk);
++
++	A6XX_TRACE("--- pass 1: clk_prepare ---");
++	for (i = 0; i < num; i++) {
++		A6XX_TRACE("clock[%d] '%s' prepare enter", i,
++			clks[i].id ? clks[i].id : "(null-id)");
++		ret = clk_prepare(clks[i].clk);
++		A6XX_TRACE("clock[%d] '%s' prepare returned ret=%d", i,
++			clks[i].id ? clks[i].id : "(null-id)", ret);
++		if (ret)
++			return ret;
++	}
++
++	A6XX_TRACE("--- pass 2: clk_enable ---");
++	for (i = 0; i < num; i++) {
++		A6XX_TRACE("clock[%d] '%s' enable enter", i,
++			clks[i].id ? clks[i].id : "(null-id)");
++		ret = clk_enable(clks[i].clk);
++		A6XX_TRACE("clock[%d] '%s' enable returned ret=%d", i,
++			clks[i].id ? clks[i].id : "(null-id)", ret);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * TEMPORARY diagnostic capture -- REMOVE AFTER RESULT. Reads only, no locks,
++ * no allocations. Uses exact register definitions from our tree.
++ */
++static void a6xx_gmu_capture_boot_state(struct a6xx_gmu *gmu, const char *when)
++{
++	A6XX_TRACE("CAPTURE %s SYSRESET=0x%x INITRES=0x%x FWBUSY=0x%x NMI=0x%x WFI=0x%x BOOTCFG=0x%x",
++		when,
++		gmu_read(gmu, REG_A6XX_GMU_CM3_SYSRESET),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_FW_BUSY),
++		gmu_read(gmu, REG_A6XX_GMU_NMI_CONTROL_STATUS),
++		gmu_read(gmu, REG_A6XX_GMU_CX_GMU_WFI_CONFIG),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_BOOT_CONFIG));
++	A6XX_TRACE("CAPTURE %s QTBL=0x%x INFO=0x%x SFR=0x%x G7=0x%x HFISTAT=0x%x IRQMSK=0x%x AOHOSTMSK=0x%x RPMHPWR=0x%x",
++		when,
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_ADDR),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_SFR_ADDR),
++		gmu_read(gmu, REG_A6XX_GMU_GENERAL_7),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK),
++		gmu_read(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_MASK),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE));
++}
++
++/*
++ * TEMPORARY diagnostic checkpoint -- REMOVE AFTER RESULT. Sentinel first
++ * four words; answers who-zeroed-what at each host step.
++ */
++static void a6xx_gmu_scratch_check(struct a6xx_gmu *gmu, const char *when)
++{
++	if (gmu->sentinel && gmu->sentinel->virt)
++		A6XX_TRACE("SCRATCH %s %08x %08x %08x %08x",
++			when,
++			((u32 *)gmu->sentinel->virt)[0], ((u32 *)gmu->sentinel->virt)[1],
++			((u32 *)gmu->sentinel->virt)[2], ((u32 *)gmu->sentinel->virt)[3]);
++	else
++		A6XX_TRACE("SCRATCH %s no-sentinel", when);
++}
++
++/* TEMPORARY experiment image 132 -- PROMOTE IF GX TURNS ON. Gated A640
++ * HFI GX_BW_PERF_VOTE probe. Default off (behavior unchanged + logging).
++ * Enable with a6xx.gmu_hfi_probe=1 (MODULE_PARAM_PREFIX is "a6xx.").
++ * Runs after message-level hfi_start success, before set_freq/hw_init.
++ * Uses only existing send/wait/dispatch; no transport/parser change. */
++bool gx_vote_done;
++static bool gmu_hfi_probe;
++bool experimental_nonlegacy;
++bool skip_bw;
++bool hold_boot;
++bool skip_gpuset;
++
++/* TEMPORARY image 156 -- PROMOTE IFF SURVIVAL EXTENDS. Periodic HFI
++ * keepalive: re-sends the proven GX vote on a timer so firmware that
++ * needs ongoing host contact (vs one-shot boot votes) stays alive.
++ * Gated, default off. No other behavior change. */
++static void keepalive156_fn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(keepalive156_work, keepalive156_fn);
++static unsigned long keepalive156_interval_ms = 3000;
++
++/*
++ * TEMPORARY image 157 -- PROMOTE IFF IT CATCHES THE KILLER. GMU-only
++ * vitals: SPTPRAC/RPMH/votes/OOB/IRQ counts every 30s (first +5s).
++ * GMU CSR reads only (never faulted in our history); NO GPU-side reads
++ * (GX-collapse NOC hazard). Armed at every resume end in nonlegacy mode.
++ */
++static void gvitals157_fn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(gvitals157_work, gvitals157_fn);
++static struct a6xx_gmu *gvitals157_gmu;
++
++static void gvitals157_fn(struct work_struct *work)
++{
++	struct a6xx_gmu *gmu = gvitals157_gmu;
++
++	/*
++	 * TEMPORARY image 223 -- poller self-diagnosis.
++	 *
++	 * Image 222 armed this poller and it never printed again, which is
++	 * why GMULIVE/HFI_VERSION went unread. Print BEFORE the NULL check so
++	 * we can distinguish "the work is not running at all" from "the work
++	 * ran but gmu was NULL", and always re-arm so one miss cannot silence
++	 * it permanently. Cheap enough to leave in: one line per 30s.
++	 */
++	pr_info("GVITTICK: fired, gmu=%px\n", (void *)gmu);
++
++	if (!gmu) {
++		schedule_delayed_work(&gvitals157_work,
++			msecs_to_jiffies(30000));
++		return;
++	}
++	/*
++	 * TEMPORARY image 222 -- GMU LIVENESS.
++	 *
++	 * Root cause: the GX (graphics) clock domain is OFF
++	 * (gpu_cc_gx_gmu_clk en=0, gcc_gpu_gpll0_clk_src en=0), so the RB/SP
++	 * never run and nothing is ever written. GXVOTE reads 0 even though
++	 * VOTE151 wrote gx=0x9, and the OOB that should raise the GX rail
++	 * times out ("POST_START: oob GPU_SET ack-wait TIMEOUT").
++	 *
++	 * a640_gmu.bin is byte-identical to stock (sha256 3ff0c027...d2), so
++	 * the firmware IMAGE is not the problem. Open question: is the GMU
++	 * firmware EXECUTING at all?
++	 *
++	 * HFI_VERSION_INFO (0x5181) is the GMU's own version handshake reply.
++	 * A live GMU answers with a real version; a dead GMU returns 0 or
++	 * 0xffffffff. If it reads 0/0xffffffff the firmware is not running and
++	 * nothing host-side can fix it.
++	 */
++	pr_info("GMULIVE: HFI_VER=0x%x OOB_G2H_INFO=0x%x OOB_G2H_MASK=0x%x OOB_H2G_RAW=0x%x OOB_H2G_SET=0x%x GX_VOTE=0x%x MX_VOTE=0x%x SPTPRAC_PWR=0x%x\n",
++		gmu_read(gmu, REG_A6XX_GMU_HFI_VERSION_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET),
++		gmu_read(gmu, REG_A6XX_GMU_GX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_MX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++
++	pr_info("GVIT157: SPTPRAC=0x%x RPMHPWR=0x%x GXVOTE=0x%x MXVOTE=0x%x OOB_H2G=0x%x OOB_G2H=0x%x hfi_irq=%lu gmu_irq=%lu\n",
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		gmu_read(gmu, REG_A6XX_GMU_GX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_MX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++		bw124_hfi_irqs, bw124_gmu_irqs);
++
++	/*
++	 * IMAGE 225 -- RPMh/TCS vitals. NEVER DUMPED IN 224 IMAGES.
++	 *
++	 * Every previous document cited "RPMH_CTRL_GFX_VOTE_ENABLE is set" as
++	 * evidence that the GMU votes GX up. Setting the vote *interface* is
++	 * not evidence that a vote was ever *issued*. These are the registers
++	 * that actually witness a vote transaction:
++	 *
++	 *   TCS0..3_DRV0_STATUS  bit0 = transaction in flight
++	 *   RSCC_SEQ_BUSY_DRV0   RSC sequencer busy
++	 *   RSC_STATUS0_DRV0     RSC machine state, incl. bit24 (SDE gating)
++	 *   GX_GDSCR             the GX GDSC soft-reset/retention register --
++	 *                       the host-visible shadow of the rail state that
++	 *                       SPTPRAC_PWR_CLK_STATUS reports as GX_HM_* bits
++	 *   RPMH_CTRL            confirm GFX_VOTE_ENABLE survived
++	 *
++	 * If after the GX vote TCS bits are still 0 and RSC_STATUS0 stays put,
++	 * the firmware never issued a vote and the break is below the GMU.
++	 * If they move, the vote went out and the break is AOP-side.
++	 */
++	pr_info("RPV225: TCS0=0x%x TCS1=0x%x TCS2=0x%x TCS3=0x%x SEQ_BUSY=0x%x RSC0=0x%x GX_GDSCR=0x%x RPMH_CTRL=0x%x\n",
++		gmu_read(gmu, REG_A6XX_RSCC_TCS0_DRV0_STATUS),
++		gmu_read(gmu, REG_A6XX_RSCC_TCS1_DRV0_STATUS),
++		gmu_read(gmu, REG_A6XX_RSCC_TCS2_DRV0_STATUS),
++		gmu_read(gmu, REG_A6XX_RSCC_TCS3_DRV0_STATUS),
++		gmu_read(gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0),
++		gmu_read(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
++		gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
++		gmu_read(gmu, REG_A6XX_GMU_RPMH_CTRL));
++
++	schedule_delayed_work(&gvitals157_work, msecs_to_jiffies(30000));
++}
++
++static void keepalive156_fn(struct work_struct *work)
++{
++	extern struct a6xx_gmu *keepalive156_gmu;
++	struct a6xx_gmu *gmu = keepalive156_gmu;
++	int ret;
++
++	if (!gmu)
++		return;
++	pr_info("KEEPALIVE156: re-vote enter\n");
++	/*
++	 * TEMPORARY image 158 -- PROMOTE IFF SURVIVAL EXTENDS. Vote LOW
++	 * (index 1, 257MHz) instead of max: if deaths are power/heat from
++	 * sustained 675MHz clocks, downclocking right after boot should
++	 * extend survival. Contact-keeping is unchanged (still periodic).
++	 */
++	ret = a6xx_hfi_send_gx_vote(gmu, 1, 1, 0);
++	pr_info("KEEPALIVE156: re-vote ret=%d\n", ret);
++	bc132("KEEPALIVE", ret);
++	schedule_delayed_work(&keepalive156_work,
++		msecs_to_jiffies(keepalive156_interval_ms));
++}
++/* IMAGE 231: KGSL gates this on ADRENO_QUIRK_LIMIT_UCHE_GBIF_RW, a DT quirk whose value
++ * we do not know. Default off rather than invent a condition. */
++bool uche_gbif_rw;
++bool a6xx_selftest;
++int secure_probe;
++/* IMAGE 273: force the SECVID_TRUST_CNTL write independently of the
++ * HFI path (a6xx.experimental_nonlegacy), which otherwise skips it.
++ */
++int secvid;
++/* IMAGE 277: do what stock KGSL and mainline a5xx do -- leave secure mode
++ * by asking the CP to write RBBM_SECVID_TRUST_CNTL, not by writing it from
++ * the host.  See adreno.c:1870 (KGSL) and a5xx_gpu.c:578 (mainline).
++ */
++int cp_secure_off;
++/* IMAGE 279: write CAF's zeros into the UCHE's address filters
++ * (WRITE_RANGE_MAX / TRAP_BASE / WRITE_THRU_BASE) instead of upstream's
++ * values.  The CP's writes work; the shader domain's do not, and these
++ * registers are the UCHE's own write-address limits.
++ */
++int uche_filter_clear;
++/* IMAGE 280: use the a640 value of PC_DBG_ECO_CNTL (0x00200200) instead of
++ * the generic one (0x00180000) -- upstream commit 564499f5ddbb.
++ */
++int pc_eco_a640;
++/* IMAGE 285: use CAF's CP_PROTECT table verbatim. */
++int cp_protect_caf;
++/* IMAGE 286: match the WORKING device's init-time register values. */
++int reg_match = 1;
++/* IMAGE 282: program the UCHE's GMEM window with CAF's formula. */
++int gmem_window = -1;
++
++static void gx132_snap(struct a6xx_gmu *gmu, const char *tag)
++{
++	pr_info("GX132-%s: SPTPRAC=0x%x RPMHPWR=0x%x GXVOTE=0x%x MXVOTE=0x%x GXGDSCR=0x%x RB_BASE=0x%llx RB_CNTL=0x%x RPTR=0x%x WPTR=0x%x\n",
++		tag,
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		gmu_read(gmu, REG_A6XX_GMU_GX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_MX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
++		(unsigned long long)gpu_read64(&container_of(gmu, struct a6xx_gpu, gmu)->base.base, REG_A6XX_CP_RB_BASE, REG_A6XX_CP_RB_BASE_HI),
++		gpu_read(&container_of(gmu, struct a6xx_gpu, gmu)->base.base, REG_A6XX_CP_RB_CNTL),
++		gpu_read(&container_of(gmu, struct a6xx_gpu, gmu)->base.base, REG_A6XX_CP_RB_RPTR),
++		gpu_read(&container_of(gmu, struct a6xx_gpu, gmu)->base.base, REG_A6XX_CP_RB_WPTR));
++}
++
++static int a6xx_gmu_hfi_vote_probe(struct a6xx_gmu *gmu)
++{
++	int idx, ret;
++
++	if (gmu->nr_gpu_freqs <= 0) {
++		pr_info("GX132-PROBE-SKIP: nr_gpu_freqs=%d, no index to vote\n",
++			gmu->nr_gpu_freqs);
++		return 0;
++	}
++	idx = gmu->nr_gpu_freqs - 1;
++
++	gx132_snap(gmu, "PRE");
++	pr_info("GX132-VOTE: send ack_type=1 freq=%d(idx) bw=0\n", idx);
++	ret = a6xx_hfi_send_gx_vote(gmu, 1, (u32)idx, 0);
++	pr_info("GX132-VOTE: hfi_ret=%d\n", ret);
++	gx132_snap(gmu, "POST");
++	udelay(100);
++	gx132_snap(gmu, "PLUS100US");
++	usleep_range(1000, 1100);
++	gx132_snap(gmu, "PLUS1MS");
++	usleep_range(10000, 10200);
++	gx132_snap(gmu, "PLUS10MS");
++	if (!ret) {
++		gx_vote_done = true;
++		if (keepalive156) {
++			keepalive156_gmu = gmu;
++			schedule_delayed_work(&keepalive156_work,
++				msecs_to_jiffies(keepalive156_interval_ms));
++			pr_info("KEEPALIVE156: armed (10s period)\n");
++		}
++	}
++	return ret;
++}
++int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	int status, ret;
++
++	if (WARN(!gmu->mmio, "The GMU is not set up yet\n"))
++		return 0;
++
++	/*
++	 * IMAGE 230: ACD notification to AOP, FIRST -- matching KGSL's
++	 * gmu_start() ordering exactly (kgsl_gmu.c:1644), which does this
++	 * before gmu_enable_gdsc(), gmu_enable_clks() and the RPMh/GX vote.
++	 * It must precede everything: the host is telling the Always-On
++	 * Processor that the GPU's clock distribution is live before any
++	 * power or clock resource is touched.
++	 */
++	if (a6xx_gmu_send_acd_state(gmu, true))
++		pr_info("ACD230: AOP ACD-enable notification FAILED (channel unavailable or link down)\n");
++
++	/* Turn on the resources */
++	pr_info("GMU_PM: gmu->dev=%s gxpd=NULL (no gxpd in this tree; upstream takes a second runtime-PM ref)\n",
++		dev_name(gmu->dev));
++	bc132("RESUME_ENTRY", 0);
++	pr_info("GMU_PM: gmu_dev_runtime_enabled=%d\n",
++		pm_runtime_enabled(gmu->dev));
++	pm_runtime_get_sync(gmu->dev);
++	pr_info("GMU_PM: pm_runtime_get_sync(gmu->dev) done\n");
++	A6XX_TRACE("pm_runtime_get_sync done");
++
++	/*
++	 * Minimal equivalent of vendor KGSL gmu_enable_gdsc(), which runs
++	 * before gmu_enable_clks() in every gmu_start() state (INIT/SUSPEND/
++	 * SLUMBER/RESET). regulator_enable() is refcounted, so calling it on
++	 * an already-enabled rail only bumps the count -- safe either way.
++	 */
++	A6XX_TRACE("before CX GDSC enable (cx=%px already=%d)",
++		gmu->cx, gmu->cx ? regulator_is_enabled(gmu->cx) : -1);
++	if (gmu->cx) {
++		ret = regulator_enable(gmu->cx);
++		A6XX_TRACE("after CX GDSC enable (ret=%d already=%d)", ret,
++			regulator_is_enabled(gmu->cx));
++		if (ret)
++			goto out;
++	} else {
++		A6XX_TRACE("CX GDSC enable skipped (no regulator)");
++	}
++
++	/*
++	 * IMAGE 274c -- the one regulator operation KGSL does that this driver
++	 * has never done.
++	 *
++	 * Everything else in the KGSL power sequence has already been ported and
++	 * exercised (image 273's dmesg, in order):
++	 *
++	 *   ACD230: '{class: gpu, res: acd, value: 1}' ret=0   (KGSL step 1)
++	 *   GXVOTE225: idx=6/7 legacy=0 -> SPTPRAC=0xc0 GX_GDSCR=0x222001
++	 *   GXGDSC226: regulator_enable(vdd/gpu_gx_gdsc) ret=0 already=1
++	 *   GXCLK229: clk_prepare_enable(gpu_cc_gx_gmu_clk) ret=0 rate=200000000
++	 *   + the DDR/CNOC bus vote: msm_bus_scale_client_update_request(bw_pcl, 4)
++	 *     immediately before FW_START (a6xx_gmu.c:2139-2141)
++	 *
++	 * So the CX GDSC is ENABLED, the GX GDSC is enabled, both clocks are on,
++	 * the AOP has been told, the interconnect is voted -- and the GPU still
++	 * writes nothing.
++	 *
++	 * What is missing is the CX GDSC's MODE.  KGSL sets it:
++	 *
++	 *   kgsl_gmu.c:1599  regulator_set_mode(gmu->cx_gdsc, REGULATOR_MODE_IDLE);
++	 *   kgsl_gmu.c:1604  regulator_set_mode(gmu->cx_gdsc, REGULATOR_MODE_NORMAL);
++	 *
++	 * and, because the DT sets qcom,gpu-quirk-cx-gdsc, KGSL then answers
++	 * "is the CX domain on" from the regulator's own state rather than from
++	 * the register (adreno_a6xx_gmu.c:842-846).  This driver parses no
++	 * gpu-quirk property at all and never calls regulator_set_mode().
++	 *
++	 * The mode is what tells the PMIC how hard the GPU domain may be driven;
++	 * on this part the CX GDSC left in its default/IDLE mode is a plausible
++	 * reason for the GX side to stay quiescent even with every gate and
++	 * clock nominally open.
++	 *
++	 * MEASUREMENT, not a fix.  It prints the regulator's own view before and
++	 * after, plus the GX GDSC and SPTPRAC registers, so one boot gives an
++	 * A/B.  The CX_GDSCR register (0x2441B) is deliberately not read: it
++	 * lives in the GPU_CC window, not the GMU's, and this tree has no accessor
++	 * for it (and the project has already established that CPU-side GPU
++	 * registers on this part are context-banked and unreliable -- image 263).
++	 */
++	if (cxgdm) {
++		bool quirk = false;
++		struct msm_drm_private *priv = NULL;
++		struct device_node *gpu_node = NULL;
++		unsigned int mode = cxgdm;
++
++		/*
++		 * IMAGE 275 FIX: the quirk property lives on the GPU node
++		 * (qcom,kgsl-3d0), NOT on the GMU node (qcom,gpu-gmu):
++		 *
++		 *   sm8150-gpu.dtsi:116   qcom,gpu-quirk-cx-gdsc;   <- GPU node
++		 *   sm8150-gpu.dtsi:175   regulator-names = "vddcx", "vdd";
++		 *   sm8150-gpu.dtsi:403   regulator-names = "vddcx", "vdd";  <- GMU node
++		 *
++		 * Image 274 read it from gmu->dev->of_node (the GMU node)
++		 * and got 0.  KGSL reads it from the adreno device node.
++		 */
++		if (a6xx_gpu->base.base.dev && a6xx_gpu->base.base.dev->dev_private)
++			priv = a6xx_gpu->base.base.dev->dev_private;
++		if (priv && priv->gpu_pdev)
++			gpu_node = priv->gpu_pdev->dev.of_node;
++		if (gpu_node)
++			quirk = of_property_read_bool(gpu_node,
++					"qcom,gpu-quirk-cx-gdsc");
++
++		pr_info("CXMODE274: cx=%px gpu_node=%px quirk(cx-gdsc)=%d mode=%u\n",
++			(void *)gmu->cx, (void *)gpu_node, quirk, mode);
++
++		if (gmu->cx) {
++			pr_info("CXMODE274: before: enabled=%d mode=%d\n",
++				regulator_is_enabled(gmu->cx),
++				regulator_get_mode(gmu->cx));
++			ret = regulator_set_mode(gmu->cx, mode);
++			pr_info("CXMODE274: regulator_set_mode(vddcx, %u) = %d\n",
++				mode, ret);
++			pr_info("CXMODE274: after: enabled=%d mode=%d\n",
++				regulator_is_enabled(gmu->cx),
++				regulator_get_mode(gmu->cx));
++		} else {
++			pr_info("CXMODE274: no vddcx regulator, nothing to do\n");
++		}
++
++		/* give the PMIC a real window before sampling */
++		msleep(20);
++
++		pr_info("CXMODE274: +20ms SPTPRAC=0x%x GX_GDSCR=0x%x TCS0=0x%x RSC0=0x%x RPMHPWR=0x%x gx_is_on=%d\n",
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++			gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
++			gmu_read(gmu, REG_A6XX_RSCC_TCS0_DRV0_STATUS),
++			gmu_read(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
++			gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++			a6xx_gmu_gx_is_on(gmu));
++	}
++
++	/* Use a known rate to bring up the GMU */
++	clk_set_rate(gmu->core_clk, 200000000);
++	A6XX_TRACE("clk_set_rate done");
++	a6xx_gmu_scratch_check(gmu, "pre-clocks");
++	A6XX_TRACE("before clk_bulk_prepare_enable");
++	pr_info("GMU_PM: clk_bulk_prepare_enable(nr=%d) enter\n",
++		gmu->nr_clocks);
++	ret = a6xx_gmu_clk_bulk_prepare_enable_traced(gmu->nr_clocks,
++			gmu->clocks);
++	A6XX_TRACE("clocks enabled (ret=%d)", ret);
++	if (!ret)
++		gmu_clks_live = true;
++	a6xx_gmu_scratch_check(gmu, "post-clocks");
++	if (ret)
++		goto out;
++
++	A6XX_TRACE("before GMU IRQ enable");
++	a6xx_gmu_irq_enable(gmu);
++	A6XX_TRACE("GMU IRQ enabled");
++
++	/* Check to see if we are doing a cold or warm boot */
++	status = gmu_read(gmu, REG_A6XX_GMU_GENERAL_7) == 1 ?
++		GMU_WARM_BOOT : GMU_COLD_BOOT;
++
++	/*
++	 * IMAGE 225 -- RESTORED from upstream v5.8 a6xx_gmu_resume().
++	 *
++	 * "Warm boot path does not work on newer GPUs. Presumably this is
++	 * because icache/dcache regions must be restored."
++	 *
++	 * Our port dropped this override, so it trusted GENERAL_7 alone. But
++	 * our own cold-boot fw_start sets GENERAL_7=1, so every resume after
++	 * the first selected WARM and skipped the firmware reload. That is a
++	 * second, independent way GX never comes up on a retried resume.
++	 */
++	if (!gmu->legacy)
++		status = GMU_COLD_BOOT;
++
++	A6XX_TRACE("boot status read (%s)",
++		status == GMU_WARM_BOOT ? "warm" : "cold");
++
++	/*
++	 * Minimal equivalent of vendor KGSL gmu_start(): DDR bandwidth vote
++	 * immediately before FW_START. KGSL votes
++	 * msm_bus_scale_client_update_request(gmu->pcl,
++	 * pwr->pwrlevels[default].bus_freq) with the comment "Vote for 300MHz
++	 * DDR for GMU to init"; on sm8150 grp3d that is index 4 (bus=300).
++	 * Observation only beyond the vote itself.
++	 */
++	A6XX_TRACE("before DDR vote (pcl=%u)", gmu->bw_pcl);
++	if (gmu->bw_pcl) {
++		ret = msm_bus_scale_client_update_request(gmu->bw_pcl, 4);
++		A6XX_TRACE("after DDR vote (ret=%d)", ret);
++		if (ret)
++			goto out;
++	} else {
++		A6XX_TRACE("DDR vote skipped (no bus client)");
++	}
++
++	/*
++	 * TEMPORARY SMMU/map diagnostics -- REMOVE ONCE FAULT IS UNDERSTOOD.
++	 *
++	 * The ARM SMMU reports faults by internal cbndx (cb=1 = second CB
++	 * allocated on kgsl-smmu, NOT hardware CB 5), so log our address
++	 * spaces by device + domain + aperture + fwspec SIDs, plus every GMU
++	 * buffer IOVA, before the GMU touches DMA.
++	 */
++	{
++		struct a6xx_gpu *ag = container_of(gmu, struct a6xx_gpu, gmu);
++		struct adreno_gpu *ad = &ag->base;
++		struct drm_device *drm = ad->base.dev;
++		struct msm_drm_private *priv = drm ? drm->dev_private : NULL;
++		struct msm_gpu *gpu = priv ? priv->gpu : NULL;
++		struct iommu_fwspec *fs;
++		int i;
++
++		A6XX_TRACE("SMMU gmu domain=%px dev=%s aperture=%llx-%llx",
++			gmu->domain, gmu->cb_dev ? dev_name(gmu->cb_dev) : "?",
++			gmu->domain ? gmu->domain->geometry.aperture_start : 0,
++			gmu->domain ? gmu->domain->geometry.aperture_end : 0);
++		if (gmu->cb_dev && gmu->cb_dev->iommu_fwspec) {
++			fs = gmu->cb_dev->iommu_fwspec;
++			for (i = 0; i < fs->num_ids; i++)
++				A6XX_TRACE("SMMU gmu fwspec SID[%d]=0x%x",
++					i, fs->ids[i]);
++		}
++		if (gpu && gpu->aspace)
++			A6XX_TRACE("SMMU gpu aspace=%px dev=%s",
++				gpu->aspace,
++				priv->gpu_pdev ? dev_name(&priv->gpu_pdev->dev) : "?");
++		if (priv && priv->gpu_pdev &&
++		    priv->gpu_pdev->dev.iommu_fwspec) {
++			fs = priv->gpu_pdev->dev.iommu_fwspec;
++			for (i = 0; i < fs->num_ids; i++)
++				A6XX_TRACE("SMMU gpu fwspec SID[%d]=0x%x",
++					i, fs->ids[i]);
++		}
++	}
++#define A6XX_BO_LOG(tag, bo) do { \
++		if (bo) \
++			A6XX_TRACE("SMMU map " tag " iova=0x%llx size=0x%zx %s", \
++				(unsigned long long)(bo)->iova, (bo)->size, \
++				IS_ERR(bo) ? "ERR" : "ok"); \
++		else \
++			A6XX_TRACE("SMMU map " tag " NULL"); \
++	} while (0)
++	A6XX_BO_LOG("itcmhole", gmu->itcm_hole);
++	A6XX_BO_LOG("hfi", gmu->hfi);
++	A6XX_BO_LOG("icache", gmu->icache);
++	A6XX_BO_LOG("dcache", gmu->dcache);
++	A6XX_BO_LOG("debug", gmu->debug);
++	A6XX_BO_LOG("dummy", gmu->dummy);
++	A6XX_BO_LOG("sentinel", gmu->sentinel);
++	A6XX_BO_LOG("log", gmu->log);
++#undef A6XX_BO_LOG
++
++	/*
++	 * TEMPORARY image 142 -- PROMOTE IF STABLE. Bounded retry beats the
++	 * firmware lottery (BADDFACE/NACK/silence): attempt 0 is the exact old
++	 * path; attempts 1-2 run the proven a6xx_gmu_reset() teardown+reboot
++	 * (fw RESET + hfi COLD_BOOT inside). Success path byte-identical.
++	 */
++	ret = -ETIMEDOUT;
++	{
++		int attempt;
++		for (attempt = 0; attempt < (recover166_fast ? 1 : 3); attempt++) {
++			if (attempt == 0) {
++				pr_info("A6XX_SNAPSHOT: FW_START state=%d\n", status);
++				pr_info("POST_START: fw_start begin\n");
++				A6XX_TRACE("before firmware start");
++				ret = a6xx_gmu_fw_start(gmu, status);
++				pr_info("POST_START: fw_start end ret=%d\n", ret);
++				A6XX_TRACE("fw_start returned (ret=%d)", ret);
++				if (ret)
++					goto next_attempt;
++
++				a6xx_gmu_bootstrap_active = true;
++				pr_info("=== GMU BOOTSTRAP BEGIN ===\n");
++				ret = a6xx_hfi_start(gmu, status);
++				a6xx_gmu_bootstrap_active = false;
++				pr_info("=== GMU BOOTSTRAP END ===\n");
++				A6XX_TRACE("hfi_start returned (ret=%d)", ret);
++			} else {
++				pr_info("RETRY142: attempt %d/2 after ret=%d\n",
++					attempt, ret);
++				bc132("RETRY", ret);
++				ret = a6xx_gmu_reset(a6xx_gpu);
++				pr_info("RETRY142: reset returned ret=%d\n", ret);
++			}
++			if (ret)
++				goto next_attempt;
++
++			/*
++			 * TEMPORARY image 132 gated probe + image 137 nonlegacy
++			 * mode.
++			 *
++			 * TEMPORARY image 194 -- PROMOTE IF THE RING APPEARS.
++			 *
++			 * This probe is an INSTRUMENT, not a bring-up
++			 * requirement. It used to be able to fail the bring-up,
++			 * and that is what stopped the GPU ever working.
++			 *
++			 * Observed on image 193:
++			 *
++			 *   fw_start end ret=0                 <- attempt 0 OK
++			 *   ... hfi_vote_probe fails ...
++			 *   GMU firmware initialization timed out
++			 *   after GMU start (ret=-110)         <- attempt 1
++			 *   BC132: ev=RESUME_RETURN ret=-110
++			 *   A6XX_DIAG: hw_init suppressed after GMU boot error -110
++			 *
++			 * A perfectly healthy GMU was booted (GOOD BABEFACE,
++			 * HFISTAT=0x1), a diagnostic vote probe failed, and the
++			 * loop then re-ran fw_start on the already-running GMU.
++			 * That retry timed out, the -110 latched
++			 * a6xx_gmu_boot_error in a6xx_pm_resume, and
++			 * msm_gpu_hw_init() skips hw_init while that is set -- so
++			 * the ring was never programmed (rb_iova=0x0, RB_BASE=0x0,
++			 * no RINGHW[] lines, "CP is NOT CLOCKING") even though
++			 * GL_RENDERER read FD640 and every GEM_SUBMIT returned 0.
++			 *
++			 * That is the entire reason wptr_dw stayed 0.
++			 *
++			 * Fix: log a probe failure and keep the successful fw_start
++			 * result instead of discarding it and retrying. bring-up is
++			 * already complete at this point; a failed read-only vote
++			 * probe must not undo it.
++			 */
++			if (gmu_hfi_probe || experimental_nonlegacy) {
++				int probe_ret = a6xx_gmu_hfi_vote_probe(gmu);
++
++				if (probe_ret && !ret) {
++					pr_info("A6XX_DIAG: hfi_vote_probe failed (%d) "
++						"-- keeping successful fw_start, "
++						"NOT retrying (image 194)\n",
++						probe_ret);
++				}
++			}
++
++			break;
++next_attempt:;
++		}
++	}
++	if (ret)
++		goto out;
++
++	/*
++	 * TEMPORARY image 140 -- PROMOTE IF STICKY. Nonlegacy mode keeps the
++	 * DCVS register writes (proven load-bearing: 133/136/138 sticky runs
++	 * all executed them; 137-att5 skipped them -> void). The OOB ack
++	 * timeout inside set_freq is harmless (all sticky runs had it).
++	 */
++	if (experimental_nonlegacy)
++		pr_info("NONLEGACY140: running legacy DCVS set_freq for its register writes (OOB result ignored as before)\n");
++	/* Set the GPU to the highest power frequency */
++	a6xx_gmu_set_freq(gmu, gmu->nr_gpu_freqs - 1);
++	A6XX_TRACE("set_freq done");
++
++	/*
++	 * IMAGE 225: immediate readback around the GX vote. This is the first
++	 * point in the whole project where we can see whether the vote had any
++	 * effect. Compare SPTPRAC / GX_GDSCR before (a6xx_gmu_resume entry) with
++	 * the values here, and GXSTATE ~1ms after via the poller.
++	 */
++	pr_info("GXVOTE225: idx=%d/%d legacy=%d -> SPTPRAC=0x%x GX_GDSCR=0x%x TCS0=0x%x RSC0=0x%x RPMHPWR=0x%x\n",
++		gmu->nr_gpu_freqs - 1, gmu->nr_gpu_freqs, gmu->legacy,
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
++		gmu_read(gmu, REG_A6XX_RSCC_TCS0_DRV0_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE));
++
++	/*
++	 * IMAGE 226 -- THE DECISIVE EXPERIMENT. gpu_cc_gx_gmu_clk is still
++	 * en=0 after a correct, acked GX vote. Last remaining blocker.
++	 *
++	 * gpu_gx_gdsc is a REAL power domain, not a placeholder:
++	 *   sm8150-gdsc.dtsi:228  qcom,gdsc@0x2c9100c, sw-reset, domain-addr
++	 *   sm8150.dtsi:4121      status="ok", parent-supply=<&pm8150l_s2_level>
++	 * i.e. a genuine PMIC rail behind a GDSC CSR. We hold the handle
++	 * (devm_regulator_get(gmu->dev,"vdd")) and have NEVER enabled it --
++	 * resume enables CX only. IMAGE-83-84-RESULTS.md proposed exactly this
++	 * a hundred images ago; KGSL-DRM-POWER-COMPARE.md later closed it on
++	 * the claim that GX comes up via GMU/RPMh alone. That claim is now
++	 * testable, because the GMU/RPMh path has actually been exercised and
++	 * the gate is still shut.
++	 *
++	 * Placed AFTER the GXVOTE225 print so that print captures the clean
++	 * pre-enable state and this block captures the post-enable state: one
++	 * boot gives an A/B. Modelled on upstream's gmu_gxpd_get(), whose own
++	 * comment says the A6x/A7x host vote "won't actually do anything but
++	 * ... make sure that the refcounting is correct".
++	 *
++	 * Interpretation:
++	 *   GXGDSCR / SPTPRAC move  -> the rail IS host-reachable; the break is
++	 *                              strictly in the GMU->AOP path.
++	 *   nothing moves           -> the host cannot reach it at all, and the
++	 *                              AOP/QMP ACD notification is the fix.
++	 */
++	if (gmu->gx && !IS_ERR(gmu->gx) && enable_gx_gdsc) {
++		int gxret = regulator_enable(gmu->gx);
++
++		pr_info("GXGDSC226: regulator_enable(vdd/gpu_gx_gdsc) ret=%d already=%d\n",
++			gxret, regulator_is_enabled(gmu->gx));
++		gmu->gx_gdsc_enabled = !gxret;
++
++		/* give the rail/sequencer a real window before sampling */
++		msleep(5);
++
++		pr_info("GXGDSC226: +5ms SPTPRAC=0x%x GX_GDSCR=0x%x TCS0=0x%x RSC0=0x%x RPMHPWR=0x%x gx_is_on=%d\n",
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++			gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
++			gmu_read(gmu, REG_A6XX_RSCC_TCS0_DRV0_STATUS),
++			gmu_read(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
++			gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++			a6xx_gmu_gx_is_on(gmu));
++	} else {
++		pr_info("GXGDSC226: skipped (handle %px, module param off)\n",
++			(void *)gmu->gx);
++	}
++
++	/*
++	 * IMAGE 229: enable the GX clock through the CLK FRAMEWORK.
++	 *
++	 * Images 227/228/229-previous each tried to poke the gate register
++	 * directly and all three failed for different reasons (of_iomap
++	 * garbage, -EBUSY, devm_ioremap garbage), twice Oopsing
++	 * a6xx_gmu_resume. Worse, the premise was wrong: I took the offset
++	 * 0x162 / mask 0x0F from debugcc-sm8150.c, which is a *measurement*
++	 * register. The real gate is in drivers/clk/qcom/gpucc-sm8150.c:
++	 *
++	 *   static struct clk_branch gpu_cc_gx_gmu_clk = {
++	 *           .enable_reg = 0x1064, .enable_mask = BIT(0), ...
++	 *
++	 * So: add GPU_CC_GX_GMU_CLK to the GMU node (done in
++	 * sm8150-gpu.dtsi) and let the clk driver enable it properly --
++	 * correct register, correct parent chain (gpu_cc_gx_gmu_clk_src),
++	 * correct refcounting. No raw MMIO, no resource conflicts.
++	 *
++	 * This is still a DIAGNOSTIC: if the fence now completes, the
++	 * firmware simply never opens this gate and the fix is the AOP/QMP
++	 * ACD notification. If the fence still hangs, the break is deeper
++	 * than power and the entire power story was a red herring.
++	 */
++	if (force_gx_clk) {
++		struct clk *gx;
++
++		gx = devm_clk_get(gmu->dev, "gx_gmu_clk");
++		if (IS_ERR(gx)) {
++			pr_info("GXCLK229: devm_clk_get(gx_gmu_clk) failed %ld\n",
++				PTR_ERR(gx));
++		} else {
++			int cret = clk_prepare_enable(gx);
++
++			pr_info("GXCLK229: clk_prepare_enable(gpu_cc_gx_gmu_clk) ret=%d rate=%lu\n",
++				cret, clk_get_rate(gx));
++
++			/* give the domain a real window before sampling */
++			msleep(20);
++
++			pr_info("GXCLK229: +20ms SPTPRAC=0x%x GX_GDSCR=0x%x TCS0=0x%x RSC0=0x%x RPMHPWR=0x%x gx_is_on=%d\n",
++				gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++				gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
++				gmu_read(gmu, REG_A6XX_RSCC_TCS0_DRV0_STATUS),
++				gmu_read(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
++				gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++				a6xx_gmu_gx_is_on(gmu));
++		}
++	}
++
++	/*
++	 * IMAGE 226: dump both sides of the OOB channel and clear a stale
++	 * host request. REG_A6XX_GMU_HOST2GMU_INTR_CLR (0x5195) is written
++	 * NOWHERE in this tree, so bit 16 -- set since image 1 and never
++	 * consumed -- has been un-retractable for the life of the project.
++	 */
++	{
++		u32 h2g = gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO);
++
++		pr_info("OOBDIAG226: H2G_RAW=0x%08x G2H_INFO=0x%08x G2H_SET=0x%08x G2H_MASK=0x%08x AO_STATUS=0x%08x\n",
++			h2g,
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_SET),
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK),
++			gmu_read(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_STATUS));
++
++		if (h2g) {
++			gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_CLR, h2g);
++			pr_info("OOBDIAG226: wrote HOST2GMU_INTR_CLR=0x%08x -> H2G_RAW=0x%08x G2H_INFO=0x%08x\n",
++				h2g,
++				gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++				gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++		}
++	}
++
++out:
++	/* Make sure to turn off the boot OOB request on error */
++	if (ret)
++		a6xx_gmu_clear_oob(gmu, GMU_OOB_BOOT_SLUMBER);
++
++	A6XX_TRACE("a6xx_gmu_resume RETURNING ret=%d", ret);
++
++	/*
++	 * IMAGE 226 -- FIX MY OWN BUG. The poller was gated on
++	 * `experimental_nonlegacy`, but the live cmdline sets
++	 * `al_nonlegacy=1`, which is a DIFFERENT parameter name. So the
++	 * poller never armed on the hardware and every RPMh/TCS diagnostic
++	 * living in it (RPV225) silently produced zero lines for the whole
++	 * image-225 run -- including the registers I added specifically to
++	 * interpret image 225's own result.
++	 *
++	 * Arm it unconditionally. The poller is observation-only.
++	 */
++	gvitals157_gmu = gmu;
++	schedule_delayed_work(&gvitals157_work, msecs_to_jiffies(5000));
++	pr_info("GVIT226: poller armed (first +5s, then 30s)\n");
++	bc132("RESUME_RETURN", ret);
++	return ret;
++}
++
++/*
++ * TEMPORARY image 166 -- PROMOTE with the IRQ-handler change above.
++ * Force the GMU off (upstream force_off shape, minus bus_halt which
++ * needs the absent interconnect driver) then cold re-bootstrap via
++ * the proven resume path (which retries the firmware lottery itself).
++ * Runs in process context under the DRM mutex, like a submit would.
++ * If resume fails, the machine stays alive (suppress philosophy) and
++ * the log shows exactly where.
++ */
++static void recover166_fn(struct work_struct *work)
++{
++	struct a6xx_gpu *ag = recover166_ag;
++	struct msm_gpu *gpu;
++	int ret;
++
++	if (!ag)
++		return;
++	gpu = &ag->base.base;
++
++	pr_info("RECOVER166: begin (force off + cold resume)\n");
++	mutex_lock(&gpu->dev->struct_mutex);
++	recover166_fast = true;
++
++	gmu_write(&ag->gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE, 0);
++	a6xx_hfi_stop(&ag->gmu);
++	a6xx_gmu_irq_disable(&ag->gmu);
++	a6xx_sptprac_disable(&ag->gmu);
++	gmu_write(&ag->gmu, REG_A6XX_GMU_AO_AHB_FENCE_CTRL, 0);
++	wmb();
++	gmu_write(&ag->gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
++	pr_info("RECOVER166: GMU halted, resuming\n");
++	a6xx_rpmh_stop(&ag->gmu);
++
++	ret = a6xx_gmu_resume(ag);
++
++	recover166_fast = false;
++	mutex_unlock(&gpu->dev->struct_mutex);
++	pr_info("RECOVER166: end ret=%d\n", ret);
++}
++
++bool a6xx_gmu_isidle(struct a6xx_gmu *gmu)
++{
++	u32 reg;
++
++	if (!gmu->mmio)
++		return true;
++
++	reg = gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS);
++
++	if (reg &  A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_GPUBUSYIGNAHB)
++		return false;
++
++	return true;
++}
++
++int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	u32 val;
++
++	/*
++	 * The GMU may still be in slumber unless the GPU started so check and
++	 * skip putting it back into slumber if so
++	 */
++	val = gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE);
++
++	if (val != 0xf) {
++		int ret = a6xx_gmu_wait_for_idle(a6xx_gpu);
++
++		/*
++		 * TEMPORARY image 165 -- PROMOTE WITH SLUMBER. Never BUG
++		 * in the trigger path: a failed slumber logs loudly and
++		 * continues awake (old behavior + full instrumentation).
++		 */
++		if (ret) {
++			pr_warn("a6xx: slumber wait_for_idle failed ret=%d, staying awake\n",
++				ret);
++			return ret;
++		}
++
++		if (a6xx_instr)
++			pr_info("SSTEP171: stop wait_for_idle done\n");
++		/* tell the GMU we want to slumber */
++		a6xx_gmu_notify_slumber(gmu);
++		if (a6xx_instr)
++			pr_info("SSTEP171: notify_slumber done\n");
++
++		ret = gmu_poll_timeout(gmu,
++			REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS, val,
++			!(val & A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_GPUBUSYIGNAHB),
++			100, 10000);
++
++		/*
++		 * Let the user know we failed to slumber but don't worry too
++		 * much because we are powering down anyway
++		 */
++
++		if (ret)
++			dev_err(gmu->dev,
++				"Unable to slumber GMU: status = 0%x/0%x\n",
++				gmu_read(gmu,
++					REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS),
++				gmu_read(gmu,
++					REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS2));
++	}
++
++	/*
++	 * TEMPORARY image 170 -- PROMOTE with the slumber lifecycle.
++	 * Drop our GX vote (upstream removes its OPP vote on shutdown;
++	 * stale votes are a known system-breaker). HFI still alive here;
++	 * a timeout just logs (bounded waiter inside the sender).
++	 */
++	if (experimental_nonlegacy) {
++		int zret = a6xx_hfi_send_gx_vote(gmu, 1, 0, 0);
++		if (a6xx_instr)
++			pr_info("SLUM170: zero-vote ret=%d\n", zret);
++	}
++
++	/* Turn off HFI */
++	a6xx_hfi_stop(gmu);
++	if (a6xx_instr)
++		pr_info("SSTEP171: hfi_stop done\n");
++
++	/* Stop the interrupts and mask the hardware */
++	a6xx_gmu_irq_disable(gmu);
++	if (a6xx_instr)
++		pr_info("SSTEP171: irq_disable done\n");
++
++	/* Tell RPMh to power off the GPU */
++	a6xx_rpmh_stop(gmu);
++	if (a6xx_instr)
++		pr_info("SSTEP171: rpmh_stop done\n");
++
++	clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
++	if (a6xx_instr)
++		pr_info("SSTEP171: clocks off done\n");
++
++	pm_runtime_put_sync(gmu->dev);
++
++	return 0;
++}
++
++static void a6xx_gmu_memory_free(struct a6xx_gmu *gmu, struct a6xx_gmu_bo *bo)
++{
++	int count, i;
++	u64 iova;
++
++	if (IS_ERR_OR_NULL(bo))
++		return;
++
++	count = bo->size >> PAGE_SHIFT;
++	iova = bo->iova;
++
++	/*
++	 * TEMPORARY image 202 update. Both allocation schemes now sit behind
++	 * this one free path and both use dma_alloc_attrs(): the HFI queue,
++	 * debug, log, dummy, sentinel, icache, dcache and itcm_hole. The
++	 * per-page alloc_page()/__free_pages() branch below is therefore dead
++	 * code (image 202 removed the last caller) and is retained only as a
++	 * safety net for any future buffer that sets `pages`.
++	 */
++	if (bo->phys) {
++		iommu_unmap(gmu->domain, iova, bo->size);
++		dma_free_attrs(gmu->dev, bo->size, bo->phys, bo->dma_addr, 0);
++		kfree(bo);
++		return;
++	}
++
++	for (i = 0; i < count; i++, iova += PAGE_SIZE) {
++		iommu_unmap(gmu->domain, iova, PAGE_SIZE);
++		__free_pages(bo->pages[i], 0);
++	}
++
++	kfree(bo->pages);
++	kfree(bo);
++}
++
++struct block_header {
++	u32 addr;
++	u32 size;
++	u32 type;
++	u32 value;
++	u32 data[];
++};
++
++/*
++ * Copy a firmware block into a CPU-visible GMU buffer if the block's address
++ * falls inside that buffer's IOVA range. Ported from upstream v5.8.
++ */
++static bool fw_block_mem(struct a6xx_gmu_bo *bo,
++		const struct block_header *blk)
++{
++	if (!bo)
++		return false;
++
++	if (blk->addr < bo->iova || blk->addr >= bo->iova + bo->size)
++		return false;
++
++	memcpy(bo->virt + (blk->addr - bo->iova), blk->data, blk->size);
++	return true;
++}
++
++/*
++ * Iteration step for the block list.
++ *
++ * Upstream v5.8 (and every version up to 2025) stepped with
++ *     &blk->data[blk->size >> 2]
++ * i.e. dword-based arithmetic, which silently truncates the advance whenever a
++ * block size is not a multiple of 4 and desynchronises the walk. The 2025 fix
++ * uses byte arithmetic instead.
++ *
++ * VERIFIED against the real Samsung blob (artifacts/display/GPU-FIRMWARE.md):
++ * all 7 block sizes in a640_gmu.bin are 4-aligned (0x30, 0x140, 0x38bc, 0x3a58,
++ * 0x1b20, 0x14, 0x308), so both formulas produce identical offsets for this
++ * firmware and the 2025 fix is NOT required here. It is used regardless because
++ * it is unconditionally correct and costs nothing.
++ */
++#define NEXT_BLK(blk) \
++	((const struct block_header *)((const char *)(blk) + \
++		sizeof(*(blk)) + (blk)->size))
++
++/*
++ * Load the GMU firmware.
++ *
++ * Legacy (A618/A630): the firmware is one flat image copied into ITCM, which
++ * is why it is capped at 0x8000 bytes. The cap is NOT raised.
++ *
++ * A640/A650: the firmware is a list of blocks, each carrying its destination
++ * address, so it can span ITCM, DTCM and the i/d caches. No size cap applies.
++ * Ported from upstream v5.8.
++ */
++static int a6xx_gmu_fw_load(struct a6xx_gmu *gmu)
++{
++	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	const struct firmware *fw_image = adreno_gpu->fw[ADRENO_FW_GMU];
++	const struct block_header *blk;
++	u32 reg_offset;
++
++	u32 itcm_base = 0x00000000;
++	u32 dtcm_base = 0x00040000;
++
++	if (WARN(!fw_image, "GMU firmware is not loaded\n"))
++		return -ENOENT;
++
++	if (gmu->legacy) {
++		/* Sanity check the size of the firmware that was loaded */
++		if (fw_image->size > 0x8000) {
++			dev_err(gmu->dev,
++				"GMU firmware is bigger than the available region\n");
++			return -EINVAL;
++		}
++
++		for (reg_offset = 0; reg_offset < fw_image->size >> 2;
++				reg_offset++)
++			gmu_write(gmu,
++				REG_A6XX_GMU_CM3_ITCM_START + reg_offset,
++				((u32 *)fw_image->data)[reg_offset]);
++		return 0;
++	}
++
++	for (blk = (const struct block_header *) fw_image->data;
++	     (const u8 *)blk < fw_image->data + fw_image->size;
++	     blk = NEXT_BLK(blk)) {
++		if (blk->size == 0)
++			continue;
++
++		if (blk->addr >= itcm_base && blk->addr < itcm_base + SZ_16K) {
++			reg_offset = (blk->addr - itcm_base) >> 2;
++			gmu_write_bulk(gmu,
++				REG_A6XX_GMU_CM3_ITCM_START + reg_offset,
++				blk->data, blk->size);
++		} else if (blk->addr >= dtcm_base &&
++				blk->addr < dtcm_base + SZ_16K) {
++			reg_offset = (blk->addr - dtcm_base) >> 2;
++			gmu_write_bulk(gmu,
++				REG_A6XX_GMU_CM3_DTCM_START + reg_offset,
++				blk->data, blk->size);
++		} else if (!fw_block_mem(gmu->icache, blk) &&
++			   !fw_block_mem(gmu->dcache, blk) &&
++			   !fw_block_mem(gmu->dummy, blk)) {
++			dev_err(gmu->dev,
++				"failed to match fw block (addr=%.8x size=%d)\n",
++				blk->addr, blk->size);
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Allocate a GMU buffer at a FIXED IOVA. Used for the A640 i/d caches, whose
++ * IOVAs are dictated by the firmware block addresses. Ported from v5.8's
++ * a6xx_gmu_memory_alloc(), reduced to this tree's page/iommu_map() model.
++ */
++static struct a6xx_gmu_bo *a6xx_gmu_memory_alloc_fixed(struct a6xx_gmu *gmu,
++		size_t size, u64 iova, unsigned int prot)
++{
++	struct a6xx_gmu_bo *bo;
++	int ret;
++
++	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
++	if (!bo)
++		return ERR_PTR(-ENOMEM);
++
++	bo->size = PAGE_ALIGN(size);
++	bo->iova = iova;
++
++	/*
++	 * TEMPORARY image 202 -- the icache/dcache coherency fix.
++	 *
++	 * This helper previously did alloc_page() + vmap(pgprot_writecombine).
++	 * It is now byte-for-byte the same coherent allocation that image 199
++	 * applied to the HFI queue and debug region, at the SAME caller-supplied
++	 * fixed IOVA, with the SAME iommu flags. CAF KGSL does exactly this for
++	 * every GMU buffer including GMU_ICACHE and GMU_DCACHE -- see
++	 * drivers/gpu/msm/kgsl_gmu.c alloc_and_map(), which reaches
++	 * dma_alloc_attrs() for both (only GMU_ITCM/GMU_DTCM return early).
++	 *
++	 * Why this is the fix for "INITRES stuck at 0x0, no SMMU fault":
++	 *
++	 * Decoding the real a640_gmu.bin block table shows where the firmware
++	 * actually lands:
++	 *
++	 *   ITCM   0x00000  14892 B  -> gmu_write_bulk() -> memcpy_toio(), ordered
++	 *   DTCM   0x40000   6964 B  -> gmu_write_bulk() -> memcpy_toio(), ordered
++	 *   ICACHE 0x04000  14936 B  -> fw_block_mem() -> memcpy() into a WC vmap
++	 *   DCACHE 0x57000    776 B  -> fw_block_mem() -> memcpy() into a WC vmap
++	 *
++	 * i.e. 41.7% of the image -- including the single largest block, the
++	 * CM3's instruction cache -- was written through a write-combine CPU
++	 * mapping. The CM3 is a separate bus master that reads that memory
++	 * through the SMMU. Stores to a WC mapping sit in the CPU's store
++	 * buffer and are not observable by any other master until they drain.
++	 * There was also no wmb() anywhere between a6xx_gmu_fw_load() and the
++	 * CM3_SYSRESET=0 release.
++	 *
++	 * The resulting signature is exactly what we observe and is why this
++	 * was so hard to see for 200 images: the CM3 executes stale or zero
++	 * instructions, so it never reaches __main and INITRES never becomes
++	 * 0xBABEFACE -- but the mapping is valid and the permissions are
++	 * correct, so arm-smmu reports ZERO unhandled context faults. Only the
++	 * DATA is wrong. Drain timing is nondeterministic, which is why the
++	 * failure is a lottery rather than deterministic.
++	 *
++	 * It also explains why images 195 (wmb on the HFI TX path) and 199
++	 * (coherent HFI queue) changed nothing: both are downstream of the
++	 * firmware LOAD. If the CM3 never starts, it never reads an HFI queue.
++	 *
++	 * Note the aliasing hazard that a bare wmb() would NOT fix:
++	 * alloc_page() pages are also reachable through the cacheable linear
++	 * map. __GFP_ZERO dirties cache lines through that alias, while the
++	 * firmware memcpy bypasses cache through the WC alias, so a later
++	 * eviction could overwrite the firmware with zeros. dma_alloc_attrs()
++	 * gives one coherent (non-snooped) mapping and performs the required
++	 * cache maintenance itself.
++	 *
++	 * Buffers affected: icache, dcache, itcm_hole, log, sentinel, dummy.
++	 * itcm_hole keeps its exact IOVA/size/flags -- image 192 proved it
++	 * load-bearing (SMMU faults 5->0) and it is NOT a CAF buffer.
++	 *
++	 * DMA_ATTR_FORCE_CONTIGUOUS: a single iommu_map() over dma_addr is only
++	 * valid if the allocation is physically contiguous. Without the flag
++	 * the DMA API gives no contiguity guarantee (this kernel has a 16 MiB
++	 * CMA, and 240 KiB icache/dcache allocations would be served from it
++	 * without a hard promise). The flag routes the allocation through
++	 * dma_alloc_from_contiguous() and makes failure explicit rather than
++	 * silently mapping a partial range. Sizes here are 4 KiB..240 KiB, well
++	 * inside the atomic pool, so the strong path is also the fast one.
++	 *
++	 * IOVA safety re-checked: no overlap. itcm_hole 0x0-0x4000 ends exactly
++	 * where icache begins; icache 0x4000-0x40000 ends exactly where dcache
++	 * begins; dummy 0x60000000 is taken by a FIXED mapping and
++	 * gmu->uncached_iova_base is then explicitly set to 0x60001000 so the
++	 * dynamically allocated HFI queue (which advances by 1 MiB) lands at
++	 * 0x60010000, clear of the fixed log at 0x60006000. sentinel at
++	 * 0xDEADB000 is in its own window.
++	 *
++	 * prot is passed through unchanged, so IOMMU_PRIV on icache/dcache/
++	 * itcm_hole is preserved.
++	 */
++	bo->phys = dma_alloc_attrs(gmu->dev, bo->size, &bo->dma_addr,
++			GFP_KERNEL | __GFP_ZERO, DMA_ATTR_FORCE_CONTIGUOUS);
++	if (!bo->phys) {
++		kfree(bo);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	ret = iommu_map(gmu->domain, bo->iova, bo->dma_addr, bo->size, prot);
++
++	if (ret) {
++		dev_err(gmu->dev, "Unable to map GMU buffer object\n");
++		goto err;
++	}
++
++	/*
++	 * TEMPORARY image 202 -- contiguity proof, logged once per buffer.
++	 *
++	 * A single iommu_map() over dma_addr is only correct if the allocation
++	 * is physically contiguous. DMA_ATTR_FORCE_CONTIGUOUS should guarantee
++	 * it, but "should" is not a measurement, and this whole bug class has
++	 * been invisible precisely because it was assumed correct. Walking the
++	 * pages via the CPU pointer costs nothing at probe time and settles it
++	 * in the log for every boot, forever.
++	 */
++	{
++		size_t k;
++		uintptr_t p0 = (uintptr_t)bo->phys;
++		u64 phys0 = (u64)virt_to_phys(bo->phys);
++		int discontig = 0;
++
++		for (k = PAGE_SIZE; k < bo->size; k += PAGE_SIZE) {
++			if ((uintptr_t)(bo->phys + k) != p0 + k ||
++			    (u64)virt_to_phys(bo->phys + k) != phys0 + k) {
++				discontig = 1;
++				break;
++			}
++		}
++		A6XX_TRACE("ALLOC202 iova=0x%llx size=0x%zx phys=0x%llx contiguous=%d\n",
++			(unsigned long long)bo->iova, bo->size,
++			(unsigned long long)phys0, !discontig);
++		if (discontig)
++			dev_err(gmu->dev,
++				"GMU buffer iova=0x%llx is NOT physically contiguous\n",
++				(unsigned long long)bo->iova);
++	}
++
++	/* Coherent CPU pointer straight from dma_alloc_attrs(). No vmap. */
++	bo->virt = bo->phys;
++
++	return bo;
++
++err:
++	dma_free_attrs(gmu->dev, bo->size, bo->phys, bo->dma_addr, 0);
++	kfree(bo);
++
++	return ERR_PTR(-ENOMEM);
++}
++static struct a6xx_gmu_bo *a6xx_gmu_memory_alloc(struct a6xx_gmu *gmu,
++		size_t size)
++{
++	struct a6xx_gmu_bo *bo;
++	int ret, count, i;
++
++	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
++	if (!bo)
++		return ERR_PTR(-ENOMEM);
++
++	bo->size = PAGE_ALIGN(size);
++
++	count = bo->size >> PAGE_SHIFT;
++
++	/*
++	 * TEMPORARY image 199 -- PROMOTE IF HFI STOPS TIMING OUT.
++	 *
++	 * Use dma_alloc_attrs(), matching CAF KGSL exactly
++	 * (drivers/gpu/msm/kgsl_gmu.c, alloc_and_map()):
++	 *
++	 *   md->hostptr = dma_alloc_attrs(&gmu->pdev->dev, md->size,
++	 *                                  &md->physaddr, GFP_KERNEL, 0);
++	 *   iommu_map(domain, md->gmuaddr, md->physaddr, md->size, attrs);
++	 *
++	 * We previously used alloc_page(GFP_KERNEL|__GFP_ZERO) followed by
++	 *   vmap(bo->pages, count, VM_IOREMAP, pgprot_writecombine(PAGE_KERNEL));
++	 *
++	 * pgprot_writecombine is the bug. A write-combine mapping is NOT
++	 * coherent with a separate bus master: the CPU's stores are merged in
++	 * a WC buffer that the GMU cannot snoop, because the GMU is its own
++	 * processor reading through the SMMU, not the CPU reading a cache
++	 * line.
++	 *
++	 * This is why image 195's wmb() fix was necessary but NOT sufficient.
++	 * wmb() orders the CPU's stores with respect to subsequent MMIO
++	 * writes, so the doorbell cannot be reordered before the queue data.
++	 * But it does not push a write-combine buffer out to a point where a
++	 * different coherently-provisioned agent can observe it. The GMU
++	 * therefore intermittently read rd==wr and found nothing to do, which
++	 * is exactly the observed symptom: 6 ACKs once, timeouts otherwise.
++	 *
++	 * dma_alloc_attrs() returns memory coherent with respect to the
++	 * device by construction, because the GMU platform device was
++	 * of_dma_configure()d. That is the property the GMU needs and a WC
++	 * mapping cannot provide.
++	 *
++	 * Physically contiguous as a bonus: one dma_alloc_attrs() replaces
++	 * the per-page alloc_page loop and needs only a single iommu_map()
++	 * for the whole buffer, instead of one per page.
++	 *
++	 * TEMPORARY image 202: DMA_ATTR_FORCE_CONTIGUOUS added so that single
++	 * iommu_map() is provably valid. The HFI buffer is only 20 KiB, so the
++	 * strong path costs nothing.
++	 */
++	bo->phys = dma_alloc_attrs(gmu->dev, bo->size, &bo->dma_addr,
++			GFP_KERNEL | __GFP_ZERO, DMA_ATTR_FORCE_CONTIGUOUS);
++	if (!bo->phys) {
++		kfree(bo);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	memset(bo->phys, 0, bo->size);
++
++	bo->iova = gmu->uncached_iova_base;
++
++	ret = iommu_map(gmu->domain, bo->iova, bo->dma_addr, bo->size,
++		IOMMU_READ | IOMMU_WRITE);
++
++	if (ret) {
++		dev_err(gmu->dev, "Unable to map GMU buffer object\n");
++		goto err;
++	}
++
++	/*
++	 * Coherent CPU pointer straight from dma_alloc_attrs(). No vmap and
++	 * definitely no pgprot_writecombine() -- that mapping is precisely
++	 * what left the GMU unable to see our queue writes. See the comment at
++	 * the allocation above.
++	 */
++	bo->virt = bo->phys;
++
++	/* Align future IOVA addresses on 1MB boundaries */
++	gmu->uncached_iova_base += ALIGN(size, SZ_1M);
++
++	return bo;
++
++err:
++	dma_free_attrs(gmu->dev, bo->size, bo->phys, bo->dma_addr, 0);
++	kfree(bo);
++
++	return ERR_PTR(-ENOMEM);
++}
++
++static int a6xx_gmu_memory_probe(struct device *mmu_dev,
++		struct a6xx_gmu *gmu)
++{
++	int ret;
++
++	/*
++	 * The GMU address space is hardcoded to treat the range
++	 * 0x60000000 - 0x80000000 as un-cached memory. All buffers shared
++	 * between the GMU and the CPU will live in this space
++	 */
++	gmu->uncached_iova_base = 0x60000000;
++
++	/*
++	 * Get an IOMMU domain for the GMU's kernel context bank.
++	 *
++	 * The GMU node itself carries no "iommus" property; the context banks
++	 * gmu_user (CB 4) and gmu_kernel (CB 5) are its children. KGSL maps GMU
++	 * kernel buffers (HFI queues, icache/dcache, debug region) through
++	 * gmu_kernel - see kgsl_gmu.c alloc_and_map(GMU_CONTEXT_KERNEL) - so
++	 * that is the bank used here.
++	 *
++	 * msm_gpu_cb_domain_get() populates the CB as a platform device and
++	 * allocates + attaches a domain, exactly as CAF's
++	 * gmu_iommu_cb_probe() does, without requiring KGSL.
++	 */
++	gmu->domain = NULL;
++	gmu->cb_dev = NULL;
++
++	ret = msm_gpu_cb_domain_get("gmu_kernel", &gmu->domain, &gmu->cb_dev);
++	if (ret) {
++		dev_err(mmu_dev,
++			"failed to obtain GMU context bank 'gmu_kernel': %d\n",
++			ret);
++		return ret;
++	}
++
++	/*
++	 * TEMPORARY experiment image 122 -- PROMOTE IF OPP FIXES.
++	 * Upstream ownership: gmu->dev stays on the real GMU platform
++	 * device; the context-bank device lives only in gmu->cb_dev and
++	 * is passed explicitly (mmu_dev) where the IOMMU adapter needs
++	 * a device. The old "gmu->dev = gmu->cb_dev" reassignment is
++	 * removed so OPP/clocks/regulators see the GMU node.
++	 */
++
++	mmu_dbg(mmu_dev, "GMU using context bank gmu_kernel, domain=%p\n",
++		gmu->domain);
++
++	return 0;
++}
++
++/* Get the list of RPMh voltage levels from cmd-db */
++static int a6xx_gmu_rpmh_arc_cmds(const char *id, void *vals, int size)
++{
++	u32 len = cmd_db_get_aux_data_len(id);
++
++	if (!len)
++		return 0;
++
++	if (WARN_ON(len > size))
++		return -EINVAL;
++
++	cmd_db_get_aux_data(id, vals, len);
++
++	/*
++	 * The data comes back as an array of unsigned shorts so adjust the
++	 * count accordingly
++	 */
++	return len >> 1;
++}
++
++/*
++ * dev_pm_opp_get_of_node() was added upstream in 4.16 and is absent from this
++ * 4.14-era PM framework. Resolve the DT node of an operating point by walking
++ * the device's "operating-points-v2" table and matching opp-hz instead.
++ */
++static struct device_node *__maybe_unused a6xx_opp_node_by_freq(struct device *dev,
++		unsigned long freq)
++{
++	struct device_node *tbl, *opp_np, *match = NULL;
++	u64 opp_freq;
++
++	tbl = of_parse_phandle(dev->of_node, "operating-points-v2", 0);
++	if (!tbl)
++		return NULL;
++
++	for (opp_np = of_get_next_available_child(tbl, NULL);
++			opp_np;
++			opp_np = of_get_next_available_child(tbl, opp_np)) {
++		if (of_property_read_u64(opp_np, "opp-hz", &opp_freq))
++			continue;
++
++		if (opp_freq != freq)
++			continue;
++
++		match = of_node_get(opp_np);
++		break;
++	}
++
++	return match;
++}
++
++/* Return the 'arc-level' for the given frequency */
++static u32 a6xx_gmu_get_arc_level(struct device *dev, unsigned long freq)
++{
++	struct dev_pm_opp *opp;
++	u32 val = 0;
++
++	if (!freq)
++		return 0;
++
++	opp  = dev_pm_opp_find_freq_exact(dev, freq, true);
++	if (IS_ERR(opp))
++		return 0;
++
++	/*
++	 * TEMPORARY experiment image 123 -- PROMOTE IF BW ACKS.
++	 * 4.14 has no dev_pm_opp_get_level()/opp->level (4.19+); the
++	 * downstream DT convention stores the RPMh ARC corner in
++	 * opp-microvolt, so dev_pm_opp_get_voltage() returns exactly the
++	 * existing OPP-attached level. No qcom,level, no invented values.
++	 */
++	val = (u32) dev_pm_opp_get_voltage(opp);
++
++	dev_pm_opp_put(opp);
++
++	return val;
++}
++
++static int a6xx_gmu_rpmh_arc_votes_init(struct device *dev, u32 *votes,
++		unsigned long *freqs, int freqs_count,
++		u16 *pri, int pri_count,
++		u16 *sec, int sec_count)
++{
++	int i, j;
++
++	/* Construct a vote for each frequency */
++	for (i = 0; i < freqs_count; i++) {
++		u8 pindex = 0, sindex = 0;
++		u32 level = a6xx_gmu_get_arc_level(dev, freqs[i]);
++
++		/* Get the primary index that matches the arc level */
++		for (j = 0; j < pri_count; j++) {
++			if (pri[j] >= level) {
++				pindex = j;
++				break;
++			}
++		}
++
++		if (j == pri_count) {
++			dev_err(dev,
++				"Level %u not found in in the RPMh list\n",
++					level);
++			dev_err(dev, "Available levels:\n");
++			for (j = 0; j < pri_count; j++)
++				dev_err(dev, "  %u\n", pri[j]);
++
++			return -EINVAL;
++		}
++
++		/*
++		 * Look for a level in in the secondary list that matches. If
++		 * nothing fits, use the maximum non zero vote
++		 */
++
++		for (j = 0; j < sec_count; j++) {
++			if (sec[j] >= level) {
++				sindex = j;
++				break;
++			} else if (sec[j]) {
++				sindex = j;
++			}
++		}
++
++		/* Construct the vote */
++		votes[i] = ((pri[pindex] & 0xffff) << 16) |
++			(sindex << 8) | pindex;
++		pr_info("ARC123: dev=%s freq=%lu level=%u vote=0x%08x\n",
++			dev_name(dev), freqs[i], level, votes[i]);
++	}
++
++	return 0;
++}
++
++/*
++ * The GMU votes with the RPMh for itself and on behalf of the GPU but we need
++ * to construct the list of votes on the CPU and send it over. Query the RPMh
++ * voltage levels and build the votes
++ */
++
++static int a6xx_gmu_rpmh_votes_init(struct a6xx_gmu *gmu)
++{
++	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	struct msm_gpu *gpu = &adreno_gpu->base;
++
++	u16 gx[16], cx[16], mx[16];
++	u32 gxcount, cxcount, mxcount;
++	int ret;
++
++	/* Get the list of available voltage levels for each component */
++	gxcount = a6xx_gmu_rpmh_arc_cmds("gfx.lvl", gx, sizeof(gx));
++	cxcount = a6xx_gmu_rpmh_arc_cmds("cx.lvl", cx, sizeof(cx));
++	mxcount = a6xx_gmu_rpmh_arc_cmds("mx.lvl", mx, sizeof(mx));
++	pr_info("ARC123: cmd_db counts gfx.lvl=%u cx.lvl=%u mx.lvl=%u\n",
++		gxcount, cxcount, mxcount);
++
++	/* Build the GX votes */
++	ret = a6xx_gmu_rpmh_arc_votes_init(&gpu->pdev->dev, gmu->gx_arc_votes,
++		gmu->gpu_freqs, gmu->nr_gpu_freqs,
++		gx, gxcount, mx, mxcount);
++
++	/* Build the CX votes */
++	ret |= a6xx_gmu_rpmh_arc_votes_init(gmu->dev, gmu->cx_arc_votes,
++		gmu->gmu_freqs, gmu->nr_gmu_freqs,
++		cx, cxcount, mx, mxcount);
++
++	return ret;
++}
++
++static int a6xx_gmu_build_freq_table(struct device *dev, unsigned long *freqs,
++		u32 size)
++{
++	int count = dev_pm_opp_get_opp_count(dev);
++	struct dev_pm_opp *opp;
++	int i, index = 0;
++	unsigned long freq = 1;
++
++	/*
++	 * The OPP table doesn't contain the "off" frequency level so we need to
++	 * add 1 to the table size to account for it
++	 */
++
++	if (WARN(count + 1 > size,
++		"The GMU frequency table is being truncated\n"))
++		count = size - 1;
++
++	/* Set the "off" frequency */
++	freqs[index++] = 0;
++
++	for (i = 0; i < count; i++) {
++		opp = dev_pm_opp_find_freq_ceil(dev, &freq);
++		if (IS_ERR(opp))
++			break;
++
++		dev_pm_opp_put(opp);
++		freqs[index++] = freq++;
++	}
++
++	return index;
++}
++
++static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
++{
++	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	struct msm_gpu *gpu = &adreno_gpu->base;
++
++	int ret = 0;
++
++	/*
++	 * The GMU handles its own frequency switching so build a list of
++	 * available frequencies to send during initialization
++	 */
++	ret = dev_pm_opp_of_add_table(gmu->dev);
++	pr_info("OPP121: GMU OPP probe ret=%d\n", ret);
++	if (ret) {
++		dev_err(gmu->dev, "Unable to set the OPP table for the GMU\n");
++		return ret;
++	}
++
++	gmu->nr_gmu_freqs = a6xx_gmu_build_freq_table(gmu->dev,
++		gmu->gmu_freqs, ARRAY_SIZE(gmu->gmu_freqs));
++
++	/*
++	 * The GMU also handles GPU frequency switching so build a list
++	 * from the GPU OPP table
++	 */
++	gmu->nr_gpu_freqs = a6xx_gmu_build_freq_table(&gpu->pdev->dev,
++		gmu->gpu_freqs, ARRAY_SIZE(gmu->gpu_freqs));
++
++	/* Build the list of RPMh votes that we'll send to the GMU */
++	/* TEMPORARY image 121 diagnostics -- REMOVE AFTER RESULT. */
++	{
++		int _i121;
++		for (_i121 = 0; _i121 < gmu->nr_gmu_freqs; _i121++)
++			pr_info("OPP121: gmu_freqs[%d]=%lu\n", _i121, gmu->gmu_freqs[_i121]);
++		for (_i121 = 0; _i121 < gmu->nr_gpu_freqs; _i121++)
++			pr_info("OPP121: gpu_freqs[%d]=%lu\n", _i121, gmu->gpu_freqs[_i121]);
++		pr_info("OPP121: nr_gmu_freqs=%d nr_gpu_freqs=%d entering rpmh_votes_init\n",
++			gmu->nr_gmu_freqs, gmu->nr_gpu_freqs);
++	}
++	ret = a6xx_gmu_rpmh_votes_init(gmu);
++	pr_info("OPP121: rpmh_votes_init ret=%d\n", ret);
++	pr_info("OPP122: gmudev=%s opp_probe_ret=0 nr_gmu_freqs=%d nr_gpu_freqs=%d rpmh_ret=%d\n",
++		dev_name(gmu->dev),
++		gmu->nr_gmu_freqs, gmu->nr_gpu_freqs, ret);
++	return ret;
++}
++
++static int a6xx_gmu_clocks_probe(struct a6xx_gmu *gmu)
++{
++	int ret = msm_clk_bulk_get(gmu->dev, &gmu->clocks);
++
++	if (ret < 1)
++		return ret;
++
++	gmu->nr_clocks = ret;
++
++	pr_info("A6XX_TRACE: GMU clocks: count=%d array=%zu bytes (%zu each)\n",
++		gmu->nr_clocks,
++		gmu->nr_clocks * sizeof(struct clk_bulk_data),
++		sizeof(struct clk_bulk_data));
++
++	gmu->core_clk = msm_clk_bulk_get_clock(gmu->clocks,
++		gmu->nr_clocks, "gmu");
++
++	return 0;
++}
++
++static void __iomem *a6xx_gmu_get_mmio(struct platform_device *pdev,
++		const char *name)
++{
++	void __iomem *ret;
++	struct resource *res = platform_get_resource_byname(pdev,
++			IORESOURCE_MEM, name);
++
++	if (!res) {
++		dev_err(&pdev->dev, "Unable to find the %s registers\n", name);
++		return ERR_PTR(-EINVAL);
++	}
++
++	ret = devm_ioremap(&pdev->dev, res->start, resource_size(res));
++	if (!ret) {
++		dev_err(&pdev->dev, "Unable to map the %s registers\n", name);
++		return ERR_PTR(-EINVAL);
++	}
++
++	return ret;
++}
++
++/*
++ * Map one GMU register region, tolerating either the upstream or the Samsung
++ * CAF reg-name.
++ *
++ * Upstream v4.19/v5.8 expect:
++ *      "gmu", "gmu_pdc", "gmu_pdc_seq"
++ * while this vendor device tree names the same three regions:
++ *      "kgsl_gmu_reg", "kgsl_gmu_pdc_cfg", "kgsl_gmu_pdc_seq"
++ *
++ * The vendor name is tried first and the upstream name is kept as a fallback,
++ * so no device-tree change is required and the tree works either way. All
++ * three DT resources are left untouched.
++ */
++static void __iomem *a6xx_gmu_get_mmio_any(struct platform_device *pdev,
++		const char *vendor_name, const char *upstream_name)
++{
++	void __iomem *ret;
++
++	ret = a6xx_gmu_get_mmio(pdev, vendor_name);
++	if (!IS_ERR(ret))
++		return ret;
++
++	return a6xx_gmu_get_mmio(pdev, upstream_name);
++}
++
++
++static int a6xx_gmu_get_irq(struct a6xx_gmu *gmu, struct platform_device *pdev,
++		int irq, const char *name, irq_handler_t handler)
++{
++	int ret;
++
++	ret = devm_request_irq(&pdev->dev, irq, handler, IRQF_TRIGGER_HIGH,
++		name, gmu);
++	if (ret) {
++		dev_err(&pdev->dev, "Unable to get interrupt %s\n", name);
++		return ret;
++	}
++
++	disable_irq(irq);
++
++	return irq;
++}
++
++/*
++ * Acquire one GMU interrupt, tolerating either the upstream or the Samsung
++ * CAF interrupt-name.
++ *
++ * Upstream v4.19/v5.8 expect:
++ *      "hfi", "gmu"
++ * while this vendor device tree names the same two interrupts:
++ *      "kgsl_hfi_irq", "kgsl_gmu_irq"
++ *
++ * Same vendor-first / upstream-fallback policy as a6xx_gmu_get_mmio_any().
++ * platform_get_irq_byname() returns a negative errno when the name is not
++ * present, so an absent vendor name falls through to the upstream name.
++ */
++static int a6xx_gmu_get_irq_any(struct a6xx_gmu *gmu,
++		struct platform_device *pdev, const char *vendor_name,
++		const char *upstream_name, irq_handler_t handler)
++{
++	int irq;
++
++	irq = platform_get_irq_byname(pdev, vendor_name);
++	if (irq < 0)
++		irq = platform_get_irq_byname(pdev, upstream_name);
++
++	if (irq < 0) {
++		dev_err(&pdev->dev, "Unable to find the %s/%s interrupt\n",
++			vendor_name, upstream_name);
++		return irq;
++	}
++
++	return a6xx_gmu_get_irq(gmu, pdev, irq, vendor_name, handler);
++}
++
++void a6xx_gmu_remove(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++
++	if (!IS_ERR_OR_NULL(gmu->mmio)) {
++		pm_runtime_disable(gmu->dev);
++		a6xx_gmu_stop(a6xx_gpu);
++
++		a6xx_gmu_irq_disable(gmu);
++		a6xx_gmu_memory_free(gmu, gmu->hfi);
++
++		/* A640 i/d cache buffers, and the legacy debug region */
++		a6xx_gmu_memory_free(gmu, gmu->icache);
++		a6xx_gmu_memory_free(gmu, gmu->dcache);
++		a6xx_gmu_memory_free(gmu, gmu->itcm_hole);
++		a6xx_gmu_memory_free(gmu, gmu->dummy);
++		a6xx_gmu_memory_free(gmu, gmu->sentinel);
++		a6xx_gmu_memory_free(gmu, gmu->log);
++		a6xx_gmu_memory_free(gmu, gmu->debug);
++	}
++
++	/*
++	 * Release the context-bank domain obtained by msm_gpu_cb_domain_get().
++	 * Done unconditionally: the domain may have been obtained even if mmio
++	 * mapping later failed.
++	 */
++	msm_gpu_cb_domain_put(gmu->domain, gmu->cb_dev);
++	gmu->domain = NULL;
++	gmu->cb_dev = NULL;
++}
++
++/*
++ * Diagnostic deferral of the GMU bring-up.
++ *
++ * The GMU probe programs the GPU power domain controller. On this platform
++ * that wedged the device during boot with no panic record (ramoops is wired
++ * up and stays empty), so there was no way to see how far init got: the
++ * kernel has no console= at all and pstore only captures panics.
++ *
++ * With a non-zero delay the probe body is queued and the machine boots
++ * normally, which lets the log be watched live right up to the hang. The
++ * default of 0 keeps the original immediate behaviour.
++ */
++/*
++ * a6xx_gmu.o is a composite object inside the built-in msm_drm, so
++ * KBUILD_MODNAME would otherwise make the command-line name
++ * "a6xx_gmu.gpu_init_delay_ms". Pin the prefix explicitly so the documented
++ * name is the one that actually parses.
++ */
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "a6xx."
++
++/*
++ * Not static: msm_drv.c's load_gpu() deferral reads the same value so one
++ * command-line parameter covers both the GMU probe and the GPU core attach.
++ */
++unsigned int gpu_init_delay_ms;
++module_param(gpu_init_delay_ms, uint, 0444);
++MODULE_PARM_DESC(gpu_init_delay_ms,
++	"Hold the A6xx GPU core attach for on-demand sysfs trigger (diagnostics)");
++
++module_param(gmu_hfi_probe, bool, 0444);
++MODULE_PARM_DESC(gmu_hfi_probe,
++	"Send one HFI GX_BW_PERF_VOTE after HFI START (diagnostics, default off)");
++
++module_param(secure_probe, int, 0444);
++MODULE_PARM_DESC(secure_probe,
++	"0=direct SECVID write (default), 1=skip it, 2=ZAP probe if available");
++
++module_param(secvid, int, 0644);
++MODULE_PARM_DESC(secvid,
++	"1=force the SECVID_TRUST_CNTL write even when experimental_nonlegacy would skip it (default 0, image 273)");
++
++/* IMAGE 274c */
++module_param(gmem_window, int, 0444);
++MODULE_PARM_DESC(gmem_window,
++	"UCHE GMEM window size in KB using CAF's formula (base=ALIGN(size,1M)); -1=keep the current degenerate window (image 282)");
++
++module_param(reg_match, int, 0444);
++MODULE_PARM_DESC(reg_match,
++	"1=program the init-time registers with the WORKING device's values (CP_RB_CNTL NO_UPDATE, INT_0_MASK, HANG_INT_CNTL) (image 286)");
++
++module_param(cp_protect_caf, int, 0444);
++MODULE_PARM_DESC(cp_protect_caf,
++	"1=program CAF's CP_PROTECT table verbatim plus the DT qcom,protect slots (image 285)");
++
++module_param(pc_eco_a640, int, 0444);
++MODULE_PARM_DESC(pc_eco_a640,
++	"1=write the a640 PC_DBG_ECO_CNTL (0x00200200) instead of the generic value (image 280)");
++
++module_param(uche_filter_clear, int, 0444);
++MODULE_PARM_DESC(uche_filter_clear,
++	"1=clear the UCHE write-range/trap-base filters to CAF's zeros (image 279), 0=upstream values (default)");
++
++module_param(cp_secure_off, int, 0644);
++MODULE_PARM_DESC(cp_secure_off,
++	"1=leave secure mode with CP_SET_SECURE_MODE(0) through the ring, the way stock KGSL and mainline a5xx do, instead of a host write (image 277)");
++
++
++module_param(experimental_nonlegacy, bool, 0444);
++MODULE_PARM_DESC(experimental_nonlegacy,
++	"1=HFI vote + skip legacy DCVS/SECVID at boot (default off)");
++
++/*
++ * IMAGE 226: enable the GPU GX power domain (vdd-supply -> gpu_gx_gdsc) from
++ * the host. This is a DISCRIMINATOR, not a fix -- see the GXGDSC226 block in
++ * a6xx_gmu_resume(). Default ON because the whole point of image 226 is to run
++ * the experiment; turn it off (a6xx.enable_gx_gdsc=0) to reproduce the
++ * image-225 behaviour exactly.
++ */
++static bool enable_gx_gdsc = true;
++module_param(enable_gx_gdsc, bool, 0444);
++MODULE_PARM_DESC(enable_gx_gdsc,
++	"1=host regulator_enable() the GX GDSC at resume (default 1, image 226 experiment)");
++
++/*
++ * IMAGE 227: brute-force the gpu_cc_gx_gmu_clk gate directly. DIAGNOSTIC ONLY
++ * -- bypasses clk refcounting and is not a fix. Default off; enable with
++ * a6xx.force_gx_clk=1 on the cmdline.
++ */
++module_param(uche_gbif_rw, bool, 0444);
++MODULE_PARM_DESC(uche_gbif_rw,
++	"1=write UCHE_GBIF_GX_CONFIG=0x10200f9 (default 0; KGSL gates this on an unknown DT quirk)");
++module_param(force_gx_clk, bool, 0444);
++MODULE_PARM_DESC(force_gx_clk,
++	"1=force gpu_cc_gx_gmu_clk gate at GPU_CC+0x162 (default 0, image 227 diagnostic)");
++
++/*
++ * IMAGE 230: send the ACD state to AOP over the qmp_aop mailbox. Default ON
++ * because this is the ported vendor behaviour, not an experiment: KGSL
++ * enables ACD unconditionally at gmu_aop_mailbox_init() and sends "value: 1"
++ * on the first gmu_start(). Set a6xx.send_acd=0 to disable.
++ */
++static bool send_acd = true;
++module_param(send_acd, bool, 0444);
++MODULE_PARM_DESC(send_acd,
++	"1=notify AOP of GPU ACD state at resume (default 1, ported from KGSL gmu_aop_send_acd_state)");
++
++
++module_param(a6xx_selftest, bool, 0444);
++MODULE_PARM_DESC(a6xx_selftest,
++	"1=re-run CP_ME_INIT self-test after hw_init (needs nonlegacy, default off)");
++
++/*
++ * IMAGE 274c: set the CX GDSC regulator's MODE. Default OFF; enable with
++ * a6xx.cxgdm=1 on the cmdline.
++ *
++ * KGSL does this and we never do:
++ *   kgsl_gmu.c:1599  regulator_set_mode(gmu->cx_gdsc, REGULATOR_MODE_IDLE);
++ *   kgsl_gmu.c:1604  regulator_set_mode(gmu->cx_gdsc, REGULATOR_MODE_NORMAL);
++ *
++ * and, because the DT sets qcom,gpu-quirk-cx-gdsc, KGSL answers "is CX on"
++ * from the regulator rather than from a register
++ * (adreno_a6xx_gmu.c:842-846).  Our DT sets the quirk and our driver parses
++ * no gpu-quirk property at all.
++ */
++module_param(cxgdm, uint, 0644);
++MODULE_PARM_DESC(cxgdm,
++	"regulator mode to set on vddcx at GPU bring-up: 0=off, 2=REGULATOR_MODE_NORMAL, 4=REGULATOR_MODE_IDLE (default 0; image 274 found that NORMAL kills the GPU's secure firmware, so IDLE is the next thing to try)");
++module_param(skip_bw, bool, 0444);
++MODULE_PARM_DESC(skip_bw,
++	"1=skip BW_TABLE send, continue as if ACKed (default off)");
++module_param(keepalive156, bool, 0444);
++MODULE_PARM_DESC(keepalive156,
++	"1=re-send HFI GX vote every 10s (default off)");
++module_param(hold_boot, bool, 0444);
++MODULE_PARM_DESC(hold_boot,
++	"1=keep boot OOBs, no GMU power handoff (default off)");
++module_param(skip_gpuset, bool, 0444);
++MODULE_PARM_DESC(skip_gpuset,
++	"1=skip GPU_SET OOB in hw_init (default off)");
++/*
++ * Image 182 -- default OFF (was on since 165). Post-success pm_suspend
++ * wedges the trigger thread inside printk (console_unlock, CPU3,
++ * images 179-181: SSH and OTG die while the phone looks alive), and
++ * even when it returns the VBIF poll never completes (79/79 archives:
++ * wait_for_idle done, never vbif halt done). Mesa needs a POWERED GPU
++ * anyway -- a slumbered GPU has no resume-on-submit yet, so slumbering
++ * before first render just guarantees userspace finds it asleep.
++ * Stay awake; power management returns after first pixels.
++ */
++bool slumber165 = false;
++module_param(slumber165, bool, 0444);
++MODULE_PARM_DESC(slumber165,
++	"1=post-hw_init slumber via suspend path (default off since 182)");
++/*
++ * Image 182 -- PROMOTE (quiet bring-up). Every post-success diagnostic
++ * thread (dw161 SHOTs, sw165 spinwatch with its cross-CPU IPI ping and
++ * 15s hot spin) is off unless explicitly armed. The bring-up flood
++ * (HFI/BС132/SELFTEST) already proved it can wedge console_unlock;
++ * post-success prints buy forensics at the price of the machine's
++ * responsiveness. Mesa needs the CPUs more than the logs do.
++ */
++bool a6xx_instr;
++module_param(a6xx_instr, bool, 0444);
++MODULE_PARM_DESC(a6xx_instr,
++	"1=arm post-success instruments (SHOTs, spinwatch; default off)");
++/*
++ * TEMPORARY image 178 -- PROMOTE IFF SURVIVAL EXTENDS. Halt the GMU
++ * firmware (CM3 SYSRESET) right after a successful bring-up, before
++ * slumber. If the firmware's autonomous post-boot activity (NoC
++ * floods/death throes/power games) is what destabilizes the system,
++ * a halted firmware can't do any of it; the GPU stays usable at
++ * fixed clocks for submits (no GMU needed for CP/fences).
++ * Default off (normal bring-up).
++ */
++bool halt_gmu;
++module_param(halt_gmu, bool, 0444);
++MODULE_PARM_DESC(halt_gmu,
++	"1=halt GMU CM3 firmware after successful hw_init (default off)");
++
++
++/*
++ * TEMPORARY bring-up tracing -- REMOVE ONCE GMU PROBE IS STABLE.
++ *
++ * The probe wedges the device with no panic record, so the last marker seen
++ * on /dev/kmsg names the statement that killed it.
++ */
++#define a6xx_trace(step) pr_info("a6xx-trace: %s\n", (step))
++
++
++
++/* TEMPORARY image 138 -- REMOVE AFTER RESULT. Attach identity + provider
++ * snapshot. Read-only; proves duplicate-attach origin and dependency
++ * readiness at each attach. */
++static int att138_n;
++
++/* TEMPORARY image 138 -- clocks-gate for prov138 HW reads. GMU CSR /
++ * GDSC / clock-controller reads with clocks off can NoC-fault (TZ
++ * reset, no Linux record). Set on successful enable, cleared on disable.
++ */
++
++static void prov138(struct a6xx_gmu *gmu, const char *tag)
++{
++	struct device *dev = gmu->dev;
++	struct device *parent = dev ? dev->parent : NULL;
++	int i;
++	pr_info("PROV138-%s: dev=%s parent=%s pm_en=%d pm_active=%d usage=%d rpmh_init=%s\n",
++		tag,
++		dev ? dev_name(dev) : "?",
++		parent ? dev_name(parent) : "?",
++		dev ? pm_runtime_enabled(dev) : -1,
++		dev ? pm_runtime_active(dev) : -1,
++		dev ? atomic_read(&dev->power.usage_count) : -1,
++		"n/a-at-probe(rpmh_init runs at trigger)");
++	pr_info("PROV138-%s: cx_reg=%d gx_reg=%d domain=%s cb=%s RPMH_CTRL=0x%x%s\n",
++		tag,
++		gmu_clks_live && gmu->cx ? regulator_is_enabled(gmu->cx) : -1,
++		gmu_clks_live && gmu->gx ? regulator_is_enabled(gmu->gx) : -1,
++		gmu->domain ? "set" : "NULL",
++		gmu->cb_dev ? dev_name(gmu->cb_dev) : "NULL",
++		gmu->mmio && gmu_clks_live ?
++			gmu_read(gmu, REG_A6XX_GMU_RPMH_CTRL) : 0,
++		gmu_clks_live ? "" : " (HW reads skipped, clocks off)");
++	for (i = 0; i < gmu->nr_clocks; i++)
++		pr_info("PROV138-%s: clk[%d]=%s rate=%lu\n", tag, i,
++			gmu->clocks[i].id ? gmu->clocks[i].id : "?",
++			(gmu_clks_live && gmu->clocks[i].clk) ?
++				clk_get_rate(gmu->clocks[i].clk) : 0);
++	pr_info("PROV138-%s: note no-gxpd no-devfreq-target no-qmp links-skipped\n",
++		tag);
++}
++static int a6xx_gmu_probe_real(struct a6xx_gpu *a6xx_gpu,
++		struct device_node *node);
++
++/*
++ * TEMPORARY bring-up tracing -- REMOVE ONCE seq_mmio IS UNDERSTOOD.
++ *
++ * Prints the three GMU MMIO pointers and, where the resource is known, the
++ * backing resource extents. Called at probe time, before the RPMh init, and
++ * before the first pdcseq_write().
++ */
++
++/*
++ * TEMPORARY GMU post-mortem -- REMOVE ONCE A6xx BRING-UP IS DONE.
++ * Runs in SMMU-IRQ context just before the fault panic. Only gmu_read()
++ * (plain MMIO) + pr_info + host-RAM reads: no locks, no allocations.
++ * Ordered registers-first so early lines survive even a wedged TCM read.
++ * Everything is bounded for last_kmsg.
++ */
++void a6xx_gmu_snapshot_on_smmu_fault(const char *smmu_name,
++		unsigned long iova,
++		int cbndx, u32 sid, u32 fsr, u32 fsynr0, u32 fsynr1,
++		u64 ttbr0, u64 ttbr1, u32 sctlr)
++{
++	struct a6xx_gmu *gmu = a6xx_snapshot_gmu;
++	int i;
++	u32 w0, w1, w2, w3;
++
++	if (!gmu || !gmu->mmio)
++		return;
++
++	pr_info("A6XX_SNAPSHOT: FAULT smmu=%s iova=0x%lx cb=%d sid=0x%x fsr=0x%x fsynr0=0x%x fsynr1=0x%x\n",
++		smmu_name, iova, cbndx, sid, fsr, fsynr0, fsynr1);
++	pr_info("A6XX_SNAPSHOT: SMMU ttbr0=0x%llx ttbr1=0x%llx sctlr=0x%x\n",
++		ttbr0, ttbr1, sctlr);
++	pr_info("A6XX_SNAPSHOT: HOST QTBL=0x%x INFO=0x%x SFR=0x%x BOOT=0x%x CM3CFG=0x%x G7=0x%x INITRES=0x%x HFISTAT=0x%x\n",
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_ADDR),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_QTBL_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_SFR_ADDR),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_BOOT_CONFIG),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_CFG),
++		gmu_read(gmu, REG_A6XX_GMU_GENERAL_7),
++		gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT),
++		gmu_read(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS));
++	if (gmu->hfi && gmu->hfi->virt)
++		pr_info("A6XX_SNAPSHOT: HFIQ %08x %08x %08x %08x\n",
++			((u32 *)gmu->hfi->virt)[0], ((u32 *)gmu->hfi->virt)[1],
++			((u32 *)gmu->hfi->virt)[2], ((u32 *)gmu->hfi->virt)[3]);
++	for (i = 0; i < 0x80; i += 16) {
++		w0 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2));
++		w1 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2) + 1);
++		w2 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2) + 2);
++		w3 = gmu_read(gmu, REG_A6XX_GMU_CM3_ITCM_START + (i >> 2) + 3);
++		pr_info("A6XX_SNAPSHOT: ITCM+%02x %08x %08x %08x %08x\n",
++			i, w0, w1, w2, w3);
++	}
++	for (i = 0; i < 0x40; i += 16) {
++		w0 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2));
++		w1 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2) + 1);
++		w2 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2) + 2);
++		w3 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START + (i >> 2) + 3);
++		pr_info("A6XX_SNAPSHOT: DTCM+%02x %08x %08x %08x %08x\n",
++			i, w0, w1, w2, w3);
++	}
++	for (i = 0; i < 0x40; i += 16) {
++		w0 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START +
++			((0x3f80 + i) >> 2));
++		w1 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START +
++			((0x3f80 + i) >> 2) + 1);
++		w2 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START +
++			((0x3f80 + i) >> 2) + 2);
++		w3 = gmu_read(gmu, REG_A6XX_GMU_CM3_DTCM_START +
++			((0x3f80 + i) >> 2) + 3);
++		pr_info("A6XX_SNAPSHOT: DTCM+3f%02x %08x %08x %08x %08x\n",
++			i, w0, w1, w2, w3);
++	}
++	if (gmu->sentinel && gmu->sentinel->virt)
++		pr_info("A6XX_SNAPSHOT: SENTINEL %08x %08x %08x %08x %08x %08x %08x %08x FW_BUSY=0x%x NMI=0x%x elapsed=%ums\n",
++			((u32 *)gmu->sentinel->virt)[0], ((u32 *)gmu->sentinel->virt)[1],
++			((u32 *)gmu->sentinel->virt)[2], ((u32 *)gmu->sentinel->virt)[3],
++			((u32 *)gmu->sentinel->virt)[4], ((u32 *)gmu->sentinel->virt)[5],
++			((u32 *)gmu->sentinel->virt)[6], ((u32 *)gmu->sentinel->virt)[7],
++			gmu_read(gmu, REG_A6XX_GMU_CM3_FW_BUSY),
++			gmu_read(gmu, REG_A6XX_GMU_NMI_CONTROL_STATUS),
++			jiffies_to_msecs(jiffies - a6xx_start_jiffies));
++	pr_info("A6XX_SNAPSHOT: done\n");
++}
++
++int a6xx_gmu_probe(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
++{
++	/*
++	 * Synchronous, as upstream orders it: the GMU must be set up before
++	 * any GPU hw init, because a6xx_gmu_resume() dereferences gmu->mmio
++	 * and oopses if the probe has not run. The deferral that used to live
++	 * here produced exactly that NULL deref once the filesystem was fixed.
++	 *
++	 * gpu_init_delay_ms now only gates the GPU core attach in msm_drv.c,
++	 * which keeps the kernel bring-up observable over the network.
++	 */
++	return a6xx_gmu_probe_real(a6xx_gpu, node);
++}
++
++static int a6xx_gmu_probe_real(struct a6xx_gpu *a6xx_gpu,
++		struct device_node *node)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++	struct platform_device *pdev = of_find_device_by_node(node);
++	int ret;
++
++	if (!pdev)
++		return -ENODEV;
++
++	att138_n++;
++	pr_info("ATT138: n=%d pdev=%s/%px node=%s parent=%s mmio=%s domain=%s caller=%ps\n",
++		att138_n, dev_name(&pdev->dev), &pdev->dev,
++		node->full_name,
++		pdev->dev.parent ? dev_name(pdev->dev.parent) : "?",
++		gmu->mmio ? "set" : "NULL",
++		gmu->domain ? "set" : "NULL",
++		__builtin_return_address(0));
++	prov138(gmu, "probe-entry");
++
++	gmu->dev = &pdev->dev;
++
++	of_dma_configure(gmu->dev, node);
++
++	/* Fow now, don't do anything fancy until we get our feet under us */
++	gmu->idle_level = GMU_IDLE_STATE_ACTIVE;
++
++	pm_runtime_enable(gmu->dev);
++	gmu->gx = devm_regulator_get(gmu->dev, "vdd");
++	/*
++	 * Minimal equivalent of vendor KGSL gmu_enable_gdsc(): own the CX
++	 * GDSC from the same GMU node ("vddcx" in regulator-names,
++	 * vddcx-supply = <&gpu_cx_gdsc>). No DT change; the binding exists.
++	 * Left NULL on error so a missing binding cannot break the probe;
++	 * the resume skips a NULL/ERR regulator.
++	 */
++	gmu->cx = devm_regulator_get(gmu->dev, "vddcx");
++	if (IS_ERR(gmu->cx)) {
++		dev_info(gmu->dev, "a6xx: no vddcx regulator: %ld (continuing)\n",
++			PTR_ERR(gmu->cx));
++		gmu->cx = NULL;
++	}
++
++	/*
++	 * Minimal equivalent of vendor KGSL gmu_gpu_bw_probe(): register a
++	 * bus-scale client on the GPU device's grp3d table. KGSL votes index
++	 * bus_freq (300MHz DDR = index 4 on sm8150) via
++	 * msm_bus_scale_client_update_request(gmu->pcl, ...) immediately
++	 * before FW_START. 0 stays 0 if the table/client is unavailable.
++	 */
++	{
++		struct drm_device *drm = adreno_gpu->base.dev;
++		struct msm_drm_private *priv = drm ? drm->dev_private : NULL;
++		struct platform_device *gpdev =
++			priv ? priv->gpu_pdev : NULL;
++		struct msm_bus_scale_pdata *bw_table = NULL;
++
++		if (gpdev)
++			bw_table = msm_bus_cl_get_pdata(gpdev);
++		if (bw_table) {
++			gmu->bw_pcl =
++				msm_bus_scale_register_client(bw_table);
++			dev_info(gmu->dev,
++				"a6xx: bus client registered: pcl=%u cases=%d\n",
++				gmu->bw_pcl,
++				bw_table->num_usecases);
++		} else {
++			dev_info(gmu->dev,
++				"a6xx: no grp3d bus table (continuing)\n");
++		}
++	}
++
++	/* Get the list of clocks */
++	ret = a6xx_gmu_clocks_probe(gmu);
++	if (ret)
++		return ret;
++
++	/*
++	 * IMAGE 230: open the AOP mailbox channel used to notify AOP of the
++	 * GPU's ACD state. Transcribed from vendor KGSL
++	 * drivers/gpu/msm/kgsl_gmu.c:1305-1333 on this board's tree.
++	 *
++	 * The GMU DT node already carries the phandle (sm8150-gpu.dtsi):
++	 *	mboxes = <&qmp_aop 0>;
++	 *	mbox-names = "aop";
++	 * so mbox_request_channel() can resolve it. Failure is non-fatal:
++	 * report it and carry on, exactly as KGSL logs and continues.
++	 */
++	if (send_acd) {
++		gmu->aop_client = kzalloc(sizeof(*gmu->aop_client),
++					  GFP_KERNEL);
++		if (gmu->aop_client) {
++			gmu->aop_client->dev = gmu->dev;
++			gmu->aop_client->tx_block = true;
++			gmu->aop_client->tx_tout = 1000;
++			gmu->aop_client->knows_txdone = false;
++
++			gmu->aop_chan = mbox_request_channel(gmu->aop_client, 0);
++			if (IS_ERR(gmu->aop_chan)) {
++				pr_info("ACD230: mbox_request_channel failed %ld\n",
++					PTR_ERR(gmu->aop_chan));
++				gmu->aop_chan = NULL;
++				kfree(gmu->aop_client);
++				gmu->aop_client = NULL;
++			} else {
++				pr_info("ACD230: AOP mailbox channel acquired\n");
++			}
++		}
++	}
++
++	/* Set up the IOMMU context bank (gmu->dev stays on the GMU pdev) */
++	pr_info("GMU_DEV: before=%p/%s/%s\n", gmu->dev, dev_name(gmu->dev),
++		gmu->dev->of_node ? gmu->dev->of_node->full_name : "?");
++	ret = a6xx_gmu_memory_probe(&adreno_gpu->base.pdev->dev, gmu);
++	if (ret)
++		return ret;
++	pr_info("GMU_DEV: after=%p/%s/%s cb=%s\n", gmu->dev, dev_name(gmu->dev),
++		gmu->dev->of_node ? gmu->dev->of_node->full_name : "?",
++		gmu->cb_dev ? dev_name(gmu->cb_dev) : "?");
++	a6xx_trace("after memory_probe");
++
++	/*
++	 * TEMPORARY A/B experiment -- REVERT AFTER RESULT.
++	 * Upstream v5.8 allocates a dummy page at fixed 0x60000000
++	 * (a6xx_gmu.c:1432) and HFI dynamically at >= 0x60001000
++	 * (range_start = 0x60000000 + PAGE_SIZE); our HFI sits at
++	 * 0x60000000. Mirror the v5.8 layout exactly for one boot.
++	 * Nothing else changes: same helpers, same flags, same teardown
++	 * (memory_free already handles dummy).
++	 */
++	gmu->dummy = a6xx_gmu_memory_alloc_fixed(gmu, SZ_4K, 0x60000000,
++			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV);
++	if (IS_ERR(gmu->dummy))
++		goto err;
++	gmu->uncached_iova_base = 0x60300000;
++	A6XX_TRACE("dummy mapped at 0x60000000, dynamic base now 0x60300000 (KGSL layout: HFI 0x60100000, LOG 0x60200000)");
++
++	/*
++	 * Allocate memory for the HFI queues.
++	 *
++	 * IMAGE 276: place the table at the FIXED address the A640 GMU
++	 * firmware expects, instead of letting the dynamic allocator choose.
++	 *
++	 * ANDROID-KGSL-PSP-REFERENCE.md records the working KGSL layout:
++	 *
++	 *   0x60000000  dummy page          (4K)
++	 *   0x60100000  HFI table           (20K = 0x5000)  <- KGSL
++	 *   0x60200000  LOG buffer          (4K)            <- KGSL
++	 *
++	 * This tree had:
++	 *
++	 *   0x60000000  dummy page          (4K)   same
++	 *   0x60001000  HFI table           (0x5000)  <- dynamic, NOT where KGSL puts it
++	 *   0x60006000  LOG buffer          (4K)    <- NOT where KGSL puts it
++	 *
++	 * so 0x60200000 was UNMAPPED in our layout, while the GMU firmware
++	 * has that address compiled in (it is the GMU's own non-cached window,
++	 * 0x60000000-0x80000000, and the firmware's LOG and HFI offsets are
++	 * fixed).  A firmware write to an address the GMU domain does not
++	 * map is an unmapped access at EL2 -- which is exactly the
++	 * TZBSP_ERR_FATAL_NOC_ERROR / EL2 data abort that accounts for
++	 * 167 of the project's 213 archived captures.
++	 *
++	 * The dummy page stays at 0x60000000 (matching both upstream v5.8 and
++	 * KGSL), and the dynamic allocator's base stays 0x60001000 so it
++	 * cannot hand out the now-reserved 0x60100000/0x60200000.
++	 */
++	gmu->hfi = a6xx_gmu_memory_alloc_fixed(gmu, 0x5000, 0x60100000,
++			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV);
++	if (IS_ERR(gmu->hfi))
++		goto err;
++	a6xx_trace("after hfi alloc (fixed 0x60100000, KGSL layout)");
++
++	/*
++	 * A640 vs A618/A630 GMU bring-up. Ported from upstream v5.8.
++	 *
++	 * A640 gets dedicated i/d cache buffers at the fixed IOVAs its
++	 * firmware block list addresses, and runs HFI v2. Everything else is
++	 * "legacy": a single debug buffer and HFI v1.
++	 */
++	if (adreno_is_a640(adreno_gpu)) {
++		/*
++		 * TEMPORARY image 192 -- PROMOTE ONLY ON RESULT.
++		 *
++		 * Fill the GMU ITCM hole at IOVA 0x00000-0x04000.
++		 *
++		 * Evidence: immediately after fw_start returns GOOD (0xBABEFACE
++		 * is the CA success code -- our own poll waits for it), the GMU
++		 * issues SMMU reads to IOVA 0x280/0x800/0x820 and every one
++		 * fails:
++		 *
++		 *   Unhandled context fault: iova=0x820, cb=1,
++		 *     fsr=0x40000402 [TF R SS]
++		 *   soft iova-to-phys=0x0
++		 *   SOFTWARE TABLE WALK FAILED! ... unmapped address
++		 *
++		 * Our lowest GMU mapping is icache at 0x4000, so all three
++		 * addresses sit in a hole with no mapping at all. 1.5s later
++		 * the GMU watchdog expires and the recovery resume times out,
++		 * which drops the GPU (ENXIO -> llvmpipe).
++		 *
++		 * CAF lists this range too -- kgsl_gmu.c gmu_vma[] has
++		 *   [GMU_ITCM] = { .start = 0x00000, .size = SZ_16K }
++		 * -- but CAF deliberately does NOT map it: alloc_and_map()
++		 * returns 0 early for GMU_ITCM/GMU_DTCM ("No actually memory
++		 * allocated"). So CAF must reach ITCM over the private CM3
++		 * aperture rather than the SMMU, and on this tree it evidently
++		 * does not. That is the gap being closed here.
++		 *
++		 * IOMMU_PRIV matches icache/dcache. Sized 16K to end exactly at
++		 * the icache base, so it cannot overlap any existing mapping.
++		 */
++		a6xx_trace("before itcm_hole alloc_fixed");
++		gmu->itcm_hole = a6xx_gmu_memory_alloc_fixed(gmu,
++			SZ_16K, 0x00000,
++			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV);
++		if (IS_ERR(gmu->itcm_hole))
++			goto err;
++		memset(gmu->itcm_hole->virt, 0, SZ_16K);
++		a6xx_trace("after itcm_hole alloc_fixed");
++
++		a6xx_trace("before icache alloc_fixed");
++		gmu->icache = a6xx_gmu_memory_alloc_fixed(gmu,
++			SZ_256K - SZ_16K, 0x04000,
++			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV);
++		if (IS_ERR(gmu->icache))
++			goto err;
++		a6xx_trace("after icache alloc_fixed");
++
++		a6xx_trace("before dcache alloc_fixed");
++		gmu->dcache = a6xx_gmu_memory_alloc_fixed(gmu,
++			SZ_256K - SZ_16K, 0x44000,
++			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV);
++		if (IS_ERR(gmu->dcache))
++			goto err;
++		a6xx_trace("after dcache alloc_fixed");
++	} else {
++		/* HFI v1, has sptprac */
++		gmu->legacy = true;
++
++		/* Allocate memory for the GMU debug region */
++		gmu->debug = a6xx_gmu_memory_alloc(gmu, SZ_16K);
++		if (IS_ERR(gmu->debug))
++			goto err;
++		a6xx_trace("after debug alloc");
++	}
++
++	/*
++	 * TEMPORARY experiment image 102 -- REMOVE OR PROMOTE ON RESULT.
++	 * 4 KiB GMU log at fixed 0x60006000 (right after the 0x5000 HFI),
++	 * normal READ|WRITE (upstream v5.8: plain WC dynamic buffer, NOT
++	 * priv). Zero-filled: uninitialized log memory must not confuse the
++	 * firmware's log-size/address decode.
++	 *
++	 * IMAGE 276: move it to KGSL's address.  The GMU's non-cached window
++	 * is 0x60000000-0x80000000 and the firmware has the LOG at a FIXED
++	 * offset in it (0x60200000 per ANDROID-KGSL-PSP-REFERENCE.md).  With
++	 * the HFI table now at 0x60100000 and the log at 0x60006000, the
++	 * firmware's own LOG address (0x60200000) was not mapped at all --
++	 * a firmware write there is an unmapped access at EL2.
++	 */
++	gmu->log = a6xx_gmu_memory_alloc_fixed(gmu, SZ_4K, 0x60200000,
++			IOMMU_READ | IOMMU_WRITE);
++	if (IS_ERR(gmu->log))
++		goto err;
++	memset(gmu->log->virt, 0, SZ_4K);
++	A6XX_TRACE("LOG mapped 0x60006000/0x1000 zeroed");
++
++	/*
++	 * TEMPORARY A/B experiment -- REVERT AFTER RESULT.
++	 * Probe-time layout verification: dummy must be 0x60000000/0x1000,
++	 * HFI >= 0x60001000, icache 0x4000, dcache 0x44000.
++	 */
++	A6XX_TRACE("LAYOUT dummy=0x%llx/0x%zx hfi=0x%llx/0x%zx",
++		(unsigned long long)gmu->dummy->iova, gmu->dummy->size,
++		(unsigned long long)gmu->hfi->iova, gmu->hfi->size);
++	if (adreno_is_a640(adreno_gpu))
++		A6XX_TRACE("LAYOUT icache=0x%llx/0x%zx dcache=0x%llx/0x%zx",
++			(unsigned long long)gmu->icache->iova, gmu->icache->size,
++			(unsigned long long)gmu->dcache->iova, gmu->dcache->size);
++	else
++		A6XX_TRACE("LAYOUT debug=0x%llx/0x%zx",
++			(unsigned long long)gmu->debug->iova, gmu->debug->size);
++
++	/*
++	 * TEMPORARY sentinel diagnostic -- REMOVE AFTER RESULT. One 4 KiB
++	 * scratch page at 0xDEADB000, READ|WRITE (deliberately NOT priv: if
++	 * the accessor is privileged this will permission-fault instead,
++	 * which is itself an answer). Filled with 0xA5A5A5A5 before start.
++	 * Verifies unmapped-ness by construction: the 0xDEADBEE0 fault proves
++	 * nothing is mapped there today.
++	 */
++	gmu->sentinel = a6xx_gmu_memory_alloc_fixed(gmu, SZ_4K, 0xDEADB000,
++			IOMMU_READ | IOMMU_WRITE);
++	if (IS_ERR(gmu->sentinel))
++		goto err;
++	memset(gmu->sentinel->virt, 0xA5, SZ_4K);
++	A6XX_TRACE("SENTINEL mapped 0xDEADB000/0x1000 filled A5");
++	A6XX_TRACE("LAYOUT sentinel=0x%llx/0x%zx",
++		(unsigned long long)gmu->sentinel->iova, gmu->sentinel->size);
++	A6XX_TRACE("LAYOUT log=0x%llx/0x%zx",
++		(unsigned long long)gmu->log->iova, gmu->log->size);
++	a6xx_gmu_scratch_check(gmu, "probe-memsetup");
++
++	/* Map the GMU registers (vendor reg-name, upstream as fallback) */
++	a6xx_trace("before mmio map");
++	gmu->mmio = a6xx_gmu_get_mmio_any(pdev, "kgsl_gmu_reg", "gmu");
++	a6xx_trace("after mmio map");
++
++	/* Map the GPU power domain controller registers */
++	gmu->pdc_mmio = a6xx_gmu_get_mmio_any(pdev,
++		"kgsl_gmu_pdc_cfg", "gmu_pdc");
++	a6xx_trace("after pdc_mmio map");
++
++	/*
++	 * Map the PDC sequence registers. These are a separate DT resource on
++	 * this platform and upstream v5.8 fetches them separately; the RPMh
++	 * sequence programming writes target this region.
++	 */
++	gmu->seq_mmio = a6xx_gmu_get_mmio_any(pdev,
++		"kgsl_gmu_pdc_seq", "gmu_pdc_seq");
++	a6xx_trace("after seq_mmio map");
++
++	if (IS_ERR(gmu->mmio) || IS_ERR(gmu->pdc_mmio) ||
++	    IS_ERR(gmu->seq_mmio))
++		goto err;
++
++	a6xx_gmu_dump_mmio(pdev, gmu, "MMIO_MAP");
++
++	/* Get the HFI and GMU interrupts */
++	a6xx_trace("before irq requests");
++	gmu->hfi_irq = a6xx_gmu_get_irq_any(gmu, pdev,
++		"kgsl_hfi_irq", "hfi", a6xx_hfi_irq);
++	a6xx_trace("after hfi irq");
++	gmu->gmu_irq = a6xx_gmu_get_irq_any(gmu, pdev,
++		"kgsl_gmu_irq", "gmu", a6xx_gmu_irq);
++	a6xx_trace("after gmu irq");
++
++	if (gmu->hfi_irq < 0 || gmu->gmu_irq < 0)
++		goto err;
++
++	/* Set up a tasklet to handle GMU HFI responses */
++	tasklet_init(&gmu->hfi_tasklet, a6xx_hfi_task, (unsigned long) gmu);
++
++	/* Get the power levels for the GMU and GPU */
++	a6xx_trace("before pwrlevels");
++	a6xx_gmu_pwrlevels_probe(gmu);
++	a6xx_trace("after pwrlevels");
++
++	/* Set up the HFI queues */
++	a6xx_trace("before hfi_init");
++	a6xx_hfi_init(gmu);
++	a6xx_trace("after hfi_init -- PROBE COMPLETE");
++	prov138(gmu, "probe-end");
++	pr_info("BOOT_RACE_READY ms=%u uptime=%us n=%d\n",
++		jiffies_to_msecs(jiffies),
++		(unsigned)(jiffies / HZ), att138_n);
++	a6xx_snapshot_gmu = gmu;
++
++	return 0;
++err:
++	a6xx_gmu_memory_free(gmu, gmu->hfi);
++
++	if (gmu->domain) {
++		iommu_detach_device(gmu->domain, gmu->cb_dev);
++
++		iommu_domain_free(gmu->domain);
++	}
++
++	return -ENODEV;
++}

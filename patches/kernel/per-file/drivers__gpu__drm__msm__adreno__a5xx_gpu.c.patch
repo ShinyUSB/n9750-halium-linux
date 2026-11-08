@@ -1,0 +1,71 @@
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -102,7 +102,7 @@
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct msm_drm_private *priv = gpu->dev->dev_private;
+-	struct msm_ringbuffer *ring = gpu->rb;
++	struct msm_ringbuffer *ring = gpu->rb[0];
+ 	unsigned int i, ibs = 0;
+ 
+ 	for (i = 0; i < submit->nr_cmds; i++) {
+@@ -127,8 +127,8 @@
+ 
+ 	OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+ 	OUT_RING(ring, CACHE_FLUSH_TS | (1 << 31));
+-	OUT_RING(ring, lower_32_bits(rbmemptr(adreno_gpu, fence)));
+-	OUT_RING(ring, upper_32_bits(rbmemptr(adreno_gpu, fence)));
++	OUT_RING(ring, lower_32_bits(adreno_rbmemptr(adreno_gpu, fence)));
++	OUT_RING(ring, upper_32_bits(adreno_rbmemptr(adreno_gpu, fence)));
+ 	OUT_RING(ring, submit->fence->seqno);
+ 
+ 	gpu->funcs->flush(gpu);
+@@ -247,7 +247,7 @@
+ static int a5xx_me_init(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+-	struct msm_ringbuffer *ring = gpu->rb;
++	struct msm_ringbuffer *ring = gpu->rb[0];
+ 
+ 	OUT_PKT7(ring, CP_ME_INIT, 8);
+ 
+@@ -567,8 +567,8 @@
+ 	 * ticking correctly
+ 	 */
+ 	if (adreno_is_a530(adreno_gpu)) {
+-		OUT_PKT7(gpu->rb, CP_EVENT_WRITE, 1);
+-		OUT_RING(gpu->rb, 0x0F);
++		OUT_PKT7(gpu->rb[0], CP_EVENT_WRITE, 1);
++		OUT_RING(gpu->rb[0], 0x0F);
+ 
+ 		gpu->funcs->flush(gpu);
+ 		if (!a5xx_idle(gpu))
+@@ -584,8 +584,8 @@
+ 	 */
+ 	ret = a5xx_zap_shader_init(gpu);
+ 	if (!ret) {
+-		OUT_PKT7(gpu->rb, CP_SET_SECURE_MODE, 1);
+-		OUT_RING(gpu->rb, 0x00000000);
++		OUT_PKT7(gpu->rb[0], CP_SET_SECURE_MODE, 1);
++		OUT_RING(gpu->rb[0], 0x00000000);
+ 
+ 		gpu->funcs->flush(gpu);
+ 		if (!a5xx_idle(gpu))
+@@ -665,7 +665,7 @@
+ bool a5xx_idle(struct msm_gpu *gpu)
+ {
+ 	/* wait for CP to drain ringbuffer: */
+-	if (!adreno_idle(gpu))
++	if (!adreno_idle(gpu, gpu->rb[0]))
+ 		return false;
+ 
+ 	if (spin_until(_a5xx_check_idle(gpu))) {
+@@ -1032,7 +1032,7 @@
+ 
+ 	a5xx_gpu->lm_leakage = 0x4E001A;
+ 
+-	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs);
++	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs, 1);
+ 	if (ret) {
+ 		a5xx_destroy(&(a5xx_gpu->base.base));
+ 		return ERR_PTR(ret);

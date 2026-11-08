@@ -1,0 +1,19 @@
+--- a/drivers/input/wacom/wacom_i2c.c
++++ b/drivers/input/wacom/wacom_i2c.c
+@@ -1772,6 +1772,16 @@
+ 		input_set_abs_params(input_dev, ABS_Y, 0, pdata->max_y, 4, 0);
+ 	}
+ 
++	/*
++	 * libinput rejects tablet devices whose X/Y axes carry no resolution
++	 * ("missing tablet capabilities: resolution"); derive units/mm from
++	 * the ~70 x 155 mm active pen area.
++	 */
++	input_abs_set_res(input_dev, ABS_X,
++			  input_abs_get_max(input_dev, ABS_X) / 70);
++	input_abs_set_res(input_dev, ABS_Y,
++			  input_abs_get_max(input_dev, ABS_Y) / 155);
++
+ 	input_set_capability(input_dev, EV_KEY, BTN_TOOL_PEN);
+ 	input_set_capability(input_dev, EV_KEY, BTN_TOOL_RUBBER);
+ 	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);

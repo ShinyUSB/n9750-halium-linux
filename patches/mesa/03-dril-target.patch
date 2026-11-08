@@ -1,0 +1,18 @@
+--- /tmp/mp/mesa-25.3.0/src/gallium/targets/dril/dril_target.c	2025-11-15 00:25:42.000000000 +0300
++++ /home/usb/mnt-sda/mesa-root/root/mesa-25.3.0/src/gallium/targets/dril/dril_target.c	2026-10-24 12:55:40.460042247 +0300
+@@ -356,6 +356,15 @@
+    enum pipe_format last_pformat = 0;
+    unsigned last_start = 0;
+ 
++   /* PROJECT PATCH (d2q kgsl pivot, 2026-10-24): with fd == -1 upstream
++    * recurses into libEGL.so.1 passing EGL_DEFAULT_DISPLAY as the
++    * "gbm_device*" -- valid under glvnd, a wild pointer in a non-glvnd
++    * build (observed strdup(NULL) SIGSEGV from weston-simple-egl and
++    * glxinfo hangs).  Return NULL instead; drilCreateNewScreen then uses
++    * its static config list. */
++   if (fd == -1)
++      return NULL;
++
+    /* dlopen/dlsym to avoid linkage */
+    egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!egl)

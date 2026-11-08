@@ -1,0 +1,4243 @@
+--- /dev/null
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -0,0 +1,4240 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2017-2018 The Linux Foundation. All rights reserved. */
++
++
++#include "msm_gem.h"
++#include "msm_mmu.h"
++#include "a6xx_gpu.h"
++#include "a6xx_gmu.xml.h"
++#include <linux/scatterlist.h>	/* IMAGE 253: sg_get_pages/sg_page_count */
++#include <linux/soc/qcom/llcc-qcom.h>
++#include <linux/power_supply.h>
++#include <linux/sched/debug.h>
++#include <linux/sched/clock.h>
++#include <linux/nmi.h>
++#include <linux/kernel_stat.h>
++#include <linux/ktime.h>
++#include <linux/smp.h>
++#include <linux/io.h>
++#include <linux/delay.h>
++
++/*
++ * TEMPORARY image 161 -- PROMOTE IFF IT CATCHES THE KILLER. In-kernel
++ * death-watch: host/userspace reaction (even 0.2s polling) keeps missing
++ * a killer that strikes within ~1s of [25]. A delayed_work armed at
++ * hw_init success dumps state at +200ms (regs only), +2s (regs +
++ * all-CPU backtraces + full task dump), +30s (regs). All to printk so
++ * sec_debug last_kmsg carries it. Self-diagnosing: a wedged GX read
++ * shows as the last printed line.
++ */
++/*
++ * TEMPORARY image 165 -- PROMOTE IFF IT SHOWS THE WEDGE. Timer-free
++ * witness: classic timers (pet_timer, delayed_work) stop firing within
++ * ~250ms of [25] while hrtimers/scheduling continue, and every
++ * timer-based dump (GVIT, SHOT1+) misses. A kthread that busy-waits on
++ * sched_clock (no timers, no sleeps) dumps regs at +1s and regs +
++ * show_state at +5s. Whatever wedges the timers cannot stop an already
++ * running thread; the +5s show_state reveals the pet kthread's exact
++ * wait point (timer wait vs IPI ping vs MMIO).
++ */
++static struct task_struct *sw165_task;
++static struct a6xx_gpu *sw165_ag;
++static void __iomem *sw165_wdt_base;
++static void dw161_regs(struct a6xx_gpu *ag, const char *tag);
++
++static void sw165_ipi_fn(void *info)
++{
++	*(u64 *)info = sched_clock();
++}
++
++struct sw165_ipi_done {
++	struct completion c;
++	u64 t;
++};
++
++static void sw165_ipi_fn2(void *info)
++{
++	struct sw165_ipi_done *d = info;
++	d->t = sched_clock();
++	complete(&d->c);
++}
++
++static int sw165_fn(void *data)
++{
++	u64 t0 = sched_clock();
++	u64 t1 = t0 + 1000000000ULL;
++	u64 t2 = t0 + 5000000000ULL;
++	u64 t3 = t0 + 12000000000ULL;
++	u64 t4 = t0 + 15000000000ULL;
++	u64 next_snap = t0 + 500000000ULL;
++	struct a6xx_gpu *ag = sw165_ag;
++	struct msm_gpu *gpu = ag ? &ag->base.base : NULL;
++	struct a6xx_gmu *gmu = ag ? &ag->gmu : NULL;
++	bool mmio_done = false, ipi_done = false, unvote_done = false;
++
++	while ((s64)(sched_clock() - t1) < 0) {
++		cpu_relax();
++		cond_resched();
++	}
++	if (ag)
++		dw161_regs(ag, "SPIN1");
++	else
++		pr_info("DW161-SPIN1: no ag (jiffies=%llu sched=%llu online=%u)\n",
++			(unsigned long long)get_jiffies_64(),
++			(unsigned long long)sched_clock(),
++			num_online_cpus());
++	/*
++	 * TEMPORARY image 169 -- PROMOTE with the spinwatch. Timer-free
++	 * storm timeline: every 500ms of spin time, snapshot all three
++	 * GPU IRQ counters + jiffies + online count. If an IRQ storm
++	 * starts post-+1s and wedges CPUs (starving timers, the pet
++	 * path, and eventually this thread), the last snapshot names
++	 * the line and the time. Surviving to +5s still dumps show_state.
++	 */
++	while ((s64)(sched_clock() - t2) < 0) {
++		u64 now = sched_clock();
++		if ((s64)(now - next_snap) >= 0) {
++			next_snap = now + 500000000ULL;
++			if (ag)
++				pr_info("DW161-SNAP: t+%llums jiffies=%llu gpu=%u hfi=%u gmu=%u online=%u\n",
++					(unsigned long long)(now - t0) / 1000000ULL,
++					(unsigned long long)get_jiffies_64(),
++					gpu->irq >= 0 ? kstat_irqs((unsigned int)gpu->irq) : 0,
++					gmu->hfi_irq >= 0 ? kstat_irqs((unsigned int)gmu->hfi_irq) : 0,
++					gmu->gmu_irq >= 0 ? kstat_irqs((unsigned int)gmu->gmu_irq) : 0,
++					num_online_cpus());
++			else
++				pr_info("DW161-SNAP: t+%llums no ag\n",
++					(unsigned long long)(now - t0) / 1000000ULL);
++			/*
++			 * TEMPORARY image 180 -- PROMOTE IFF SURVIVAL
++			 * EXTENDS. Post-success vote removal: return power
++			 * control to the bootloader state (proven stable on
++			 * pristine boots) by dropping our GX/MX ARC votes,
++			 * all RPMH vote enables, and the HFI vote. If OUR
++			 * votes/rails destabilize the system (firmware
++			 * acting on them over seconds), this removes the
++			 * playground; SHOTs after this point may wedge on
++			 * collapsed GX (harmless datum, other CPUs live).
++			 */
++			if (!unvote_done && ag &&
++			    (s64)(now - t0 - 10000000000ULL) >= 0) {
++				int uvret;
++				unvote_done = true;
++				gmu_write(gmu, REG_A6XX_GMU_GX_VOTE_IDX, 0);
++				gmu_write(gmu, REG_A6XX_GMU_MX_VOTE_IDX, 0);
++				gmu_rmw(gmu, REG_A6XX_GMU_RPMH_CTRL,
++					A6XX_GMU_RPMH_CTRL_RPMH_INTERFACE_ENABLE |
++					A6XX_GMU_RPMH_CTRL_LLC_VOTE_ENABLE |
++					A6XX_GMU_RPMH_CTRL_DDR_VOTE_ENABLE |
++					A6XX_GMU_RPMH_CTRL_MX_VOTE_ENABLE |
++					A6XX_GMU_RPMH_CTRL_CX_VOTE_ENABLE |
++					A6XX_GMU_RPMH_CTRL_GFX_VOTE_ENABLE, 0);
++				uvret = a6xx_hfi_send_gx_vote(gmu, 1, 0, 0);
++				pr_info("UNVOTE180: ARC+enables cleared hfi_ret=%d RPMHPWR=0x%x\n",
++					uvret,
++					gmu_read(gmu,
++						REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE));
++			}
++		}
++		/*
++		 * TEMPORARY image 171 -- PROMOTE with the wedge finder.
++		 * Probe the two remaining pet-path links from this
++		 * timer-free thread: WDT MMIO readability (+2s) and
++		 * self-IPI round trip (+3s). A wedge inside either probe
++		 * names the killer by its absence (everything else proves
++		 * liveness around it).
++		 */
++		if (!mmio_done && (s64)(now - t0 - 2000000000ULL) >= 0) {
++			mmio_done = true;
++			if (sw165_wdt_base) {
++				u64 mb = sched_clock();
++				u32 v1 = readl(sw165_wdt_base + 0x0C);
++				u32 v2 = readl(sw165_wdt_base + 0x0C);
++				u64 ma = sched_clock();
++				pr_info("DW161-WDTMMIO: v1=0x%x v2=0x%x dt_ns=%llu\n",
++					v1, v2, (unsigned long long)(ma - mb));
++			} else {
++				pr_info("DW161-WDTMMIO: no mapping\n");
++			}
++			/*
++			 * TEMPORARY image 176 -- PROMOTE with the variance
++			 * verdict. 1000 rapid back-to-back reads: a healthy
++			 * 32kHz counter barely moves (1-2 distinct values);
++			 * a faulting bus shows garbage spread. Detects the
++			 * instability class that would spin pet_watchdog's
++			 * read loop forever (now capped, forced pet).
++			 */
++			if (sw165_wdt_base) {
++				u32 first, v, mn = 0xFFFFFFFF, mx = 0;
++				int k, uniq = 0;
++				u32 last = 0;
++				first = readl(sw165_wdt_base + 0x0C);
++				mn = mx = last = first;
++				for (k = 0; k < 1000; k++) {
++					v = readl(sw165_wdt_base + 0x0C);
++					if (v < mn)
++						mn = v;
++					if (v > mx)
++						mx = v;
++					if (v != last) {
++						uniq++;
++						last = v;
++					}
++				}
++				pr_info("DW161-WDTVAR: n=1000 min=0x%x max=0x%x transitions=%d\n",
++					mn, mx, uniq);
++			}
++		}
++		if (!ipi_done && (s64)(now - t0 - 3000000000ULL) >= 0) {
++			u64 tib, tia, tstamp = 0;
++			int iret, cpu;
++			ipi_done = true;
++			tib = sched_clock();
++			iret = smp_call_function_single(smp_processor_id(),
++				sw165_ipi_fn, &tstamp, 1);
++			tia = sched_clock();
++			pr_info("DW161-IPI: ret=%d dt_ns=%llu tstamp=%llu\n",
++				iret, (unsigned long long)(tia - tib),
++				(unsigned long long)tstamp);
++			/*
++			 * TEMPORARY image 172 -- PROMOTE with the ping
++			 * verdict. The watchdog pets by IPI-pinging every
++			 * online CPU with wait=1; a CPU that never acks
++			 * wedges the pet forever. Ping every OTHER online
++			 * CPU the same way and time each: a wedge here
++			 * names the dead CPU (last line standing).
++			 *
++			 * TEMPORARY image 173 -- PROMOTE with the deaf map.
++			 * wait=1 wedges the witness too; go async with a
++			 * 1s completion timeout so the loop always finishes
++			 * and names EVERY deaf CPU, then continues.
++			 */
++			for_each_online_cpu(cpu) {
++				u64 cb, ca;
++				struct sw165_ipi_done d;
++				long wret;
++				if (cpu == smp_processor_id())
++					continue;
++				init_completion(&d.c);
++				d.t = 0;
++				cb = sched_clock();
++				smp_call_function_single(cpu,
++					sw165_ipi_fn2, &d, 0);
++				wret = wait_for_completion_timeout(&d.c,
++					msecs_to_jiffies(1000));
++				ca = sched_clock();
++				pr_info("DW161-IPIX: cpu=%d %s dt_ns=%llu\n",
++					cpu, wret ? "ACK" : "TIMEOUT",
++					(unsigned long long)(ca - cb));
++			}
++			pr_info("DW161-IPIX: all-cpu ping done\n");
++		}
++		cpu_relax();
++		cond_resched();
++	}
++	pr_info("DW161-SPIN5: show_state begin (jiffies=%llu sched=%llu online=%u)\n",
++		(unsigned long long)get_jiffies_64(),
++		(unsigned long long)sched_clock(),
++		num_online_cpus());
++	show_state();
++	pr_info("DW161-SPIN5: show_state end\n");
++	/*
++	 * TEMPORARY image 174 -- PROMOTE with the blind-window eliminator.
++	 * The +5s-to-+13s window (pet due, then bark) was never witnessed;
++	 * extend the timer-free spin to +15s with a compact +12s snapshot
++	 * (regs + clocks + online). If the machine dies first, the last
++	 * SNAP already bounded it; if it lives, +12s shows the pre-bark
++	 * state with zero timer dependence.
++	 */
++	while ((s64)(sched_clock() - t3) < 0) {
++		cpu_relax();
++		cond_resched();
++	}
++	if (sw165_ag)
++		dw161_regs(sw165_ag, "SPIN12");
++	pr_info("DW161-SPIN12: jiffies=%llu sched=%llu online=%u\n",
++		(unsigned long long)get_jiffies_64(),
++		(unsigned long long)sched_clock(),
++		num_online_cpus());
++	while ((s64)(sched_clock() - t4) < 0) {
++		cpu_relax();
++		cond_resched();
++	}
++	pr_info("DW161-SPIN15: end jiffies=%llu sched=%llu online=%u\n",
++		(unsigned long long)get_jiffies_64(),
++		(unsigned long long)sched_clock(),
++		num_online_cpus());
++	return 0;
++}
++
++static void sw165_arm(struct a6xx_gpu *ag)
++{
++	if (sw165_task)
++		return;
++	sw165_ag = ag;
++	sw165_wdt_base = ioremap(0x17c10000, 0x1000);
++	pr_info("DW161-SPIN: wdt_map=%px\n", sw165_wdt_base);
++	sw165_task = kthread_run(sw165_fn, NULL, "sw165");
++	if (IS_ERR(sw165_task)) {
++		pr_info("DW161-SPIN: kthread_run failed\n");
++		sw165_task = NULL;
++	} else {
++		pr_info("DW161-SPIN: armed (+1s/+5s, timer-free)\n");
++	}
++}
++
++static void dw161_fn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(dw161_work, dw161_fn);
++static struct a6xx_gpu *dw161_ag;
++static int dw161_shot;
++
++static void dw161_regs(struct a6xx_gpu *ag, const char *tag)
++{
++	struct msm_gpu *gpu = &ag->base.base;
++	struct a6xx_gmu *gmu = &ag->gmu;
++
++	pr_info("DW161-%s: SPTPRAC=0x%x RPMHPWR=0x%x GXVOTE=0x%x MXVOTE=0x%x OOB_H2G=0x%x OOB_G2H=0x%x\n",
++		tag,
++		gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		gmu_read(gmu, REG_A6XX_GMU_GX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_MX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	pr_info("DW161-%s: RBBM_STATUS=0x%x RPTR=0x%x WPTR=0x%x fence=%u\n",
++		tag,
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++		gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++		gpu->fctx ? gpu->fctx->completed_fence : 0);
++	pr_info("DW161-%s: gpu_irq=%d irqcount=%u hfi_irq=%d hficount=%u gmu_irq=%d gmucount=%u\n",
++		tag, gpu->irq,
++		gpu->irq >= 0 ? kstat_irqs((unsigned int)gpu->irq) : 0,
++		gmu->hfi_irq,
++		gmu->hfi_irq >= 0 ? kstat_irqs((unsigned int)gmu->hfi_irq) : 0,
++		gmu->gmu_irq,
++		gmu->gmu_irq >= 0 ? kstat_irqs((unsigned int)gmu->gmu_irq) : 0);
++	/* Clock triple + online count: discriminates tick-freeze (jiffies
++	 * stalls vs sched_clock/ktime) from a wedged pet path. */
++	pr_info("DW161-%s: jiffies=%llu sched_clock=%llu ktime=%lld online=%u\n",
++		tag, (unsigned long long)get_jiffies_64(),
++		(unsigned long long)sched_clock(),
++		(long long)ktime_get_ns(), num_online_cpus());
++}
++
++static void dw161_fn(struct work_struct *work)
++{
++	struct a6xx_gpu *ag = dw161_ag;
++	int shot = dw161_shot++;
++
++	if (!ag)
++		return;
++	if (shot == 0) {
++		dw161_regs(ag, "SHOT0");
++		schedule_delayed_work(&dw161_work,
++			msecs_to_jiffies(200));
++	} else if (shot == 1) {
++		dw161_regs(ag, "SHOT1");
++		schedule_delayed_work(&dw161_work,
++			msecs_to_jiffies(750));
++	} else if (shot == 2) {
++		dw161_regs(ag, "SHOT2");
++		schedule_delayed_work(&dw161_work,
++			msecs_to_jiffies(4000));
++	} else if (shot == 3) {
++		dw161_regs(ag, "SHOT3");
++		pr_info("DW161-SHOT3: cpubt=%d begin\n",
++			trigger_all_cpu_backtrace());
++		pr_info("DW161-SHOT3: cpubt done, show_state begin\n");
++		show_state();
++		pr_info("DW161-SHOT3: show_state end\n");
++		schedule_delayed_work(&dw161_work,
++			msecs_to_jiffies(25000));
++	} else {
++		dw161_regs(ag, "SHOT4");
++		pr_info("DW161: watch complete\n");
++	}
++}
++
++static inline bool _a6xx_check_idle(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	/* Check that the GMU is idle */
++	if (!a6xx_gmu_isidle(&a6xx_gpu->gmu))
++		return false;
++
++	/* Check tha the CX master is idle */
++	if (gpu_read(gpu, REG_A6XX_RBBM_STATUS) &
++			~A6XX_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER)
++		return false;
++
++	return !(gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS) &
++		A6XX_RBBM_INT_0_MASK_RBBM_HANG_DETECT);
++}
++
++bool a6xx_idle(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
++{
++	/* wait for CP to drain ringbuffer: */
++	if (!adreno_idle(gpu, ring))
++		return false;
++
++	if (spin_until(_a6xx_check_idle(gpu))) {
++		DRM_ERROR("%s: %ps: timeout waiting for GPU to idle: status %8.8X irq %8.8X rptr/wptr %d/%d\n",
++			gpu->name, __builtin_return_address(0),
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++			gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS),
++			gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++			gpu_read(gpu, REG_A6XX_CP_RB_WPTR));
++		return false;
++	}
++
++	return true;
++}
++
++static void a6xx_flush(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
++{
++	uint32_t wptr;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ring->lock, flags);
++
++	/* Copy the shadow to the actual register */
++	ring->cur = ring->next;
++
++	/* Make sure to wrap wptr if we need to */
++	wptr = get_wptr(ring);
++
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	/* Make sure everything is posted before making a decision */
++	mb();
++
++	gpu_write(gpu, REG_A6XX_CP_RB_WPTR, wptr);
++}
++
++static bool ibdump;
++module_param(ibdump, bool, 0644);
++
++MODULE_PARM_DESC(ibdump, "dump indirect buffer contents on every submit (debug)");
++
++/*
++ * IMAGE 261 -- TIME-RESOLVED POST-FLUSH SAMPLER.
++ *
++ * WHY THIS EXISTS
++ * ---------------
++ * Every verdict this project has reached about "did the GPU run" so far has
++ * come from a SINGLE sample taken after the work had already finished:
++ *
++ *   - a6xx_submit() does msleep(50) after a6xx_flush() and only then reads
++ *     CP_SQE_STAT.  A constant sqe_pc there is what a HEALTHY IDLE SQE looks
++ *     like, not evidence of a wedged one (this retracted a whole root-cause
++ *     document).
++ *   - CP_SCRATCH_REG(2), the fence and CP_RB_RPTR are all point-in-time reads
++ *     taken at the same moment, so they cannot show ORDER.  We know the scratch
++ *     register eventually holds the seqno and the ring eventually drains, but
++ *     not whether the timestamp ever fired, nor what the state was in between.
++ *
++ * The one sound signal we have is the interrupt decode:
++ *
++ *   RBBM_INT_0_STATUS = 0, cache_flush_ts = 0, and NO fault of any kind
++ *   (no ahb error, no hang detect, no opcode/ucode/hw_fault/prot/vsd/illegal).
++ *
++ * i.e. the submission neither completes nor faults.  To localise WHERE it
++ * stops we need time resolution, which is exactly what this adds.
++ *
++ * WHAT IT SAMPLES, AND WHY EACH ONE
++ *   pc/pkt   CP_SQE_STAT index 0/1 -- the SQE program counter and the packet
++ *            it is currently on.  A PC that ADVANCES proves the SQE is
++ *            running; a PC pinned at one value across a burst proves it is
++ *            stuck THERE, which is the discriminator we lack.
++ *   rptr/wptr  ROQ prefetch progress.
++ *   scratch  CP_SCRATCH_REG(2) -- lands at the END of the driver's preamble,
++ *            so the sample at which it flips tells us how far the CP got.
++ *   int0     RBBM_INT_0_STATUS.  Bit 20 (0x00100000) is CP_CACHE_FLUSH_TS,
++ *            the "the fence write landed" success bit.
++ *   cpint    CP_INTERRUPT_STATUS -- the fault flavours.
++ *   fence    ring->memptrs->fence -- the CPU-visible timestamp.
++ *
++ * The burst stops early once RPTR==WPTR and CACHE_FLUSH_TS has fired, so a
++ * healthy submit costs only a couple of samples.
++ *
++ * Controlled by `ibtrace` (samples per submit, 0 = off) so it is strictly
++ * on-demand: with it at 0 this code does nothing and the submit path is
++ * unchanged.  Writes no state; read-only apart from the documented
++ * CP_SQE_STAT_ADDR index selector.
++ */
++static unsigned int ibtrace;
++module_param(ibtrace, uint, 0644);
++
++MODULE_PARM_DESC(ibtrace, "post-flush SQE walk iteration budget, 0=off (debug)");
++
++/* IMAGE 264 -- defined below; used by the walk tracer to dump the capture. */
++static void a6xx_ibcap_report(struct msm_gpu *gpu, unsigned int seqno);
++
++/*
++ * IMAGE 265 -- hard ceiling on the walk tracer.
++ *
++ * The burst runs inside a6xx_submit() with struct_mutex held, and each
++ * iteration is ~4 MMIO reads. Left unbounded, a submission whose fence never
++ * lands would spin here for an arbitrary time and block the entire GPU
++ * scheduling path. ibtrace is the operator's budget; this is the driver's
++ * veto. A healthy submission needs ~70 iterations, so 4096 is ~50x headroom
++ * while still bounding the worst case to a few milliseconds.
++ */
++#define IBTRACE_MAX 4096
++
++static void a6xx_trace_burst(struct msm_gpu *gpu, struct msm_ringbuffer *ring,
++			     unsigned int seqno)
++{
++	u32 last_pc = ~0u, last_pkt = ~0u;
++	unsigned int i, nlogged = 0, stale = 0, budget;
++	u32 busy0, busy1, gras_tl0, gras_tl1;
++	u64 aon0, aon1;
++
++	if (!ibtrace)
++		return;
++
++	budget = min(ibtrace, (unsigned int)IBTRACE_MAX);
++
++	/*
++	 * Baselines for the DELTAs. Point values prove nothing on their own --
++	 * a register that reads 0x80000000 may be a real latched value or just
++	 * an idle one. What matters is whether it MOVED while the submission
++	 * ran, so take a baseline here and diff it in the summary line.
++	 */
++	busy0     = gpu_read(gpu, REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED);
++	gras_tl0  = gpu_read(gpu, REG_A6XX_GRAS_2D_DST_TL);
++	aon0      = gpu_read64(gpu, REG_A6XX_CP_ALWAYS_ON_COUNTER_LO,
++				REG_A6XX_CP_ALWAYS_ON_COUNTER_HI);
++
++	/*
++	 * IMAGE 261b -- CHANGE-DRIVEN WALK TRACE.
++	 *
++	 * The previous version logged every sample at ~100 us. That was fast
++	 * enough to prove the submission retires, but far too slow to see HOW
++	 * the SQE walks the command graph: a whole submission completes in
++	 * under ~100 us, so a 100 us sampler only ever catches the first
++	 * sample and then the idle state.
++	 *
++	 * Everything we have measured so far is ring-level: the ring's own
++	 * CP_SCRATCH/CACHE_FLUSH_TS land, and pkt=0x70bf8003 is the ring's
++	 * CP_INDIRECT_BUFFER packet. The render commands live one and two
++	 * levels further down (envelope -> leaf), and we have NEVER observed
++	 * the SQE in either of those. The fence landing proves the ring
++	 * completed; it does not prove the nested buffers were walked.
++	 *
++	 * So: poll only pc/pkt (4 MMIO) as fast as the interconnect allows,
++	 * and pay for the full register set ONLY when one of them changes.
++	 * That maximises the rate at which we can observe the walk while
++	 * keeping the log short enough to read.
++	 */
++	for (i = 0; i < budget; i++) {
++		u32 pc, pkt;
++
++		/*
++		 * Indexed register protocol: ADDR is a WRITE-ONLY selector.
++		 * Write the index, then read DATA to pop the corresponding word.
++		 * Order matters -- successive reads pop associated state.  Index 0
++		 * is the SQE firmware PC, index 1 the current packet header.
++		 */
++		gpu_write(gpu, REG_A6XX_CP_SQE_STAT_ADDR, 0);
++		pc = gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA);
++		gpu_write(gpu, REG_A6XX_CP_SQE_STAT_ADDR, 1);
++		pkt = gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA);
++
++		if (pc != last_pc || pkt != last_pkt) {
++			u32 rptr, wptr, scratch, int0, cpint, fence;
++			u32 busy, gras_tl, gras_br, rb_mode;
++			u64 rbmempx;
++
++			rptr    = gpu_read(gpu, REG_A6XX_CP_RB_RPTR);
++			wptr    = gpu_read(gpu, REG_A6XX_CP_RB_WPTR);
++			scratch = gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(2));
++			int0    = gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS);
++			cpint   = gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS);
++			fence   = ring->memptrs ? ring->memptrs->fence : 0xffffffff;
++			/* CP_RB_RPTR_ADDR is 64-bit in this tree: _LO / _HI. */
++			rbmempx = gpu_read64(gpu, REG_A6XX_CP_RB_RPTR_ADDR_LO,
++						REG_A6XX_CP_RB_RPTR_ADDR_HI);
++
++			/*
++			 * IMAGE 262 -- RENDER BACKEND STATE at the instant the
++			 * SQE is holding a CP_DRAW.  The draws are proven to
++			 * execute (walk step pc=0xd00 pkt=0x70388003), yet
++			 * nothing is ever written, so the question is whether
++			 * the RB is ARMED at all.
++			 *
++			 *   gpubusy  RBBM_PERFCTR_GPU_BUSY_MASKED -- aggregate
++			 *            GPU busy cycles.  If this does not move
++			 *            across a submission containing a draw,
++			 *            no engine did any work, and that is
++			 *            decisive regardless of point values.
++			 *   gras_tl/br  GRAS_2D_DST_TL/BR -- the 2D bounds the
++			 *            render backend uses.  A6xx CULLS a draw
++			 *            when no primitive is visible in the
++			 *            current tile, so wrong/zero bounds here
++			 *            would silently discard every primitive
++			 *            with no fault at all.
++			 *   rb_mode  RB_ADDR_MODE_CNTL -- 64-bit addressing
++			 *            for the RB; a zero here would mis-address
++			 *            every render target store.
++			 */
++			busy    = gpu_read(gpu,
++					REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED);
++			gras_tl = gpu_read(gpu, REG_A6XX_GRAS_2D_DST_TL);
++			gras_br = gpu_read(gpu, REG_A6XX_GRAS_2D_DST_BR);
++			rb_mode = gpu_read(gpu, REG_A6XX_RB_ADDR_MODE_CNTL);
++
++			pr_info("TRC[seq=%u i=%03u] pc=0x%08x pkt=0x%08x rptr=0x%05x wptr=0x%05x scratch=0x%08x int0=0x%08x cpint=0x%08x fence=%u rptraddr=0x%llx flush_ts=%d gpubusy=0x%08x gras_tl=0x%08x gras_br=0x%08x rb_mode=0x%08x\n",
++				seqno, nlogged, pc, pkt, rptr, wptr, scratch,
++				int0, cpint, fence,
++				(unsigned long long)rbmempx,
++				!!(int0 & 0x00100000),
++				busy, gras_tl, gras_br, rb_mode);
++
++			last_pc = pc;
++			last_pkt = pkt;
++			nlogged++;
++			stale = 0;
++		} else {
++			stale++;
++		}
++
++		/*
++		 * Retire early once the submission is clearly done AND the SQE
++		 * has stopped moving -- i.e. it has gone idle. Without this we
++		 * would spin the full ibtrace budget every submit.
++		 */
++		if (stale > 64 && ring->memptrs &&
++		    ring->memptrs->fence >= seqno)
++			break;
++
++		udelay(1);
++	}
++
++	busy1    = gpu_read(gpu, REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED);
++	gras_tl1 = gpu_read(gpu, REG_A6XX_GRAS_2D_DST_TL);
++	aon1     = gpu_read64(gpu, REG_A6XX_CP_ALWAYS_ON_COUNTER_LO,
++			       REG_A6XX_CP_ALWAYS_ON_COUNTER_HI);
++
++	/*
++	 * gpubusy_delta == 0 across a submission that contains CP_DRAW is the
++	 * single most decisive number this instrument produces: it means no
++	 * GPU engine did any work at all, regardless of what any individual
++	 * register happens to read.
++	 */
++	pr_info("TRC[seq=%u] walk_end iterations=%u transitions=%u gpubusy_delta=%u alwayson_delta=%llu gras_tl_changed=%d\n",
++		seqno, i, nlogged, busy1 - busy0,
++		(unsigned long long)(aon1 - aon0),
++		(gras_tl1 != gras_tl0));
++
++	/*
++	 * IMAGE 264 -- if the CP-view capture was armed, report it now.  This
++	 * runs after the fence has landed, so the captured values are the
++	 * post-render state.
++	 */
++	a6xx_ibcap_report(gpu, seqno);
++}
++
++/*
++ * IMAGE 264 -- RENDER-BACKEND REGISTER CAPTURE VIA CP_REG_TO_MEM.
++ *
++ * WHY CPU MMIO CANNOT ANSWER THIS
++ * -------------------------------
++ * Image 263 read GRAS_2D_DST_TL/BR, RB_ADDR_MODE_CNTL and
++ * RBBM_PERFCTR_GPU_BUSY_MASKED straight over the CPU bus and got unusable
++ * results:
++ *
++ *   - GRAS_2D_DST_TL read 0x00000000, yet the submitted command stream
++ *     demonstrably contains a write to it (header 0x48840502 = reg 0x8405).
++ *   - PERFCTR_GPU_BUSY_MASKED read a CONSTANT 0x002f7fff and never moved,
++ *     while CP_ALWAYS_ON_COUNTER advanced 6724 in the same window. A counter
++ *     stuck at a fixed value is evidence the counter is not counting, NOT
++ *     evidence that the engine is idle.
++ *
++ * The cause of the first one is structural: a6xx register clusters are
++ * CONTEXT-BANKED. From the freedreno documentation, "registers generally have
++ * two copies ('contexts') in their cluster", so a CPU read can land on a
++ * different context than the one the CP wrote. Reading the render backend over
++ * the CPU bus therefore cannot work here, and must not be used to conclude
++ * anything.
++ *
++ * THE FIX
++ * -------
++ * Ask the CP to capture the registers itself, with CP_REG_TO_MEM, and read
++ * the results from memory. This is the same mechanism upstream uses for its
++ * statistics counters (get_stats_counter() in a6xx_submit()), and it reads
++ * the register in the CP's OWN context -- the view that actually matters.
++ *
++ * The packets are emitted AFTER the indirect buffer, so they capture the state
++ * left behind by the render, not the state before it.
++ *
++ * Encoding taken from this tree, not from memory:
++ *   CP_REG_TO_MEM = 62                    (adreno_pm4.xml.h)
++ *   CP_REG_TO_MEM_0_REG  bits 0-15        (mask 0x0000ffff)
++ *   CP_REG_TO_MEM_0_CNT  bits 19-28       (mask 0x3ff80000)
++ *   CP_REG_TO_MEM_0_64B  bit 30
++ *
++ * Note REG is only 16 bits wide, so every register listed below must fit --
++ * they do (largest is 0x8e07).
++ */
++static bool ibcap;
++module_param(ibcap, bool, 0644);
++
++MODULE_PARM_DESC(ibcap, "capture render-backend registers via CP_REG_TO_MEM (debug)");
++
++static const struct {
++	u32 reg;
++	const char *name;
++} ibcap_regs[] = {
++	{ REG_A6XX_GRAS_2D_DST_TL,			"GRAS_2D_DST_TL" },
++	{ REG_A6XX_GRAS_2D_DST_BR,			"GRAS_2D_DST_BR" },
++	{ REG_A6XX_RB_ADDR_MODE_CNTL,			"RB_ADDR_MODE_CNTL" },
++	{ REG_A6XX_RB_CCU_CNTL,				"RB_CCU_CNTL" },
++	{ REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED,	"PERFCTR_GPU_BUSY" },
++	{ REG_A6XX_RBBM_STATUS,				"RBBM_STATUS" },
++	{ REG_A6XX_RBBM_INT_0_STATUS,			"INT_0_STATUS" },
++	{ REG_A6XX_CP_RB_CNTL,				"CP_RB_CNTL" },
++	{ REG_A6XX_SP_FS_CTRL_REG0,			"SP_FS_CTRL_REG0" },
++};
++
++static uint64_t ibcap_iova;
++static unsigned int ibcap_len;
++
++/*
++ * IMAGE 266 -- THE CAPTURE USES THE EXISTING MEMPTRS BUFFER. NO ALLOCATION.
++ *
++ * Three attempts, and the failure modes are worth keeping together:
++ *
++ *   264  allocated a BO lazily inside a6xx_submit(). Deadlock: the call took
++ *        the GEM locks while struct_mutex and the GPU lock were held. The
++ *        kernel thread stayed stuck holding struct_mutex, so every reader of
++ *        a6xx_gpu_cpstate blocked forever -- which LOOKED like a frozen phone
++ *        but was not one; ssh and dmesg kept working throughout.
++ *   265  allocated at init from inside hw_init. Also a deadlock: the
++ *        a6xx-load thread sat in D state inside msm_gem_new_impl. Upstream
++ *        escapes this by calling a6xx_ucode_load() from msm_gpu_init(),
++ *        before hw_init; this CAF tree calls a6xx_ucode_init() from inside
++ *        hw_init, where the GEM lock conflicts.
++ *   266  allocate nothing at all. The capture lives in the TAIL of the memptrs
++ *        buffer, which is allocated in adreno_gpu_init() -- the ordinary DRM
++ *        init path that already works. See ADRENO_IBCAP_OFF/_LEN in
++ *        adreno_gpu.h.
++ *
++ * ibcap_iova is therefore derived from memptrs_iova at emit time. There is no
++ * allocation on any GPU path, so the deadlock class is structurally gone.
++ */
++static void a6xx_ibcap_emit(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	unsigned int i;
++	u64 base, off = 0;
++
++	if (!ibcap || !adreno_gpu->memptrs_iova)
++		return;
++
++	base = adreno_gpu->memptrs_iova + ADRENO_IBCAP_OFF;
++	ibcap_iova = base;
++
++	for (i = 0; i < ARRAY_SIZE(ibcap_regs); i++) {
++		if (off + 8 > ADRENO_IBCAP_LEN)
++			break;
++		OUT_PKT7(ring, CP_REG_TO_MEM, 3);
++		OUT_RING(ring, CP_REG_TO_MEM_0_REG(ibcap_regs[i].reg) |
++			      CP_REG_TO_MEM_0_CNT(2) | CP_REG_TO_MEM_0_64B);
++		OUT_RING(ring, lower_32_bits(base + off));
++		OUT_RING(ring, upper_32_bits(base + off));
++		off += 8;		/* CNT(2) => 2 dwords */
++	}
++
++	ibcap_len = off;
++}
++
++static void a6xx_ibcap_report(struct msm_gpu *gpu, unsigned int seqno)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	u32 *p;
++	unsigned int i;
++
++	if (!ibcap || !ibcap_len || !adreno_gpu->memptrs)
++		return;
++
++	p = msm_gem_get_vaddr(adreno_gpu->memptrs_bo);
++	if (IS_ERR(p)) {
++		msm_gem_put_vaddr(adreno_gpu->memptrs_bo);
++		return;
++	}
++
++	pr_info("IBCAP[seq=%u] === CP-view register capture, %u regs ===\n",
++		seqno, ARRAY_SIZE(ibcap_regs));
++	for (i = 0; i < ARRAY_SIZE(ibcap_regs); i++)
++		pr_info("IBCAP[seq=%u] %-20s = 0x%08x  0x%08x\n",
++			seqno, ibcap_regs[i].name,
++			p[ADRENO_IBCAP_OFF / 4 + i * 2],
++			p[ADRENO_IBCAP_OFF / 4 + i * 2 + 1]);
++
++	msm_gem_put_vaddr(adreno_gpu->memptrs_bo);
++}
++
++/*
++ * IMAGE 243 -- a640 bring-up parity with CAF and mainline.
++ *
++ * NOTE the default of a640_gbif_halt is FALSE on purpose. At the corrected
++ * address (0x3c45) writing GBIF_HALT=0 / RBBM_GBIF_HALT=0 wedges the AXI bus
++ * and freezes the machine on the first GPU trigger -- confirmed by runtime
++ * A/B on image 243-v2: a640_gbif_halt=1 froze the system, a640_gbif_halt=0
++ * brought the GPU up cleanly on the same image. Images 231/232 saw the same
++ * thing but their define was 0xf114 (4x-inflated, unmapped), so the write was
++ * a no-op and the "GBIF does not answer" conclusion was reached for the wrong
++ * reason. Both references do clear it, so this is CAF/mainline divergence we
++ * cannot adopt on this hardware.
++ */
++static bool a640_roq2 = true;
++module_param(a640_roq2, bool, 0644);
++MODULE_PARM_DESC(a640_roq2, "a640: CP_ROQ_THRESHOLDS_2=0x02000140 (CAF+mainline a640 value); tree was using the a630 value 0x010000c0");
++
++static bool a640_gbif_halt;
++module_param(a640_gbif_halt, bool, 0644);
++MODULE_PARM_DESC(a640_gbif_halt, "a640: clear GBIF_HALT/RBBM_GBIF_HALT at hw_init. DEFAULT OFF - at the corrected address this write wedges the AXI bus and freezes the machine on GPU trigger (A/B verified on image 243-v2)");
++
++static bool a640_gmu_cgc = true;
++module_param(a640_gmu_cgc, bool, 0644);
++MODULE_PARM_DESC(a640_gmu_cgc, "a640: write GMU AO_CGC_MODE/DELAY/HYST + CX_GMU_WFI_CONFIG in a6xx_set_hwcg (CAF __get_gmu_ao_cgc_* / __get_gmu_wfi_config; mainline a6xx_set_hwcg). Had no writer before");
++
++static bool a640_qsb = true;
++module_param(a640_qsb, bool, 0644);
++MODULE_PARM_DESC(a640_qsb, "a640: also program GBIF_QSB_SIDE0..3=0x00071620. DEFAULT ON per CAF a640_gbif[] (adreno_a6xx.c:48-54) - image 243 turned this off on mainline's a610-only scoping, which was the wrong reference");
++
++static bool a640_rbbm_nc = true;
++module_param(a640_rbbm_nc, bool, 0644);
++MODULE_PARM_DESC(a640_rbbm_nc, "a640: write RBBM_NC_MODE_CNTL=1 (macrotile mode; mainline from DT ubwc-mode=3 + highest-bank-bit=15)");
++
++/* IMAGE 281: use CAF's 49-entry a640 hwcg table instead of the project's 46-entry one. */
++static bool hwcg_caf = true;
++module_param(hwcg_caf, bool, 0444);
++MODULE_PARM_DESC(hwcg_caf, "1=use CAF's a640 hwcg table verbatim (49 entries, image 281), 0=the previous 46-entry table");
++
++static bool a640_hwcg_a640 = true;
++module_param(a640_hwcg_a640, bool, 0644);
++MODULE_PARM_DESC(a640_hwcg_a640, "a640: use CAF's per-chip a640_hwcg table (46 entries, incl. the TEX_FCHE clock gate) instead of the a630 table (105 entries). Set 0 to fall back to the old table at runtime");
++
++;
++
++/*
++ * IMAGE 241 -- runtime-triggered LLCC SCID programming (default off).
++ *
++ * The image-240 inline version hung bring-up writing a wrong address, so the
++ * write now happens only when explicitly requested AFTER bring-up: a bad
++ * address can wedge the triggering shell at worst, never the GPU. (The
++ * device survived the 240 hang with ssh/ping alive, so this is proven safe
++ * to attempt.)
++ *
++ * Steps are printed individually so a hang identifies the exact call:
++ *   1. llcc_slice_getd (CPU DT lookup; bounded)
++ *   2. llcc_slice_activate (bounded poll, ~0 jiffies at HZ>=100... returns
++ *      -ETIMEDOUT quickly if the slice never signals)
++ *   3. gpu_write(REG_A6XX_GBIF_SCACHE_CNTL1 = 0x3c02, replicated SCID).
++ *      WRITE ONLY, no readback (image 231: GBIF reads wedge).
++ *
++ * Correct address provenance: canonical Mesa/CAF dword index 0x3c02
++ * (mesa a6xx.xml, CAF a6xx_reg.h:849). Our header previously had no such
++ * define; image 240 used 0xF008 (= 0x3c02 * 4, byte 0x3C020, unmapped).
++ */
++static struct msm_gpu *rbobs_gpu_stash;
++
++static int llcc_scid_set(const char *val, const struct kernel_param *kp)
++{
++	struct llcc_slice_desc *slice;
++	int scid, i, ret;
++	u32 scid_val = 0;
++	struct msm_gpu *gpu = rbobs_gpu_stash;
++
++	ret = param_set_bool(val, kp);
++	if (ret)
++		return ret;
++
++	if (!gpu) {
++		pr_info("LLCCSCID: no GPU stashed yet (bring-up has not run)\n");
++		return 0;
++	}
++
++	pr_info("LLCCSCID: step 1 getd\n");
++	slice = llcc_slice_getd(&gpu->pdev->dev, "gpu");
++	if (IS_ERR(slice)) {
++		pr_info("LLCCSCID: getd failed %ld\n", PTR_ERR(slice));
++		return 0;
++	}
++
++	pr_info("LLCCSCID: step 2 activate\n");
++	ret = llcc_slice_activate(slice);
++	pr_info("LLCCSCID: activate ret=%d\n", ret);
++	if (ret)
++		return 0;
++
++	pr_info("LLCCSCID: step 3 write\n");
++	scid = llcc_get_slice_id(slice);
++	for (i = 0; i < 5; i++)
++		scid_val |= ((u32)(scid & 0x1f) << (i * 5));
++	gpu_write(gpu, REG_A6XX_GBIF_SCACHE_CNTL1, scid_val);
++	pr_info("LLCCSCID: scid=%d cntl1=0x%08x written (no readback)\n",
++		scid, scid_val);
++	return 0;
++}
++
++static bool llcc_scid;
++static const struct kernel_param_ops param_ops_llcc_scid = {
++	.set = llcc_scid_set,
++	.get = param_get_bool,
++};
++module_param_cb(llcc_scid, &param_ops_llcc_scid, &llcc_scid, 0644);
++MODULE_PARM_DESC(llcc_scid, "program LLCC SCID on demand (debug, default off)");
++
++/*
++ * IMAGE 239 -- backend observer v2 (replaces the image 238 delayed sampler).
++ *
++ * Why v1 failed: it sampled RBBM_STATUS 5x starting 10 ms after the kick.
++ * A 64x64 clear executes in microseconds, so all five samples showed the
++ * all-idle 0x1. Combined with zero pixels that is two indistinguishable
++ * states: "executed and wrote nothing" vs "never executed". The sampler
++ * could only ever catch idle, so it proved nothing.
++ *
++ * v2 polls STATUS in a tight loop starting immediately after the kick and
++ * stops when the GPU echoes the fence (or after a bounded iteration cap),
++ * keeping a STICKY bitmask of every bit seen. The fence echo is the GPU's
++ * own completion signal, so the window exactly covers execution:
++ *
++ *   RB ever set     -> backend received the work (addressing/format fork;
++ *                      LLCC/SCID is next)
++ *   RB never, CP/SP -> backend never engaged (dispatch fork; CP_ME_INIT /
++ *                      GMU AO CGC are next)
++ *   nothing ever    -> the submit never reached the GPU
++ *
++ * Blocking the ioctl path is safe here: the loop is bounded by the cap
++ * regardless of the fence, the fence is known to retire (no hang since
++ * image 234), and a6xx_submit runs in process context. cpu_relax() between
++ * MMIO reads. memptrs->fence is already CPU-polled elsewhere in-tree
++ * (hangcheck_handler via last_fence()), so no new coherency assumption.
++ */
++static void rbobs_poll(struct msm_gpu *gpu, struct msm_ringbuffer *ring,
++		unsigned int seqno)
++{
++	u32 seen = 0;
++	int i;
++
++	for (i = 0; i < 20000; i++) {
++		u32 st = gpu_read(gpu, REG_A6XX_RBBM_STATUS);
++
++		seen |= st;
++		if (ring->memptrs && ring->memptrs->fence >= seqno)
++			break;
++		cpu_relax();
++	}
++
++	pr_info("RBOBS2[seq=%u] iters=%d fence=%u STATUS_seen=0x%08x RB=%d SP=%d HLSQ=%d VPC=%d UCHE=%d CCU=%d CP=%d PC_DCALL=%d\n",
++		seqno, i,
++		ring->memptrs ? ring->memptrs->fence : 0xffffffff, seen,
++		!!(seen & A6XX_RBBM_STATUS_RB_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_SP_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_HLSQ_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_VPC_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_UCHE_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_CCU_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_CP_BUSY),
++		!!(seen & A6XX_RBBM_STATUS_PC_DCALL_BUSY));
++}
++
++/* IMAGE 250: tag written by the kernel into each submitted BO so userspace can
++ * tell whether the kernel's own mapping aliases the one userspace writes. */
++#define A6XX_BOS_ALIAS_TAG 0x5C5C5C5Cu
++
++/*
++ * IMAGE 272 -- POINTER MAP.
++ *
++ * IMAGE 271 established that the image-260 DANGLING IOVA scan is broken in
++ * two ways, and the resolver proved the first of them:
++ *
++ *   1. it used EXACT IOVA equality instead of containment, so every interior
++ *      pointer into a submitted buffer was reported as "dangling".  Measured:
++ *      0x700027000 -> offset 0x1000 inside the submitted 20480-byte BO;
++ *      0x700021010 -> offset 0x10 inside the submitted 4096-byte BO.
++ *      None of them was an unmapped address.
++ *   2. it only reported addresses that were NOT in the submitted set, so it
++ *      was completely silent about the pointers that DO resolve -- and that
++ *      is where the answer is.
++ *
++ * This function therefore maps EVERY pointer: for an aperture-range 64-bit
++ * value it finds the BO that contains it and prints the BO's identity --
++ * above all its mmoff, which is the DRM fake offset of the BO's mmap and
++ * therefore directly comparable with the file offset the userspace
++ * vmascan8.py reports for a /dev/dri mapping.  That is the join between the
++ * kernel's view and the userspace's view of the same buffer.
++ *
++ * The three answers this can give, and what each means:
++ *
++ *   -> BO mmoff=0x102179000   the pointer lands in the shader ISA buffer
++ *                             (userspace shows the magic constant inside it)
++ *   -> NO BO OWNS THIS IOVA  the program is not carried by the submission
++ *   -> BO mmoff=0x102189000   the pointer lands in the all-zero buffer
++ *
++ * Measurement only.  Touches no submit path, no register, no allocation.
++ */
++#define A6XX_PTRMAP_MAX 512
++
++/*
++ * Find the BO whose VMA contains the IOVA, in one list of BO objects.
++ * Returns true and fills the outputs on a hit.
++ */
++static bool a6xx_find_bo_for_iova(struct list_head *list, uint64_t iova,
++		struct msm_gem_object **out_obj, uint64_t *out_base,
++		uint64_t *out_size)
++{
++	struct msm_gem_object *msm_obj;
++	struct msm_gem_vma *vma;
++
++	list_for_each_entry(msm_obj, list, mm_list) {
++		list_for_each_entry(vma, &msm_obj->vmas, list) {
++			uint64_t vsize = (uint64_t)vma->node.size << PAGE_SHIFT;
++
++			/*
++			 * A vma with no size in the drm_mm is one created
++			 * without an allocation (e.g. the physaddr path);
++			 * fall back to the object's size so the range check
++			 * still means something.
++			 */
++			if (!vsize)
++				vsize = msm_obj->base.size;
++
++			if (iova >= vma->iova && iova < vma->iova + vsize) {
++				*out_obj = msm_obj;
++				*out_base = vma->iova;
++				*out_size = vsize;
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++static void a6xx_map_pointer(struct msm_gpu *gpu, uint64_t iova,
++		unsigned int seqno, unsigned int bo_idx, unsigned int dword,
++		unsigned int *count)
++{
++	struct msm_drm_private *priv = gpu->dev->dev_private;
++	struct msm_gem_object *msm_obj = NULL;
++	uint64_t base = 0, size = 0;
++	uint64_t best_iova = 0, best_size = 0;
++	struct msm_gem_object *bobj;
++	struct msm_gem_vma *vma;
++	bool found;
++
++	(*count)++;
++
++	/*
++	 * Enumerate every BO the DRM knows about, and find the one whose VMA
++	 * covers the IOVA.
++	 *
++	 * TWO lists, both linked through msm_gem_object::mm_list:
++	 *   gpu->active_list    -- BOs currently resident on the GPU
++	 *   priv->inactive_list -- BOs not currently on the GPU
++	 * (msm_gem_move_to_active() / msm_gem_move_to_inactive(), msm_gem.c)
++	 *
++	 * DO NOT use aspace->active_list here.  On this tree:
++	 *   - msm_gem_address_space_create() -- the constructor the GPU
++	 *     address space actually uses (msm_gpu_aspace_new() calls it) --
++	 *     does NOT INIT_LIST_HEAD(&aspace->active_list), and
++	 *   - msm_iommu_aspace_ops has no .add_to_active, so
++	 *     msm_gem_add_obj_to_aspace_active_list() is a no-op.
++	 * The list is therefore {NULL,NULL} and walking it oopses the kernel
++	 * at container_of(NULL, msm_gem_object, iova_list).  That is exactly
++	 * what image 271 did, and it cost an oops.  The missing
++	 * INIT_LIST_HEAD is a latent tree bug; it is recorded, not fixed
++	 * here, so that this image changes one thing only.
++	 *
++	 * Locking: the BO lists are protected by dev->struct_mutex, which the
++	 * submit path already holds (msm_gem_move_to_inactive() asserts it).
++	 * aspace->list_lock is likewise never mutex_init'd on this path, so it
++	 * must not be taken.
++	 */
++	found = a6xx_find_bo_for_iova(&gpu->active_list, iova, &msm_obj,
++			&base, &size);
++	if (!found)
++		found = a6xx_find_bo_for_iova(&priv->inactive_list, iova,
++				&msm_obj, &base, &size);
++
++	if (found) {
++		pr_info("PTRMAP[seq=%u] bo[%u] dword %u -> iova 0x%llx -> BO mmoff=0x%llx base=0x%llx size=0x%llx objsz=%zu boflags=0x%x name='%s' off=0x%llx\n",
++			seqno, bo_idx, dword,
++			(unsigned long long)iova,
++			(unsigned long long)msm_gem_mmap_offset(&msm_obj->base),
++			(unsigned long long)base,
++			(unsigned long long)size,
++			msm_obj->base.size,
++			msm_obj->flags,
++			msm_obj->name,
++			(unsigned long long)(iova - base));
++		return;
++	}
++
++	/* No owner: report the nearest lower VMA, which is often the
++	 * buffer the pointer was *meant* to be relative to. */
++	list_for_each_entry(bobj, &gpu->active_list, mm_list) {
++		list_for_each_entry(vma, &bobj->vmas, list) {
++			uint64_t vsize = (uint64_t)vma->node.size << PAGE_SHIFT;
++
++			if (!vsize)
++				vsize = bobj->base.size;
++			if (vma->iova <= iova && vma->iova >= best_iova) {
++				best_iova = vma->iova;
++				best_size = vsize;
++			}
++		}
++	}
++
++	pr_info("PTRMAP[seq=%u] bo[%u] dword %u -> iova 0x%llx -> NO BO OWNS THIS IOVA (nearest lower vma iova=0x%llx size=0x%llx)\n",
++		seqno, bo_idx, dword,
++		(unsigned long long)iova,
++		(unsigned long long)best_iova,
++		(unsigned long long)best_size);
++}
++
++static void a6xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit,
++	struct msm_file_private *ctx)
++{
++	struct msm_drm_private *priv = gpu->dev->dev_private;
++	/* a6xx in v4.19 submits exclusively on ring 0 */
++	struct msm_ringbuffer *ring = gpu->rb[0];
++	unsigned int i;
++
++	/*
++	 * TEMPORARY image 220 -- MEASUREMENT ONLY.
++	 *
++	 * Images 217/218/219 chased the render commands through cmd[] and got
++	 * nowhere, for a reason worth recording precisely:
++	 *
++	 *  - 217 dumped the RING only. The commands live in an indirect
++	 *    buffer the ring merely points at.
++	 *  - 218 dumped cmd[] and found exactly ONE buffer per submit
++	 *    (346/332/223 dwords). But that stream itself contains nested
++	 *    CP_INDIRECT_BUFFER references to iova 0x2c000 (77 dwords),
++	 *    0x2d000 (18) and 0x2d050 (19).
++	 *  - 219 added a dump for MSM_SUBMIT_CMD_IB_TARGET_BUF and captured
++	 *    NOTHING, because nr_cmds == 1: there are no IB_TARGET_BUF cmd
++	 *    entries at all.
++	 *
++	 * The reason is that a nested IB target is not a cmd entry. It is a
++	 * RELOC: fd_ringbuffer_emit_reloc_ring_full() records the target in
++	 * submit->bos[] and patches the address into the IB packet. So the
++	 * real clear/render commands live in submit->bos[], which nothing has
++	 * ever dumped.
++	 *
++	 * So: walk bos[] directly. Each entry has {flags, obj, iova}; the
++	 * nested IB targets are identifiable by having a GPU-visible iova.
++	 * Dump contents only for small objects (<= BSKIP dwords) so we do not
++	 * flood the log with the render target or staging buffers.
++	 */
++	if (ibdump) {
++		unsigned int b;
++		unsigned int gather_nr;
++		uint64_t gather_iova[64];	/* IMAGE 260 */
++
++		/*
++		 * IMAGE 260 -- DANGLING IOVA SCAN.
++		 *
++		 * Established (images 258-259 + vmascan2.py): the VS, the binning
++		 * VS and the FS ISA buffers are all compiled, uploaded and
++		 * verifiably resident in the Mesa process -- a magic constant baked
++		 * into each shader is found in shared /dev/dri mappings as real
++		 * a6xx ISA -- and NONE of them appears in this submission's bos[].
++		 *
++		 * freedreno only puts a BO in bos[] via fd_submit_append_bo(),
++		 * which is reached solely from the OUT_RELOC path:
++		 *
++		 *   freedreno_ringbuffer_sp_reloc.h:107
++		 *       for (i = 0; i < nr_reloc_bos; i++)
++		 *               fd_submit_append_bo(fd_submit, ...);
++		 *   msm_ringbuffer_sp.c:141
++		 *       req.nr_bos = fd_submit->nr_bos;
++		 *
++		 * So a missing BO means OUT_RELOC was never called for it, i.e.
++		 * the shader state was never emitted.
++		 *
++		 * The decisive question this answers: does the command stream
++		 * nevertheless CONTAIN an address for the shader? If the stream
++		 * carries an IOVA that no submitted BO provides, the GPU is being
++		 * pointed at memory the submission never maps -- a dangling
++		 * reference, and a complete explanation for a shader domain that
++		 * retires cleanly while executing nothing.
++		 *
++		 * Gather the submitted IOVA set first (cheap, no vmap), then flag
++		 * any aperture-range value in any dumped buffer that is not in it.
++		 * Layout-independent, unlike decoding CP_LOAD_STATE6 -- guessed
++		 * wrong twice already.
++		 */
++		gather_nr = 0;
++		for (b = 0; b < submit->nr_bos && gather_nr < ARRAY_SIZE(gather_iova);
++		     b++)
++			gather_iova[gather_nr++] = submit->bos[b].iova;
++		pr_info("BOS[seq=%u] iova-set gathered: %u of %u bos\n",
++			submit->seqno, gather_nr, submit->nr_bos);
++
++		pr_info("BOS[seq=%u] nr_bos=%u nr_cmds=%u\n",
++			submit->seqno, submit->nr_bos, submit->nr_cmds);
++
++		for (b = 0; b < submit->nr_bos; b++) {
++			struct msm_gem_object *bo = submit->bos[b].obj;
++			void *vaddr;
++			unsigned int ndw;
++
++			/*
++			 * IMAGE 258 -- PRINT THE RIGHT FLAGS.
++			 *
++			 * This used to print submit->bos[b].flags, which is
++			 * internal CAF submit bookkeeping (BO_VALID | BO_LOCKED
++			 * | BO_PINNED | MSM_SUBMIT_BO_WRITE) decoded from the
++			 * legacy msm_submit_rel interface -- NOT the BO's cache
++			 * mode. Observed values like 0x6003 look like a cachiness
++			 * but are not one, which is how every earlier attempt to
++			 * correlate cache mode with buffer content was reading the
++			 * wrong field and concluding "flipping WC changed
++			 * nothing".
++			 *
++			 * bo->flags is the real thing: MSM_BO_CACHE_MASK covers
++			 * 0xf0000, with MSM_BO_CACHED 0x10000, MSM_BO_WC
++			 * 0x20000, MSM_BO_UNCACHED 0x40000. This tree predates
++			 * struct drm_msm_gem_bo, which does not exist anywhere in
++			 * it, so msm_obj->flags is the only cache-mode source.
++			 *
++			 * Also print the name, which freedreno supplies at BO
++			 * creation ("fs:...", "vs:...", "pvtmem_per_fiber",
++			 * "cmdstream", "gmem:..."), so buffer identity no longer
++			 * has to be inferred from size.
++			 *
++			 * IMAGE 259 -- ALSO PRINT THE MMAP OFFSET.
++			 *
++			 * vmascan.py proved the shader ISA *is* materialised in the
++			 * Mesa process: a magic constant baked into the fragment
++			 * shader is found in a 4096-byte shared mapping on /dev/dri/
++			 * at DRM fake offset 0x10217e000, as genuine a6xx ISA whose
++			 * instruction count matches Mesa's own
++			 * "5 instr ... 32 dwords". So the upload lands. What we
++			 * cannot yet do is tell whether the buffer userspace filled
++			 * is the buffer the kernel submits: this line printed only
++			 * the IOVA, never the mmap offset, so the two views could not
++			 * be reconciled at all.
++			 *
++			 * With mmoff printed, match the ISA mapping's offset against
++			 * the submitted buffers:
++			 *   - offset present in bos[] -> identity confirmed, and the
++			 *     kernel reading zeros there would contradict the proven
++			 *     128-byte round-trip, i.e. page detachment.
++			 *   - offset absent -> the shader BO is never submitted, and
++			 *     the draw references a buffer the submission does not
++			 *     carry. One specific defect, and it also explains why the
++			 *     "empty ISA" has been permanent.
++			 */
++			if (!bo) {
++				pr_info("BOS[seq=%u] bo[%u] iova=0x%llx sflags=0x%x bo=NULL\n",
++					submit->seqno, b,
++					(unsigned long long)submit->bos[b].iova,
++					submit->bos[b].flags);
++				continue;
++			}
++
++			pr_info("BOS[seq=%u] bo[%u] iova=0x%llx mmoff=0x%llx sflags=0x%x boflags=0x%x sz=%zu name='%s' bo=%px\n",
++				submit->seqno, b,
++				(unsigned long long)submit->bos[b].iova,
++				(unsigned long long)msm_gem_mmap_offset(&bo->base),
++				submit->bos[b].flags, bo->flags, bo->base.size,
++				bo->name, (void *)bo);
++
++			ndw = bo->base.size / 4;
++
++			/* only the small command-stream buffers */
++			/*
++			 * TEMPORARY image 221 -- RAISED DUMP CAP.
++			 *
++			 * Image 220's cap of 1024 dwords (= 4096 bytes = 0x1000)
++			 * turned out to be exactly the size of a UBWC metadata
++			 * plane. For a 64x64 UBWC RGBA8 render target the layout
++			 * is 0x4000 colour + 0x1000 metadata, and the colour
++			 * plane begins at offset 0x1000 -- i.e. precisely where
++			 * the old cap stopped. We had been dumping the metadata
++			 * plane and not one byte of colour data, so the
++			 * "render target is all zeros" conclusion was measuring
++			 * the wrong region entirely.
++			 *
++			 * 8192 dwords = 32 KiB comfortably covers a 0x5000-byte
++			 * UBWC buffer including both planes, and a linear 0x4000.
++			 */
++			if (ndw == 0 || ndw > 8192)
++				continue;
++
++			vaddr = msm_gem_get_vaddr(&bo->base);
++			if (IS_ERR(vaddr)) {
++				pr_info("BOS[seq=%u] bo[%u] vmap failed err=%ld\n",
++					submit->seqno, b, PTR_ERR(vaddr));
++				continue;
++			}
++
++			pr_info("BOS[seq=%u] bo[%u] ndwords=%u\n",
++				submit->seqno, b, ndw);
++
++			/*
++			 * IMAGE 272 -- POINTER MAP.
++			 *
++			 * The image-260 DANGLING scan is replaced, not extended.
++			 * Image 271's resolver proved it was reporting interior
++			 * pointers into submitted buffers as unmapped (it used exact
++			 * IOVA equality rather than containment), and it only ever
++			 * reported the addresses that did NOT resolve -- saying
++			 * nothing about the ones that do, which is where the answer
++			 * is.
++			 *
++			 * So: map every pointer.  For each 64-bit value in the
++			 * aperture range, print which buffer it lands in, by
++			 * containment, with the offset within that buffer.  The
++			 * mmoff printed is the DRM fake offset of the owning BO's
++			 * mmap, which is exactly the file offset the userspace
++			 * vmascan8.py reports -- so the kernel's and the userspace's
++			 * views of the same buffer can finally be compared.
++			 *
++			 * Alignment: scanned at EVERY dword boundary, not just even
++			 * ones, because a pointer need not be even-aligned.  The
++			 * aperture range makes false positives essentially
++			 * impossible: the high half of any pointer in this aperture
++			 * is exactly 0x00000007, so only dwords equal to 7 can
++			 * produce a hit.
++			 */
++			{
++				uint32_t *sc = vaddr;
++				unsigned int j, nptr = 0;
++
++				for (j = 1; j < ndw; j++) {
++					uint64_t v = ((uint64_t)sc[j] << 32) | sc[j - 1];
++
++					if (v < 0x700000000ULL || v > 0x800000000ULL)
++						continue;
++					a6xx_map_pointer(gpu, v, submit->seqno, b, j - 1,
++						&nptr);
++					if (nptr >= A6XX_PTRMAP_MAX)
++						break;
++				}
++				if (nptr)
++					pr_info("BOS[seq=%u] bo[%u] PTRMAP: %u pointer(s) mapped\n",
++						submit->seqno, b, nptr);
++			}
++
++			{
++				uint32_t *p = vaddr;
++				unsigned int j;
++
++				for (j = 0; j < ndw; j++)
++					pr_info("BOS[seq=%u] bo[%u] [%03u] = 0x%08x\n",
++						submit->seqno, b, j, p[j]);
++			}
++
++			/*
++			 * IMAGE 250 -- ALIASING PROBE.
++			 *
++			 * Every "this buffer is all zeros" result in this project
++			 * came from msm_gem_get_vaddr(), which vmaps the object with
++			 * pgprot_writecombine. But two INDEPENDENT userspace
++			 * glMapBufferRange() calls on the same buffer (two views of
++			 * the same BO) agree with each other and DISAGREE with this
++			 * reader -- a pattern written through one userspace mapping is
++			 * visible through the other, yet reads as zero here.
++			 *
++			 * Settling it from userspace is unreliable (freedreno
++			 * invalidates and re-uploads buffers after use; a
++			 * PIPE_MAP_READ may be a GPU blit to staging rather than a
++			 * CPU read; GL_MAP_PERSISTENT may simply fail). So do it
++			 * here, in the kernel, where none of those apply.
++			 *
++			 * IMAGE 251 -- compare PHYSICAL addresses:
++			 *
++			 *   vpage = virt_to_phys(vaddr)          -- what this reader
++			 *            sees, and therefore what it is reporting on
++			 *   spage = sg_phys(sgt->sgl, 0)         -- what the GPU is
++			 *            actually given
++			 *
++			 *   equal     -> the mapping aliases, and the zeros are a
++			 *                region/offset problem instead
++			 *   different -> this reader is a different memory, and every
++			 *                kernel-side content read is invalid
++			 *
++			 * Note DRM's own rule for a non-coherent GPU: "backing pages
++			 * for an object are flushed to memory and marked write
++			 * combined so as to be coherent with the GPU" -- which is why
++			 * the WC mapping exists, and why an address mismatch is the
++			 * only remaining explanation.
++			 */
++			{
++				uint32_t *p = vaddr;
++				unsigned int j;
++				unsigned long vpage;
++				unsigned long spage = 0;
++				bool have_sgt = false;
++
++				/*
++				 * IMAGE 254 -- the 0x5C5C5C5C tag write is GONE.
++				 *
++				 * Images 250-253 wrote a tag into the first 16 dwords of
++				 * every submitted BO to prove the kernel's mapping
++				 * aliases userspace's. It did prove that (6/6 identical
++				 * content via the in-kernel SGT mapping in image 253), but
++				 * it also overwrote real buffer data, and every
++				 * measurement taken while it was live was corrupted --
++				 * BOs came back with exactly 16 nonzero dwords, which was
++				 * the tag, not the buffer. A diagnostic that modifies what
++				 * it measures is worse than none.
++				 *
++				 * The BOSXCHK cross-check below proves the same thing
++				 * without writing anything, so the tag is no longer needed.
++				 */
++
++				vpage = virt_to_phys(vaddr);
++				if (bo->sgt && bo->sgt->sgl) {
++					spage = (unsigned long)sg_phys(bo->sgt->sgl);
++					have_sgt = true;
++				}
++				/*
++				 * IMAGE 254 -- vpage is NOT trustworthy.
++				 *
++				 * vmap() returns a vmalloc-range address and
++				 * virt_to_phys() is invalid there on arm64, so this
++				 * number is meaningless and must not be compared with
++				 * sgt_phys. Image 253 proved that conclusively: the
++				 * content cross-check below shows the two mappings hold
++				 * IDENTICAL data for every BO, while this comparison
++				 * reported 6/6 MISMATCH. The probe was wrong, not the
++				 * driver.
++				 *
++				 * Printed for the record only, no verdict.
++				 */
++				pr_info("BOSPHYS[seq=%u] bo[%u] obj=%px size=%zu sgt_nents=%u flags=0x%x madv=%u vaddr=%px (vpage 0x%lx UNRELIABLE, sgt_phys 0x%lx)\n",
++					submit->seqno, b, (void *)&bo->base,
++					bo->base.size,
++					bo->sgt ? bo->sgt->nents : 0,
++					bo->flags, bo->madv, vaddr, vpage, spage);
++
++				/*
++				 * IMAGE 253/254 -- CONTENT cross-check, now READ-ONLY.
++				 *
++				 * Builds a second mapping directly from bo->sgt->sgl --
++				 * the very pages the GPU is handed -- and compares its
++				 * contents against the msm_gem_get_vaddr() view. This is
++				 * the only trustworthy aliasing check we have: image 253
++				 * showed 6/6 IDENTICAL CONTENT, which means the BOS[]
++				 * dump has been reading real buffer memory all along.
++				 *
++				 * Crucially this WRITES NOTHING. Image 253 also had a tag
++				 * write (0x5C5C5C5C into the first 16 dwords of every
++				 * submitted BO) which was needed to prove aliasing via
++				 * userspace. That tag corrupted every subsequent content
++				 * measurement -- BOs came back showing exactly 16 nonzero
++				 * dwords, which was the tag, not data. Now that the
++				 * cross-check is in-kernel and needs no tag, the write is
++				 * gone and the dump reports the buffer as it really is.
++				 */
++
++				/*
++				 * IMAGE 253/254 -- CONTENT cross-check, READ-ONLY.
++				 *
++				 * Builds a second mapping directly from bo->sgt->sgl --
++				 * the very pages the GPU is handed -- and compares its
++				 * contents against the msm_gem_get_vaddr() view. This is
++				 * the only trustworthy aliasing check we have: image 253
++				 * showed 6/6 IDENTICAL CONTENT, which means the BOS[]
++				 * dump has been reading real buffer memory all along.
++				 *
++				 * WRITES NOTHING. Image 253 also tagged the first 16
++				 * dwords of every submitted BO with 0x5C5C5C5C to prove
++				 * aliasing via userspace; that tag corrupted every
++				 * later measurement (BOs came back with exactly 16
++				 * nonzero dwords -- the tag, not data). With the check
++				 * in-kernel the write is unnecessary, so it is gone.
++				 */
++				if (have_sgt) {
++					struct page **sp;
++					struct scatterlist *sg = bo->sgt->sgl;
++					unsigned int nents = bo->sgt->nents;
++					unsigned int nwalk = 0;
++
++					if (!nents)
++						goto xchk_done;
++
++					sp = kmalloc_array(nents, sizeof(*sp),
++						GFP_KERNEL);
++					if (!sp)
++						goto xchk_done;
++
++					/* this 4.14 tree has no sg_get_pages(), so
++					 * walk the scatterlist by hand */
++					while (sg && nwalk < nents) {
++						sp[nwalk++] = sg_page(sg);
++						if (sg_is_last(sg))
++							break;
++						sg = sg_next(sg);
++					}
++
++					if (nwalk) {
++						void *v2 = vmap(sp, nwalk,
++							VM_MAP,
++							pgprot_writecombine(PAGE_KERNEL));
++						if (v2) {
++							uint32_t *q = v2;
++							bool same = true;
++
++							for (j = 0; j < 16 && j < ndw; j++)
++								if (q[j] != p[j])
++									same = false;
++
++							pr_info("BOSXCHK[seq=%u] bo[%u] sgt-map=%px sgt-first: %08x %08x %08x %08x | vaddr-map first: %08x %08x %08x %08x => %s\n",
++								submit->seqno, b, v2,
++								q[0], q[1], q[2], q[3],
++								p[0], p[1], p[2], p[3],
++								same ? "IDENTICAL CONTENT"
++								     : "*** DIFFERENT MEMORY ***");
++							vunmap(v2);
++						} else {
++							pr_info("BOSXCHK[seq=%u] bo[%u] sgt vmap failed\n",
++								submit->seqno, b);
++						}
++					}
++					kvfree(sp);
++				}
++xchk_done:
++				;
++			}
++
++			msm_gem_put_vaddr(&bo->base);
++		}
++	}
++
++	/*
++	 * TEMPORARY image 218 -- MEASUREMENT CONTROL.
++	 *
++	 * Image 217 gated every diagnostic on `submit->seqno <= 3`, which was
++	 * correct when the only thing we ran was the first submit. It is now
++	 * actively harmful: after three submits the dump goes silent forever,
++	 * so a later run produces NO output at all and we cannot tell "nothing
++	 * was submitted" from "we stopped printing". That is exactly how image
++	 * 217's 319-dword IB got mistaken for the glClear stream -- it was
++	 * captured from the first run, and every subsequent run was invisible.
++	 *
++	 * A runtime parameter is the right control: default off (zero cost),
++	 * enable only around the run being measured, and disable before any
++	 * reboot so the log cannot flood.
++	 */
++
++	/* Invalidate CCU depth and color */
++	OUT_PKT7(ring, CP_EVENT_WRITE, 1);
++	OUT_RING(ring, PC_CCU_INVALIDATE_DEPTH);
++
++	OUT_PKT7(ring, CP_EVENT_WRITE, 1);
++	OUT_RING(ring, PC_CCU_INVALIDATE_COLOR);
++
++	/*
++	 * IMAGE 270 -- page table prologue (upstream's a6xx_set_pagetable()).
++	 *
++	 * Upstream emits this on every context change and this tree emits it
++	 * nowhere, despite having identified the omission itself in the image-209
++	 * diagnostic comment at a6xx_gpu.c:1598-1601 ("upstream's a6xx_submit()
++	 * emits a prologue we emit nowhere: ... CP_SMMU_TABLE_UPDATE with
++	 * TTBR0+ASID").  The corpus later retired the hypothesis on the premise
++	 * that the packet is "v5.10+ only"; the PM4 spec says otherwise
++	 * (CP_SMMU_TABLE_UPDATE = 0x53, variants="A5XX-") and the vendor KGSL
++	 * driver emits it on this silicon class at adreno_iommu.c:590 with the
++	 * comment "CP switches the pagetable and flushes the Caches".
++	 *
++	 * TTBR0 is the base the shader/interconnect domain translates through.
++	 * Without it, shader-domain stores (RB render stores and SP compute
++	 * stores alike) have no valid translation -- which is exactly the
++	 * observed signature: Mesa's state is live and workload-tracking in the
++	 * registers, no fault is ever raised, the CP still writes DDR
++	 * (memptrs->fence increments), and nothing from any shader reaches
++	 * memory.
++	 *
++	 * Deliberately minimal, unlike upstream: only the packet itself.  The
++	 * CP_MEM_WRITE of TTBR0 to the memstore is upstream's "for debugging /
++	 * preemption" and is skipped because our memptrs layout has no PT_INFO
++	 * slot.  CP_SET_PROTECTED_MODE is likewise skipped -- our tree never
++	 * enables protected mode, so there is nothing to turn off.
++	 *
++	 * This is command-stream generation, not a hardware register write: the
++	 * same OUT_PKT7 mechanism Mesa already uses successfully, and it is
++	 * emitted before the existing cmd loop, leaving that loop untouched.
++	 * If the SMMU cannot supply a page table yet the submit proceeds without
++	 * it -- a missing prologue must never fail a submit.
++	 */
++	{
++		struct msm_mmu *mmu = (gpu->aspace) ? gpu->aspace->mmu : NULL;
++		uint64_t ttbr = 0;
++		int asid = 0;
++
++		if (mmu && mmu->funcs &&
++		    mmu->funcs->get_pagetable_params &&
++		    !mmu->funcs->get_pagetable_params(mmu, &ttbr, &asid)) {
++			/*
++			 * ttbr comes back with the ASID already at bit 48, and the
++			 * packet wants TTBR0_LO = bits[31:0], TTBR0_HI =
++			 * bits[63:32] -- so the two halves are simply the two
++			 * halves.  No shift constant needed, which matters because
++			 * TTBRn_ASID_SHIFT lives in a private IOMMU header.
++			 */
++			OUT_PKT7(ring, CP_SMMU_TABLE_UPDATE, 4);
++			OUT_RING(ring, lower_32_bits(ttbr));
++			OUT_RING(ring, upper_32_bits(ttbr));
++			OUT_RING(ring, 0);	/* CONTEXTIDR */
++			OUT_RING(ring, 0);	/* CONTEXTBANK */
++			pr_info("PTU270[seq=%u] ttbr0=0x%llx asid=%d\n",
++				submit->seqno, (unsigned long long)ttbr, asid);
++		} else {
++			pr_info("PTU270[seq=%u] no pagetable params, prologue skipped\n",
++				submit->seqno);
++		}
++	}
++
++	/* Submit the commands */
++	for (i = 0; i < submit->nr_cmds; i++) {
++		switch (submit->cmd[i].type) {
++		case MSM_SUBMIT_CMD_IB_TARGET_BUF:
++			/*
++			 * TEMPORARY image 219 -- MEASUREMENT ONLY.
++			 *
++			 * Image 218 dumped only CMD_BUF, and only one IB per
++			 * submit came back. But the captured stream contains
++			 * THREE nested CP_INDIRECT_BUFFER references:
++			 *
++			 *   dword 199: iova 0x2c000, 77 dwords
++			 *   dword 304: iova 0x2d000, 18 dwords
++			 *   dword 316: iova 0x2d050, 19 dwords
++			 *
++			 * Those buffers are submitted as IB_TARGET_BUF. Per
++			 * include/uapi/drm/msm_drm.h: "IB_TARGET_BUF - this cmd
++			 * buffer is an IB target. Reloc's are processed
++			 * normally, but the kernel does not setup an IB to this
++			 * buffer in the first-level ringbuffer". So they are
++			 * deliberately NOT emitted as ring references -- and
++			 * image 218's dump skipped them for the very same
++			 * reason, which is why they were invisible.
++			 *
++			 * These are where the actual render commands live: the
++			 * clear (tile_setup) and the draw/prologue buffers are
++			 * all IB targets. So the one buffer we did dump was
++			 * only ever the envelope. This is the same class of
++			 * blind spot as image 218 fixed one level up.
++			 */
++			if (ibdump &&
++			    submit->cmd[i].idx < submit->nr_bos) {
++				struct msm_gem_object *tbo =
++					submit->bos[submit->cmd[i].idx].obj;
++				void *tvaddr;
++
++				pr_info("IBTGT[seq=%u] cmd[%u] iova=0x%llx size=%u bo=%px\n",
++					submit->seqno, i,
++					(unsigned long long)submit->cmd[i].iova,
++					submit->cmd[i].size, (void *)tbo);
++
++				if (!tbo)
++					break;
++
++				tvaddr = msm_gem_get_vaddr(&tbo->base);
++				if (IS_ERR(tvaddr)) {
++					pr_info("IBTGT[seq=%u] cmd[%u] vmap failed err=%ld\n",
++						submit->seqno, i,
++						PTR_ERR(tvaddr));
++					break;
++				}
++
++				{
++					uint32_t *tp = tvaddr;
++					unsigned int tndw =
++						submit->cmd[i].size;
++					unsigned int j;
++
++					if (tndw > tbo->base.size / 4)
++						tndw = tbo->base.size / 4;
++
++					pr_info("IBTGT[seq=%u] cmd[%u] ndwords=%u\n",
++						submit->seqno, i, tndw);
++
++					for (j = 0; j < tndw; j++)
++						pr_info("IBTGT[seq=%u] cmd[%u] [%03u] = 0x%08x\n",
++							submit->seqno, i, j,
++							tp[j]);
++				}
++
++				msm_gem_put_vaddr(&tbo->base);
++			}
++			break;
++		case MSM_SUBMIT_CMD_CTX_RESTORE_BUF:
++			if (priv->lastctx == ctx)
++				break;
++		case MSM_SUBMIT_CMD_BUF:
++			/*
++			 * TEMPORARY image 217 -- MEASUREMENT ONLY.
++			 *
++			 * Every dump we have taken so far (RINGCPU) only shows
++			 * what a6xx_submit() itself writes into the ring. Mesa's
++			 * actual render commands are NOT in the ring: they live
++			 * in this indirect buffer, which the ring references by
++			 * address only. So we have been looking at the envelope
++			 * and never at the letter.
++			 *
++			 * type-7 opcode 0x3f is CP_INDIRECT_BUFFER (not some
++			 * bookkeeping packet), so the [hdr, addr_lo, addr_hi,
++			 * dwords] quad we kept seeing IS a real IB reference.
++			 *
++			 * cmd[i].idx indexes submit->bos[], which holds the GEM
++			 * object backing this cmdstream, so we can map it and
++			 * read the real commands. This is the first measurement
++			 * that can show whether Mesa emitted a clear at all,
++			 * which clear path it took (GMEM RB_BLIT with
++			 * CLEAR_MASK vs bypass CP_BLIT vs nothing), and whether
++			 * the stream is well-formed.
++			 */
++			if (ibdump &&
++			    submit->cmd[i].idx < submit->nr_bos) {
++				struct msm_gem_object *bo =
++					submit->bos[submit->cmd[i].idx].obj;
++				void *vaddr;
++
++				pr_info("IBDUMP[seq=%u] cmd[%u] type=%u size=%u iova=0x%llx bo=%px\n",
++					submit->seqno, i, submit->cmd[i].type,
++					submit->cmd[i].size,
++					(unsigned long long)submit->cmd[i].iova,
++					(void *)bo);
++
++				if (!bo)
++					goto ibdump_done;
++
++				vaddr = msm_gem_get_vaddr(&bo->base);
++				if (IS_ERR(vaddr)) {
++					pr_info("IBDUMP[seq=%u] cmd[%u] vmap failed err=%ld\n",
++						submit->seqno, i,
++						PTR_ERR(vaddr));
++					goto ibdump_done;
++				}
++
++				pr_info("IBDUMP[seq=%u] cmd[%u] vaddr=%px bo_size=%u\n",
++					submit->seqno, i, vaddr, bo->base.size);
++
++				{
++					uint32_t *p = vaddr;
++					unsigned int ndw =
++						submit->cmd[i].size;
++					unsigned int j;
++
++					/* size is in dwords */
++					if (ndw > bo->base.size / 4)
++						ndw = bo->base.size / 4;
++
++					pr_info("IBDUMP[seq=%u] cmd[%u] ndwords=%u\n",
++						submit->seqno, i, ndw);
++
++					for (j = 0; j < ndw; j++)
++						pr_info("IBDUMP[seq=%u] cmd[%u] [%03u] = 0x%08x\n",
++							submit->seqno, i, j, p[j]);
++				}
++
++				msm_gem_put_vaddr(&bo->base);
++			}
++ibdump_done:
++			OUT_PKT7(ring, CP_INDIRECT_BUFFER_PFE, 3);
++			OUT_RING(ring, lower_32_bits(submit->cmd[i].iova));
++			OUT_RING(ring, upper_32_bits(submit->cmd[i].iova));
++			OUT_RING(ring, submit->cmd[i].size);
++			break;
++		}
++	}
++
++	/*
++	 * IMAGE 264 -- capture the render backend's registers AFTER the command
++	 * stream has run, using the CP's own context.  Must sit here, between
++	 * the indirect buffer and CP_SCRATCH(2), so the values are post-render.
++	 */
++	a6xx_ibcap_emit(gpu, ring);
++
++	/* Write the fence to the scratch register */
++	OUT_PKT4(ring, REG_A6XX_CP_SCRATCH_REG(2), 1);
++	OUT_RING(ring, submit->seqno);
++
++	/*
++	 * Execute a CACHE_FLUSH_TS event. This will ensure that the
++	 * timestamp is written to the memory and then triggers the interrupt
++	 */
++	OUT_PKT7(ring, CP_EVENT_WRITE, 4);
++	OUT_RING(ring, CACHE_FLUSH_TS | (1 << 31));
++	OUT_RING(ring, lower_32_bits(rbmemptr(ring, fence)));
++	OUT_RING(ring, upper_32_bits(rbmemptr(ring, fence)));
++	OUT_RING(ring, submit->seqno);
++
++	/*
++	 * TEMPORARY image 209 -- MEASUREMENT ONLY. Changes no behaviour.
++	 *
++	 * Dumps the CPU-side view of what we just wrote, immediately after
++	 * the stream is built and before a6xx_flush() kicks the ring. This is
++	 * the one measurement that discriminates between the two families of
++	 * remaining explanation for "GPU consumes the ring but nothing
++	 * executes" (RPTR chases WPTR, CP_SCRATCH_REG2 = 0, fence stuck 0/1):
++	 *
++	 *   1. If the dwords below are the real packets, the CPU side of the
++	 *      ring is correct and the fault is GPU-side (page table / SMMU
++	 *      translation -- upstream's a6xx_submit() emits a prologue we
++	 *      emit nowhere: CP_SET_PROTECTED_MODE=0, PERFCTR_SRAM_INIT_CMD,
++	 *      and CP_SMMU_TABLE_UPDATE with TTBR0+ASID).
++	 *   2. If they are garbage, zeros or stale, the CPU is not really
++	 *      writing the ring memory the GPU reads, and coherency is live
++	 *      after all.
++	 *
++	 * ring->cur is the offset the GPU is being pointed at; the stream was
++	 * written from ring->start up to ring->next. Only dwords below cur can
++	 * have been written this submit.
++	 *
++	 * TEMPORARY image 213 -- FIX to the image 209/211/212 version of this
++	 * dump. It printed j from cur-16 to cur, i.e. dwords BELOW the commit
++	 * point, which is the PREVIOUS submit's content. On image 212 that
++	 * meant we captured the CP_ME_INIT packet left behind by
++	 * a6xx_cp_init() during bring-up instead of the stream we had just
++	 * written. The window that actually matters is cur .. next, because
++	 * ring->cur is not advanced until a6xx_flush() below.
++	 */
++	if (ibdump) {
++		unsigned int cur = ring->cur - ring->start;
++		unsigned int next = ring->next - ring->start;
++		unsigned int j;
++
++		pr_info("RINGCPU[seq=%u] start=%px cur=%u next=%u size=%u iova=0x%llx ndwords=%u\n",
++			submit->seqno, (void *)ring->start, cur, next,
++			ring->size, (unsigned long long)gpu->rb_iova,
++			next - cur);
++		pr_info("RINGCPU[seq=%u] memptrs=%px memptrs_iova=0x%llx fence=%u rptr=%u\n",
++			submit->seqno, (void *)ring->memptrs,
++			(unsigned long long)ring->memptrs_iova,
++			ring->memptrs ? ring->memptrs->fence : 0xffffffff,
++			ring->memptrs ? ring->memptrs->rptr : 0xffffffff);
++		for (j = cur; j < next && j < ring->size / 4; j++)
++			pr_info("RINGCPU[seq=%u] [%03u] = 0x%08x\n",
++				submit->seqno, j, ring->start[j]);
++	}
++
++	a6xx_flush(gpu, ring);
++
++	/*
++	 * IMAGE 261 -- sample the ring WHILE the submission is in flight, not
++	 * 50 ms after it has finished.  See a6xx_trace_burst() for why every
++	 * other verdict this project drew was a single post-hoc point sample.
++	 */
++	a6xx_trace_burst(gpu, ring, submit->seqno);
++
++	rbobs_poll(gpu, ring, submit->seqno);
++
++	/*
++	 * TEMPORARY image 212 -- MEASUREMENT ONLY. Decode the interrupt the
++	 * submit produced.
++	 *
++	 * This is the single most informative register pair we can read. Until
++	 * now we have only counted IRQs ("one per submit") without knowing
++	 * WHICH bit fired, and that count has been ambiguous between success
++	 * and failure the whole time.
++	 *
++	 *   RBBM_INT_0 bit 20 (0x00100000) = CP_CACHE_FLUSH_TS  -> SUCCESS,
++	 *                                                          the fence
++	 *                                                          write landed
++	 *   RBBM_INT_0 bit 23 (0x00800000) = RBBM_HANG_DETECT   -> a hang report
++	 *   RBBM_INT_0 bit  1 (0x00000002) = CP_AHB_ERROR      -> the CP tried
++	 *                                                          an address it
++	 *                                                          could not
++	 *                                                          translate
++	 *
++	 * CP_INTERRUPT_STATUS then says which flavour of CP fault:
++	 *   0x01 CP_OPCODE_ERROR   0x02 CP_UCODE_ERROR
++	 *   0x04 CP_HW_FAULT_ERROR 0x10 REGISTER_PROTECTION_ERROR
++	 *   0x20 CP_AHB_ERROR      0x40 VSD_PARITY_ERROR
++	 *   0x80 CP_ILLEGAL_INSTR_ERROR
++	 *
++	 * Motivation: memptrs_iova is 0 (confirmed three boots), so
++	 * rbmemptr(ring, fence) == 0x4 -- an address that is not a mapped GPU
++	 * VA. If the theory is right we should see an AHB error rather than
++	 * CACHE_FLUSH_TS, and CP_SCRATCH_REG(2) staying 0 is consistent: the
++	 * CP halts on the first faulting write, which is the CACHE_FLUSH_TS
++	 * itself in a v4.19 stream (there is no pagetable packet before it).
++	 *
++	 * A short delay lets the CP actually retire the stream before we read.
++	 */
++	if (ibdump) {
++		msleep(50);
++		pr_info("CPINT[seq=%u] RBBM_INT_0_STATUS=0x%08x INT_0_MASK=0x%08x CP_INTERRUPT_STATUS=0x%08x CP_SQE_STAT_DATA=0x%08x\n",
++			submit->seqno,
++			gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS),
++			gpu_read(gpu, REG_A6XX_RBBM_INT_0_MASK),
++			gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS),
++			gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA));
++		pr_info("CPINT[seq=%u] decodes: cache_flush_ts=%d hang_detect=%d ahb_err_rb=%d | opcode=%d ucode=%d hw_fault=%d prot=%d ahb_err_cp=%d vsd=%d illegal=%d\n",
++			submit->seqno,
++			!!(gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS) & A6XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS),
++			!!(gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS) & A6XX_RBBM_INT_0_MASK_RBBM_HANG_DETECT),
++			!!(gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS) & A6XX_RBBM_INT_0_MASK_CP_AHB_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_OPCODE_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_UCODE_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_HW_FAULT_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_REGISTER_PROTECTION_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_AHB_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_VSD_PARITY_ERROR),
++			!!(gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS) & A6XX_CP_INT_CP_ILLEGAL_INSTR_ERROR));
++		pr_info("CPINT[seq=%u] scratch2=0x%08x fence=%u rptr=%u RB_RB_WPTR=0x%x RB_RB_RPTR=0x%x\n",
++			submit->seqno,
++			gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(2)),
++			ring->memptrs ? ring->memptrs->fence : 0xffffffff,
++			ring->memptrs ? ring->memptrs->rptr : 0xffffffff,
++			gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++			gpu_read(gpu, REG_A6XX_CP_RB_RPTR));
++		/*
++		 * TEMPORARY image 213 -- where is the SQE actually stopped?
++		 *
++		 * Image 212 established that the CP retires NOTHING (all interrupt
++		 * status zero, scratch2=0, fence=0) while still advancing RPTR
++		 * and mirroring it into memptrs->rptr. Even the CP_ME_INIT that
++		 * a6xx_cp_init() wrote during bring-up is still sitting
++		 * unretired in the ring. So the question is not "why did the
++		 * submit fail" but "why has the SQE never started".
++		 *
++		 * CP_SQE_STAT_ADDR says which SQE state the sequencer is in and
++		 * CP_SQE_STAT_DATA carries the payload for that state. Together
++		 * with RBBM_STATUS they tell us whether the SQE is idle, busy,
++		 * waiting on a timestamp, or wedged on an error.
++		 */
++		if (ibdump) {
++		/*
++		 * TEMPORARY image 221 -- DIAGNOSTIC.
++		 *
++		 * Established so far (all proven this session):
++		 *   - Mesa's nested indirect buffer IS fetched and executed:
++		 *     CP_EVENT_WRITE(timestamp) values land in control memory,
++		 *     incrementing once per submit.
++		 *   - The 2D blit command stream is complete and correct,
++		 *     including RB_DBG_ECO_CNTL=0x04100000 (the A640
++		 *     BLIT_OP_SCALE workaround) bracketing CP_BLIT.
++		 *   - Yet NO data write ever lands. Both the 2D blitter and the
++		 *     shader-based util_blitter render pass fail identically,
++		 *     with UBWC on and off, sysmem and gmem.
++		 *
++		 * Everything we have ever proven about "the GPU runs" is
++		 * CP-domain: CP_SCRATCH_REG(2), the ring fence, CP_EVENT_WRITE.
++		 * Blits and render passes are executed by RB/SP/UCHE. We have
++		 * never once shown those blocks are clocked.
++		 *
++		 * So: read back every clock/power gate we can see and check for
++		 * a block that is off while CP is on. RBBM_CLOCK_CNTL=0x8aa8aa02
++		 * is the only one ever logged, and it is an aggregate mask --
++		 * it says nothing about the CLOCK_CNTL2 per-block registers for
++		 * RB, SP, UCHE or TP, the GMU
++		 * SPTPRAC clock control, or per-block slave counters.
++		 */
++		{
++			static const struct { u32 reg; const char *name; } clk[] = {
++				{ REG_A6XX_RBBM_CLOCK_CNTL,		"CLOCK_CNTL" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_RB0,	"CLOCK_CNTL2_RB0" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_RB1,	"CLOCK_CNTL2_RB1" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_RB2,	"CLOCK_CNTL2_RB2" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_RB3,	"CLOCK_CNTL2_RB3" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_SP0,	"CLOCK_CNTL2_SP0" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_SP1,	"CLOCK_CNTL2_SP1" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_SP2,	"CLOCK_CNTL2_SP2" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_SP3,	"CLOCK_CNTL2_SP3" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_UCHE,	"CLOCK_CNTL2_UCHE" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_TP0,	"CLOCK_CNTL2_TP0" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL2_RAC,	"CLOCK_CNTL2_RAC" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL_SP0,	"CLOCK_CNTL_SP0" },
++				{ REG_A6XX_RBBM_CLOCK_CNTL_SP1,	"CLOCK_CNTL_SP1" },
++			};
++			struct a6xx_gmu *gmu = &to_a6xx_gpu(to_adreno_gpu(gpu))->gmu;
++			unsigned int c;
++
++			for (c = 0; c < ARRAY_SIZE(clk); c++)
++				pr_info("CLKCHK[seq=%u] %-16s 0x%08x\n",
++					submit->seqno, clk[c].name,
++					gpu_read(gpu, clk[c].reg));
++
++			pr_info("CLKCHK[seq=%u] %-16s 0x%08x\n", submit->seqno,
++				"GMU_SPTPRAC_CLKCTL",
++				gmu_read(gmu, REG_A6XX_GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL));
++			pr_info("CLKCHK[seq=%u] %-16s 0x%08x\n", submit->seqno,
++				"GMU_SPTPRAC_PWRCTL",
++				gmu_read(gmu, REG_A6XX_GMU_GX_SPTPRAC_POWER_CONTROL));
++			pr_info("CLKCHK[seq=%u] %-16s 0x%08x\n", submit->seqno,
++				"RBBM_STATUS",
++				gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++			pr_info("CLKCHK[seq=%u] %-16s 0x%08x\n", submit->seqno,
++				"CP_RB_CNTL",
++				gpu_read(gpu, REG_A6XX_CP_RB_CNTL));
++			pr_info("CLKCHK[seq=%u] %-16s 0x%08x\n", submit->seqno,
++				"RB_CCU_CNTL",
++				gpu_read(gpu, REG_A6XX_RB_CCU_CNTL));
++		}
++	}
++
++		pr_info("CPINT[seq=%u] SQE_STAT_ADDR=0x%08x SQE_STAT_DATA=0x%08x RBBM_STATUS=0x%08x SQE_CNTL=0x%x SQE_BASE=0x%llx\n",
++			submit->seqno,
++			gpu_read(gpu, REG_A6XX_CP_SQE_STAT_ADDR),
++			gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA),
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++			gpu_read(gpu, REG_A6XX_CP_SQE_CNTL),
++			(unsigned long long)gpu_read64(gpu,
++				REG_A6XX_CP_SQE_INSTR_BASE_LO,
++				REG_A6XX_CP_SQE_INSTR_BASE_HI));
++		/*
++		 * TEMPORARY image 214 -- read the SQE's indexed debug registers
++		 * PROPERLY, and read back the bring-up values that research says
++		 * are the remaining candidates.
++		 *
++		 * CP_SQE_STAT_ADDR/CP_SQE_STAT_DATA are NOT a status/state pair.
++		 * ADDR is a WRITE-ONLY SELECTOR: you write an index, then read
++		 * DATA to pop the corresponding debug word. Successive reads pop
++		 * out associated state, so order matters. Index 0 is the SQE
++		 * firmware PC -- the single most informative value available.
++		 * Index 1 is the current packet header.
++		 *
++		 *   (Mesa crashdec.c dump_cp_sqe_stat: stat[0] = "PC",
++		 *    a6xx_gpu_state.h a6xx_indexed_reglist[] "CP_SQE_STAT" count
++		 *    0x33; KGSL adreno_a6xx_snapshot.c does the same.)
++		 *
++		 * Our earlier "SQE_STAT_ADDR=0x1" reading was meaningless -- it
++		 * was just the last index written, which is exactly the 1 that
++		 * KGSL writes to fetch the offending opcode.
++		 *
++		 * Research also established:
++		 *   - RBBM_STATUS bit 0 is CP_AHB_BUSY_CX_MASTER, the ONE bit
++		 *     upstream's idle check masks out, so 0x1 means IDLE.
++		 *   - CP_RB_RPTR is advanced by the ROQ DMA prefetcher, which is
++		 *     a different clock domain from the SQE. RPTR==WPTR with an
++		 *     idle SQE is what a STOPPED SQE looks like, not a finished
++		 *     one. So we have never seen anything retire.
++		 *   - bring-up order and CP_RB_CNTL=0x20c match v4.19 exactly.
++		 */
++		{
++			uint32_t sqe_pc, sqe_pkt, clk_cntl, hang_cntl;
++
++			/* Indexed register protocol: write index, then pop DATA. */
++			gpu_write(gpu, REG_A6XX_CP_SQE_STAT_ADDR, 0);
++			sqe_pc = gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA);
++
++			gpu_write(gpu, REG_A6XX_CP_SQE_STAT_ADDR, 1);
++			sqe_pkt = gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA);
++
++			clk_cntl = gpu_read(gpu, REG_A6XX_RBBM_CLOCK_CNTL);
++			hang_cntl = gpu_read(gpu,
++				REG_A6XX_RBBM_INTERFACE_HANG_INT_CNTL);
++
++			pr_info("SQE214: sqe_pc=0x%08x sqe_cur_pkt=0x%08x\n",
++				sqe_pc, sqe_pkt);
++			pr_info("SQE214: RBBM_CLOCK_CNTL=0x%08x (want 0x8aa8aa82 on a640) HANG_INT_CNTL=0x%08x (want 0x401fffff)\n",
++				clk_cntl, hang_cntl);
++			pr_info("SQE214: RBBM_STATUS=0x%08x (cp_busy=%d ahb_cp=%d ahb_cx=%d) INT_0_MASK=0x%08x CP_PROTECT_CNTL=0x%08x RB_CNTL=0x%08x\n",
++				gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++				!!(gpu_read(gpu, REG_A6XX_RBBM_STATUS) & A6XX_RBBM_STATUS_CP_BUSY),
++				!!(gpu_read(gpu, REG_A6XX_RBBM_STATUS) & A6XX_RBBM_STATUS_CP_AHB_BUSY_CP_MASTER),
++				!!(gpu_read(gpu, REG_A6XX_RBBM_STATUS) & A6XX_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER),
++				gpu_read(gpu, REG_A6XX_RBBM_INT_0_MASK),
++				gpu_read(gpu, REG_A6XX_CP_PROTECT_CNTL),
++				gpu_read(gpu, REG_A6XX_CP_RB_CNTL));
++		}
++	}
++}
++
++/*
++ * IMAGE 244 -- a640 clock-gating table, transcribed verbatim from
++ *   qualcomm-linux/kgsl gfx-kernel.le.0.0 adreno-gpulist.h a640_hwcg_regs[]
++ * (CAF's own per-chip table for this GPU).
++ *
++ * The table previously used here is CAF's *a630* one: 105 entries with
++ * SP0-3 / RB0-3 / CCU0-3 / TP1-3, three of each of which an a640 does not
++ * have.  This one is 44 entries, SP0 / RB0 / CCU0 / TP0 only, plus the
++ * texture fetch engine (TEX_FCHE) that a630 lacks.
++ *
++ * That gap is the point: TEX_FCHE is the block that moves colour data, and
++ * its clock gate was never programmed.  CP executes, RB/UCHE/CCU report busy
++ * and retire, nothing faults, and no bytes reach DDR -- consistent with a
++ * pipeline whose fetch stage is not clocked.
++ *
++ * A6XX_RBBM_CLOCK_CNTL is deliberately omitted: a6xx_set_hwcg() writes it
++ * separately, using the CAF-selected rbbm_clock_on value.
++ */
++/*
++ * IMAGE 281 -- CAF's a640 hwcg table, copied VERBATIM (49 entries).
++ *
++ * MEASURED (image 276, healthy CP, one boot): the CP executes userspace
++ * command streams and DOES write a userspace buffer (CP_MEM_WRITE
++ * 0x11111111 landed), while every shader-domain write fails.  So the defect
++ * is in the 3D domain, not in the memory path.
++ *
++ * A mechanical diff of CAF's a640_hwcg_regs[] against this table found four
++ * differences that the project had never noticed (it compared readbacks by
++ * offset, not by register name):
++ *
++ *   A6XX_RBBM_CLOCK_HYST_TEX_FCHE  CAF=0x00000777  ours=0x00000000
++ *   A6XX_RBBM_ISDB_CNT              CAF=0x00000182  MISSING here
++ *   A6XX_RBBM_RAC_THRESHOLD_CNT     CAF=0x00000000  MISSING here
++ *   A6XX_RBBM_SP_HYST_CNT           CAF=0x00000000  MISSING here
++ *
++ * TEX_FCHE is the texture-fetch engine -- the block that moves data between
++ * the GPU and memory -- and this table had its CNTL and DELAY but zeroed its
++ * HYST, where CAF programs 0x777.  The project's own note on this table says
++ * the TEX_FCHE clock gate "was never programmed" and that a pipeline whose
++ * fetch stage is not clocked produces exactly the observed symptom.
++ *
++ * The table is now CAF's table, entry for entry, in CAF's order.
++ */
++struct a640_hwcg_reg {
++	u32 offset;
++	u32 value;
++};
++
++/*
++ * The project's previous a640 table (46 entries): CAF's table minus
++ * ISDB_CNT / RAC_THRESHOLD_CNT / SP_HYST_CNT, and with the TEX_FCHE
++ * clock hysteresis at 0 instead of CAF's 0x777.  Kept so image 281
++ * can be A/B'd against it with a6xx.hwcg_caf=0.
++ */
++static const struct a640_hwcg_reg a640_hwcg_old[] = {
++	{REG_A6XX_RBBM_CLOCK_CNTL_SP0,	0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_SP0,	0x02222220},
++	{REG_A6XX_RBBM_CLOCK_DELAY_SP0,	0x00000080},
++	{REG_A6XX_RBBM_CLOCK_HYST_SP0,	0x0000F3CF},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TP0,	0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_TP0,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_TP0,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_TP0,	0x00022222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TP0,	0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY2_TP0,	0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY3_TP0,	0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY4_TP0,	0x00011111},
++	{REG_A6XX_RBBM_CLOCK_HYST_TP0,	0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST2_TP0,	0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST3_TP0,	0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST4_TP0,	0x00077777},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RB0,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RB0,	0x01002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_CCU0,	0x00002220},
++	{REG_A6XX_RBBM_CLOCK_HYST_RB_CCU0,	0x00040F00},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RAC,	0x05222022},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RAC,	0x00005555},
++	{REG_A6XX_RBBM_CLOCK_DELAY_RAC,	0x00000011},
++	{REG_A6XX_RBBM_CLOCK_HYST_RAC,	0x00445044},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TSE_RAS_RBBM,	0x04222222},
++	{REG_A6XX_RBBM_CLOCK_MODE_VFD,	0x00002222},
++	{REG_A6XX_RBBM_CLOCK_MODE_GPC,	0x00222222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_HLSQ_2,	0x00000002},
++	{REG_A6XX_RBBM_CLOCK_MODE_HLSQ,	0x00002222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TSE_RAS_RBBM,	0x00004000},
++	{REG_A6XX_RBBM_CLOCK_DELAY_VFD,	0x00002222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_GPC,	0x00000200},
++	{REG_A6XX_RBBM_CLOCK_DELAY_HLSQ,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_TSE_RAS_RBBM,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_VFD,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_GPC,	0x04104004},
++	{REG_A6XX_RBBM_CLOCK_HYST_HLSQ,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TEX_FCHE,	0x00000222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TEX_FCHE,	0x00000111},
++	{REG_A6XX_RBBM_CLOCK_HYST_TEX_FCHE,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_CNTL_UCHE,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_HYST_UCHE,	0x00000004},
++	{REG_A6XX_RBBM_CLOCK_DELAY_UCHE,	0x00000002},
++	{REG_A6XX_RBBM_CLOCK_CNTL_GMU_GX,	0x00000222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_GMU_GX,	0x00000111},
++	{REG_A6XX_RBBM_CLOCK_HYST_GMU_GX,	0x00000555},
++};
++
++/* CAF's a640 table, verbatim. */
++static const struct a640_hwcg_reg a640_hwcg_caf[] = {
++	{REG_A6XX_RBBM_CLOCK_CNTL_SP0,	0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_SP0,	0x02222220},
++	{REG_A6XX_RBBM_CLOCK_DELAY_SP0,	0x00000080},
++	{REG_A6XX_RBBM_CLOCK_HYST_SP0,	0x0000F3CF},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TP0,	0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_TP0,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_TP0,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_TP0,	0x00022222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TP0,	0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY2_TP0,	0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY3_TP0,	0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY4_TP0,	0x00011111},
++	{REG_A6XX_RBBM_CLOCK_HYST_TP0,	0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST2_TP0,	0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST3_TP0,	0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST4_TP0,	0x00077777},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RB0,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RB0,	0x01002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_CCU0,	0x00002220},
++	{REG_A6XX_RBBM_CLOCK_HYST_RB_CCU0,	0x00040F00},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RAC,	0x05222022},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RAC,	0x00005555},
++	{REG_A6XX_RBBM_CLOCK_DELAY_RAC,	0x00000011},
++	{REG_A6XX_RBBM_CLOCK_HYST_RAC,	0x00445044},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TSE_RAS_RBBM,	0x04222222},
++	{REG_A6XX_RBBM_CLOCK_MODE_VFD,	0x00002222},
++	{REG_A6XX_RBBM_CLOCK_MODE_GPC,	0x00222222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_HLSQ_2,	0x00000002},
++	{REG_A6XX_RBBM_CLOCK_MODE_HLSQ,	0x00002222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TSE_RAS_RBBM,	0x00004000},
++	{REG_A6XX_RBBM_CLOCK_DELAY_VFD,	0x00002222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_GPC,	0x00000200},
++	{REG_A6XX_RBBM_CLOCK_DELAY_HLSQ,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_TSE_RAS_RBBM,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_VFD,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_GPC,	0x04104004},
++	{REG_A6XX_RBBM_CLOCK_HYST_HLSQ,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TEX_FCHE,	0x00000222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TEX_FCHE,	0x00000111},
++	{REG_A6XX_RBBM_CLOCK_HYST_TEX_FCHE,	0x00000777},
++	{REG_A6XX_RBBM_CLOCK_CNTL_UCHE,	0x22222222},
++	{REG_A6XX_RBBM_CLOCK_HYST_UCHE,	0x00000004},
++	{REG_A6XX_RBBM_CLOCK_DELAY_UCHE,	0x00000002},
++	{REG_A6XX_RBBM_ISDB_CNT,	0x00000182},
++	{REG_A6XX_RBBM_RAC_THRESHOLD_CNT,	0x00000000},
++	{REG_A6XX_RBBM_SP_HYST_CNT,	0x00000000},
++	{REG_A6XX_RBBM_CLOCK_CNTL_GMU_GX,	0x00000222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_GMU_GX,	0x00000111},
++	{REG_A6XX_RBBM_CLOCK_HYST_GMU_GX,	0x00000555},
++};
++
++static const struct {
++	u32 offset;
++	u32 value;
++} a6xx_hwcg[] = {
++	{REG_A6XX_RBBM_CLOCK_CNTL_SP0, 0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_SP1, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_SP2, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_SP3, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_SP0, 0x02222220},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_SP1, 0x02022220},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_SP2, 0x02022220},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_SP3, 0x02022220},
++	{REG_A6XX_RBBM_CLOCK_DELAY_SP0, 0x00000080},
++	{REG_A6XX_RBBM_CLOCK_DELAY_SP1, 0x00000080},
++	{REG_A6XX_RBBM_CLOCK_DELAY_SP2, 0x00000080},
++	{REG_A6XX_RBBM_CLOCK_DELAY_SP3, 0x00000080},
++	{REG_A6XX_RBBM_CLOCK_HYST_SP0, 0x0000f3cf},
++	{REG_A6XX_RBBM_CLOCK_HYST_SP1, 0x0000f3cf},
++	{REG_A6XX_RBBM_CLOCK_HYST_SP2, 0x0000f3cf},
++	{REG_A6XX_RBBM_CLOCK_HYST_SP3, 0x0000f3cf},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TP0, 0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TP1, 0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TP2, 0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TP3, 0x02222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_TP0, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_TP1, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_TP2, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_TP3, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_TP0, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_TP1, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_TP2, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_TP3, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_TP0, 0x00022222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_TP1, 0x00022222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_TP2, 0x00022222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_TP3, 0x00022222},
++	{REG_A6XX_RBBM_CLOCK_HYST_TP0, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST_TP1, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST_TP2, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST_TP3, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST2_TP0, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST2_TP1, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST2_TP2, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST2_TP3, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST3_TP0, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST3_TP1, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST3_TP2, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST3_TP3, 0x77777777},
++	{REG_A6XX_RBBM_CLOCK_HYST4_TP0, 0x00077777},
++	{REG_A6XX_RBBM_CLOCK_HYST4_TP1, 0x00077777},
++	{REG_A6XX_RBBM_CLOCK_HYST4_TP2, 0x00077777},
++	{REG_A6XX_RBBM_CLOCK_HYST4_TP3, 0x00077777},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TP0, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TP1, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TP2, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TP3, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY2_TP0, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY2_TP1, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY2_TP2, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY2_TP3, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY3_TP0, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY3_TP1, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY3_TP2, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY3_TP3, 0x11111111},
++	{REG_A6XX_RBBM_CLOCK_DELAY4_TP0, 0x00011111},
++	{REG_A6XX_RBBM_CLOCK_DELAY4_TP1, 0x00011111},
++	{REG_A6XX_RBBM_CLOCK_DELAY4_TP2, 0x00011111},
++	{REG_A6XX_RBBM_CLOCK_DELAY4_TP3, 0x00011111},
++	{REG_A6XX_RBBM_CLOCK_CNTL_UCHE, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_UCHE, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL3_UCHE, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL4_UCHE, 0x00222222},
++	{REG_A6XX_RBBM_CLOCK_HYST_UCHE, 0x00000004},
++	{REG_A6XX_RBBM_CLOCK_DELAY_UCHE, 0x00000002},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RB0, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RB1, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RB2, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RB3, 0x22222222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RB0, 0x01002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RB1, 0x00002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RB2, 0x00002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RB3, 0x00002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_CCU0, 0x00002220},
++	{REG_A6XX_RBBM_CLOCK_CNTL_CCU1, 0x00002220},
++	{REG_A6XX_RBBM_CLOCK_CNTL_CCU2, 0x00002220},
++	{REG_A6XX_RBBM_CLOCK_CNTL_CCU3, 0x00002220},
++	{REG_A6XX_RBBM_CLOCK_HYST_RB_CCU0, 0x00040f00},
++	{REG_A6XX_RBBM_CLOCK_HYST_RB_CCU1, 0x00040f00},
++	{REG_A6XX_RBBM_CLOCK_HYST_RB_CCU2, 0x00040f00},
++	{REG_A6XX_RBBM_CLOCK_HYST_RB_CCU3, 0x00040f00},
++	{REG_A6XX_RBBM_CLOCK_CNTL_RAC, 0x05222022},
++	{REG_A6XX_RBBM_CLOCK_CNTL2_RAC, 0x00005555},
++	{REG_A6XX_RBBM_CLOCK_DELAY_RAC, 0x00000011},
++	{REG_A6XX_RBBM_CLOCK_HYST_RAC, 0x00445044},
++	{REG_A6XX_RBBM_CLOCK_CNTL_TSE_RAS_RBBM, 0x04222222},
++	{REG_A6XX_RBBM_CLOCK_MODE_GPC, 0x00222222},
++	{REG_A6XX_RBBM_CLOCK_MODE_VFD, 0x00002222},
++	{REG_A6XX_RBBM_CLOCK_HYST_TSE_RAS_RBBM, 0x00000000},
++	{REG_A6XX_RBBM_CLOCK_HYST_GPC, 0x04104004},
++	{REG_A6XX_RBBM_CLOCK_HYST_VFD, 0x00000000},
++	{REG_A6XX_RBBM_CLOCK_DELAY_HLSQ, 0x00000000},
++	{REG_A6XX_RBBM_CLOCK_DELAY_TSE_RAS_RBBM, 0x00004000},
++	{REG_A6XX_RBBM_CLOCK_DELAY_GPC, 0x00000200},
++	{REG_A6XX_RBBM_CLOCK_DELAY_VFD, 0x00002222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_HLSQ_2, 0x00000002},
++	{REG_A6XX_RBBM_CLOCK_MODE_HLSQ, 0x00002222},
++	{REG_A6XX_RBBM_CLOCK_CNTL_GMU_GX, 0x00000222},
++	{REG_A6XX_RBBM_CLOCK_DELAY_GMU_GX, 0x00000111},
++	{REG_A6XX_RBBM_CLOCK_HYST_GMU_GX, 0x00000555}
++};
++
++static void a6xx_set_hwcg(struct msm_gpu *gpu, bool state)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	unsigned int i;
++	u32 val;
++	u32 rbbm_clock_on;
++
++	val = gpu_read(gpu, REG_A6XX_RBBM_CLOCK_CNTL);
++
++	/*
++	 * IMAGE 235 -- A640 needs its own RBBM_CLOCK_CNTL value.
++	 *
++	 * This was hard-coded to 0x8aa8aa02, which CAF gives ONLY to a630.
++	 * Every other chip in CAF's selector, including a640, gets
++	 * 0x8aa8aa82:
++	 *
++	 *   vendor adreno_a6xx.c:592-601
++	 *     __get_rbbm_clock_cntl_on():
++	 *       if (adreno_is_a630)              return 0x8AA8AA02;
++	 *       else if (a612 || a610)           return 0xAAA8AA82;
++	 *       else                             return 0x8AA8AA82;   <- a640
++	 *
++	 * The single differing bit is bit 7. On a640 we were leaving one
++	 * clock gate off that CAF turns on.
++	 *
++	 * This matters because it is the ONE hypothesis that matches the
++	 * symptom split exactly: the CP runs (its bits are right in both
++	 * values) while the RB/ROP path never writes (its gate is wrong).
++	 *
++	 * NOTE: the SQE214 diagnostic above and the "already correct" test
++	 * here both keyed on the old a630 constant, so they reported success
++	 * on a value CAF says belongs to a different chip. Both are updated.
++	 *
++	 * This tree has no adreno_is_a630() helper (only adreno_is_a640() at
++	 * adreno_gpu.h:241), so the selector is written in terms of a640, which
++	 * is the only part we run on. CAF returns 0x8AA8AA82 for everything
++	 * except a630, so this matches.
++	 */
++	rbbm_clock_on = adreno_is_a640(adreno_gpu) ? 0x8aa8aa82 : 0x8aa8aa02;
++
++	/* IMAGE 243 -- GMU always-on clock gate (CAF __get_gmu_ao_cgc_*, __get_gmu_wfi_config;
++	 * mainline a6xx_set_hwcg). a640 takes the `else` branch of each selector.
++	 * This was the corpus's own open item "GMU AO CGC: defines present, no writer". */
++	if (a640_gmu_cgc) {
++		gmu_write(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_MODE_CNTL, state ? 0x00020202 : 0);
++		gmu_write(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_DELAY_CNTL, state ? 0x00010111 : 0);
++		gmu_write(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_HYST_CNTL, state ? 0x00005555 : 0);
++		gmu_write(gmu, REG_A6XX_GMU_CX_GMU_WFI_CONFIG,
++			state ? (adreno_is_a640(adreno_gpu) ? 0x00000002 : 0) : 0);
++		pr_info("GMUCGC243: MODE=0x%x DELAY=0x%x HYST=0x%x WFI=0x%x state=%d\n",
++			gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_MODE_CNTL),
++			gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_DELAY_CNTL),
++			gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_HYST_CNTL),
++			gmu_read(gmu, REG_A6XX_GMU_CX_GMU_WFI_CONFIG), state);
++	}
++
++	/* Don't re-program the registers if they are already correct */
++	if ((!state && !val) || (state && (val == rbbm_clock_on)))
++		return;
++
++	/* Disable SP clock before programming HWCG registers */
++	gmu_rmw(gmu, REG_A6XX_GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL, 1, 0);
++
++	if (adreno_is_a640(adreno_gpu) && a640_hwcg_a640) {
++
++		const struct a640_hwcg_reg *tbl;
++		int n;
++
++		if (hwcg_caf) {
++			tbl = a640_hwcg_caf;
++			n = ARRAY_SIZE(a640_hwcg_caf);
++		} else {
++			tbl = a640_hwcg_old;
++			n = ARRAY_SIZE(a640_hwcg_old);
++		}
++
++		for (i = 0; i < n; i++) {
++			gpu_write(gpu, tbl[i].offset,
++				state ? tbl[i].value : 0);
++		}
++		pr_info("HWCG244: a640 table, %zu entries, state=%d "
++			"CNTL_TEX_FCHE=0x%x\n", n, state,
++			gpu_read(gpu, REG_A6XX_RBBM_CLOCK_CNTL_TEX_FCHE));
++
++		/*
++		 * IMAGE 245 -- VERIFY, do not assume.
++		 *
++		 * Read back every entry and compare against the value CAF says
++		 * a640 wants. A gpu_read() of an address the part does not
++		 * implement returns 0xdeadbead (Adreno's unmapped-register
++		 * signature), so a deadbead here means the ADDRESS in our
++		 * a6xx.xml.h is wrong for this part and the setting was written
++		 * into the void -- i.e. that clock gate was never programmed at
++		 * all. A plain value mismatch means the write did not stick.
++		 *
++		 * This is the only way to tell "we programmed the RB/CCU clocks"
++		 * (what we have been asserting) from "we wrote to a register that
++		 * does not exist on a640" (which looks identical from userspace).
++		 */
++		if (state) {
++			int bad = 0;
++
++			for (i = 0; i < n; i++) {
++				u32 want = tbl[i].value;
++				u32 got = gpu_read(gpu, tbl[i].offset);
++
++				if (got == want)
++					continue;
++				bad++;
++				pr_info("HWCGVFY: MISMATCH off=0x%04x want=0x%08x got=0x%08x%s\n",
++					tbl[i].offset, want, got,
++					(got == 0xdeadbead || got == 0xffffffff) ?
++					"  <== UNMAPPED, ADDRESS WRONG FOR a640" : "");
++			}
++			pr_info("HWCGVFY: %d/%zu entries did not read back as CAF specifies\n",
++				bad, n);
++		}
++	} else {
++		for (i = 0; i < ARRAY_SIZE(a6xx_hwcg); i++)
++			gpu_write(gpu, a6xx_hwcg[i].offset,
++				state ? a6xx_hwcg[i].value : 0);
++		pr_info("HWCG244: legacy a630 table, %zu entries, state=%d\n",
++			ARRAY_SIZE(a6xx_hwcg), state);
++	}
++
++	/* Enable SP clock */
++	gmu_rmw(gmu, REG_A6XX_GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL, 0, 1);
++
++	gpu_write(gpu, REG_A6XX_RBBM_CLOCK_CNTL, state ? rbbm_clock_on : 0);
++}
++
++static int a6xx_cp_init(struct msm_gpu *gpu)
++{
++	struct msm_ringbuffer *ring = gpu->rb[0];
++
++	OUT_PKT7(ring, CP_ME_INIT, 8);
++
++	OUT_RING(ring, 0x0000002f);
++
++	/* Enable multiple hardware contexts */
++	OUT_RING(ring, 0x00000003);
++
++	/* Enable error detection */
++	OUT_RING(ring, 0x20000000);
++
++	/* Don't enable header dump */
++	OUT_RING(ring, 0x00000000);
++	OUT_RING(ring, 0x00000000);
++
++	/* No workarounds enabled */
++	OUT_RING(ring, 0x00000000);
++
++	/* Pad rest of the cmds with 0's */
++	OUT_RING(ring, 0x00000000);
++	OUT_RING(ring, 0x00000000);
++
++	/* TEMPORARY image 129 diagnostics -- REMOVE AFTER RESULT. */
++	pr_info("CP_PRE_FLUSH: ring_iova=0x%llx sw_wptr_dw=%u RB_BASE=0x%llx RB_CNTL=0x%x RPTR=0x%x WPTR=0x%x SQE=0x%x\n",
++		(unsigned long long)gpu->rb_iova,
++		(unsigned)(ring->cur - ring->start),
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_RB_BASE, REG_A6XX_CP_RB_BASE_HI),
++		gpu_read(gpu, REG_A6XX_CP_RB_CNTL),
++		gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++		gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++		gpu_read(gpu, REG_A6XX_CP_SQE_CNTL));
++	a6xx_flush(gpu, ring);
++	pr_info("CP_POST_FLUSH: RPTR=0x%x WPTR=0x%x STATUS=0x%x INT0=0x%x\n",
++		gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++		gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS));
++	if (!a6xx_idle(gpu, ring)) {
++		/* TEMPORARY image 128 failure snapshot -- REMOVE AFTER RESULT. */
++		pr_info("CPIDLE-FAIL: RBBM_STATUS=0x%x INT0=0x%x CP_RB_RPTR=0x%x CP_RB_WPTR=0x%x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++			gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS),
++			gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++			gpu_read(gpu, REG_A6XX_CP_RB_WPTR));
++		pr_info("CPIDLE-FAIL: ring0[0..15] =%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			ring->start[0], ring->start[1], ring->start[2],
++			ring->start[3], ring->start[4], ring->start[5],
++			ring->start[6], ring->start[7], ring->start[8],
++			ring->start[9], ring->start[10], ring->start[11],
++			ring->start[12], ring->start[13], ring->start[14],
++			ring->start[15]);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int a6xx_ucode_init(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	if (!a6xx_gpu->sqe_bo) {
++		a6xx_gpu->sqe_bo = adreno_fw_create_bo(gpu,
++			adreno_gpu->fw[ADRENO_FW_SQE], &a6xx_gpu->sqe_iova);
++
++		if (IS_ERR(a6xx_gpu->sqe_bo)) {
++			int ret = PTR_ERR(a6xx_gpu->sqe_bo);
++
++			a6xx_gpu->sqe_bo = NULL;
++			DRM_DEV_ERROR(&gpu->pdev->dev,
++				"Could not allocate SQE ucode: %d\n", ret);
++
++			return ret;
++		}
++	}
++
++	/*
++	 * TEMPORARY image 213 -- identify the SQE microcode we actually loaded.
++	 *
++	 * Image 212 showed the CP retires nothing at all, including the
++	 * CP_ME_INIT that a6xx_cp_init() wrote during bring-up, while still
++	 * advancing RPTR. That points at the SQE itself never starting, so
++	 * the first thing to rule out is that we are running the wrong
++	 * microcode for an A640.
++	 *
++	 * Upstream a6xx_ucode_check_version() gates on these nibbles:
++	 *
++	 *   if (!strcmp(sqe_name, "a630_sqe.fw")) {
++	 *       if ((((buf[0] & 0xf) == 0xa) && (buf[2] & 0xf) >= 1) ||
++	 *           (buf[0] & 0xfff) >= 0x190)
++	 *               a6xx_gpu->has_whereami = true;
++	 *   }
++	 *
++	 * has_whereami gates whether upstream allocates shadow_bo and therefore
++	 * whether CP_RB_RPTR_ADDR is programmed at all. Our tree never calls
++	 * that check, so print the raw nibbles and let them be judged.
++	 */
++	{
++		const struct firmware *fw = adreno_gpu->fw[ADRENO_FW_SQE];
++
++		if (fw && fw->data && fw->size >= 8)
++			pr_info("SQE213: name=%s size=%zu b0=0x%02x b2=0x%02x ver=0x%03x nib0=0x%x nib2=0x%x would_whereami=%d\n",
++				adreno_gpu->info->fw[ADRENO_FW_SQE], fw->size,
++				fw->data[0], fw->data[2],
++				fw->data[0] & 0xfff, fw->data[0] & 0xf,
++				fw->data[2] & 0xf,
++				(((fw->data[0] & 0xf) == 0xa) &&
++				  ((fw->data[2] & 0xf) >= 1)) ||
++				((fw->data[0] & 0xfff) >= 0x190));
++		else
++			pr_info("SQE213: SQE firmware missing or too small (fw=%px size=%zu)\n",
++				(void *)fw, fw ? fw->size : 0);
++	}
++
++	/*
++	 * IMAGE 266 -- no capture buffer is allocated here. It lives in the
++	 * tail of the memptrs BO (see ADRENO_IBCAP_OFF in adreno_gpu.h).
++	 * Allocating one at this point, or in a6xx_submit(), deadlocked the
++	 * machine on images 264 and 265 respectively.
++	 */
++
++	pr_info("RINGHW-W: CP_SQE_INSTR_BASE before=0x%llx val=0x%llx\n",
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_SQE_INSTR_BASE_LO,
++			REG_A6XX_CP_SQE_INSTR_BASE_HI),
++		(unsigned long long)a6xx_gpu->sqe_iova);
++	gpu_write64(gpu, REG_A6XX_CP_SQE_INSTR_BASE_LO,
++		REG_A6XX_CP_SQE_INSTR_BASE_HI, a6xx_gpu->sqe_iova);
++	pr_info("RINGHW-W: CP_SQE_INSTR_BASE after=0x%llx\n",
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_SQE_INSTR_BASE_LO,
++			REG_A6XX_CP_SQE_INSTR_BASE_HI));
++
++	return 0;
++}
++
++#define A6XX_INT_MASK (A6XX_RBBM_INT_0_MASK_CP_AHB_ERROR | \
++	  A6XX_RBBM_INT_0_MASK_RBBM_ATB_ASYNCFIFO_OVERFLOW | \
++	  A6XX_RBBM_INT_0_MASK_CP_HW_ERROR | \
++	  A6XX_RBBM_INT_0_MASK_CP_IB2 | \
++	  A6XX_RBBM_INT_0_MASK_CP_IB1 | \
++	  A6XX_RBBM_INT_0_MASK_CP_RB | \
++	  A6XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS | \
++	  A6XX_RBBM_INT_0_MASK_RBBM_ATB_BUS_OVERFLOW | \
++	  A6XX_RBBM_INT_0_MASK_RBBM_HANG_DETECT | \
++	  A6XX_RBBM_INT_0_MASK_UCHE_OOB_ACCESS | \
++	  A6XX_RBBM_INT_0_MASK_UCHE_TRAP_INTR)
++
++/*
++ * TEMPORARY image 130 -- REMOVE AFTER RESULT. Read-only GX power/clock
++ * snapshot via existing GMU/GPU accessors. No writes, no polls, no sleeps.
++ */
++extern bool gx_vote_done;
++extern int secure_probe;
++extern int secvid;
++extern int cp_secure_off;
++extern int uche_filter_clear;
++extern int pc_eco_a640;
++extern int cp_protect_caf;
++extern int reg_match;
++extern int gmem_window;
++extern bool experimental_nonlegacy;
++extern bool a6xx_selftest;
++extern bool uche_gbif_rw;
++extern bool slumber165;
++extern bool halt_gmu;
++extern bool a6xx_instr;
++
++static int a6xx_pm_suspend(struct msm_gpu *gpu);
++extern bool hold_boot;
++extern bool skip_gpuset;
++
++
++static void gxstate_snap(struct msm_gpu *gpu, const char *tag)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++	u32 sptp = gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS);
++	u32 off = A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_GDSC_POWER_OFF;
++	u32 clkoff = A6XX_GMU_SPTPRAC_PWR_CLK_STATUS_GX_HM_CLK_OFF;
++
++	pr_info("GXSTATE[%s]: SPTPRAC=0x%x GDSC_OFF=%u CLK_OFF=%u RPMHPWR=0x%x GXVOTE=0x%x MXVOTE=0x%x GXGDSCR=0x%x\n",
++		tag, sptp, !!(sptp & off), !!(sptp & clkoff),
++		gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		gmu_read(gmu, REG_A6XX_GMU_GX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GMU_MX_VOTE_IDX),
++		gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR));
++	pr_info("GXSTATE[%s]: verdict GX_%s\n", tag,
++		((sptp & (off | clkoff)) == 0) ? "ON" : "OFF");
++}
++
++static int a6xx_hw_init(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	int ret;
++
++	pr_info("HWINIT[00] enter\n");
++	gxstate_snap(gpu, "0");
++	if (a640_gbif_halt) {
++		gpu_write(gpu, REG_A6XX_GBIF_HALT, 0);
++		gpu_write(gpu, REG_A6XX_RBBM_GBIF_HALT, 0);
++		pr_info("GBIF243: GBIF_HALT=0 RBBM_GBIF_HALT=0 written (no readback)\n");
++	} else {
++		pr_info("HWINIT[03] GBIF/HALT: SKIPPED (a640_gbif_halt=0, image 243 finding)\n");
++	}
++	/*
++	 * IMAGE 233 -- GBIF halt clear DISABLED deliberately.
++	 *
++	 * Images 231 and 232 tried this:
++	 *   231 with donor's readback  -> the read never returned, the GPU
++	 *                                wedged hard (classic AXI: writes post,
++	 *                                reads block on an absent slave).
++	 *   232 write-only            -> did not wedge the GPU, but the run was
++	 *                                lost anyway to the unrelated UFS BUG,
++	 *                                so we learned nothing either way.
++	 *
++	 * Both results are informative: the GBIF block does not answer reads
++	 * on this setup. But 233 is a DIAGNOSTICS-ONLY image so that DIAG231
++	 * finally runs. Combining a speculative fix with the measurement meant
++	 * to evaluate it lost both, twice. If DIAG231 comes back clean and the
++	 * hang persists, re-enable this and evaluate it on its own.
++	 *
++	 * A640 is a GBIF part (hw_init below prints "A640 interconnect path =
++	 * GBIF"), so this remains the leading suspect.
++	 */
++
++	/*
++	 * KGSL writes A6XX_RBBM_NC_MODE_CNTL = 1
++	 * (/home/usb/ShinyKernel/Kernel/drivers/gpu/msm/adreno_a6xx.c:908);
++	 * donor master does the same. Never written by our tree.
++	 */
++	/* IMAGE 233: NC_MODE_CNTL/UCHE_GBIF writes deferred -- see HWINIT[03]. */
++
++	/*
++	 * KGSL limits UCHE GBIF read/write via A6XX_UCHE_GBIF_GX_CONFIG =
++	 * 0x10200F9 (adreno_a6xx.c:805), but gates it on
++	 * ADRENO_QUIRK_LIMIT_UCHE_GBIF_RW, which is a DT quirk we do not know
++	 * the value of. Default OFF rather than invent a condition; flip with
++	 * a6xx.uche_gbif_rw=1 to test it.
++	 */
++	/* IMAGE 233: UCHE_GBIF_GX_CONFIG write deferred, see HWINIT[03]. */
++	/* Make sure the GMU keeps the GPU on while we set it up */
++	/* IMAGE 225: bit numbers now selected by set_oob(); log what it will use. */
++	pr_info("HWINIT[01] before GMU_OOB_GPU_SET legacy=%d req_bit=%d ack_bit=%d HOST2GMU_INFO=0x%x GMU2HOST_INFO=0x%x KEEPALIVE=0x%x RPMHPWR=0x%x RBBMSTA=0x%x\n",
++		a6xx_gpu->gmu.legacy,
++		a6xx_gpu->gmu.legacy ? GMU_OOB_GPU_SET_REQUEST :
++				       GMU_OOB_GPU_SET_REQUEST_NEW,
++		a6xx_gpu->gmu.legacy ? GMU_OOB_GPU_SET_ACK :
++				       GMU_OOB_GPU_SET_ACK_NEW,
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++	/*
++	 * TEMPORARY image 155 -- PROMOTE IFF SURVIVAL EXTENDS. Skip the
++	 * GPU_SET OOB: tests whether the firmware's post-GPU_SET state
++	 * advance (not our register writes) is the death fuse. Power may
++	 * collapse mid-hw_init without it (expect void writes/-22); either
++	 * outcome discriminates.
++	 */
++	if (skip_gpuset) {
++		pr_info("SKIPSET155: GPU_SET OOB skipped\n");
++	} else {
++		a6xx_gmu_set_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
++	}
++	pr_info("HWINIT[02] after GMU_OOB_GPU_SET HOST2GMU_INFO=0x%x GMU2HOST_INFO=0x%x\n",
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	gxstate_snap(gpu, "1");
++
++	pr_info("HWINIT[05] before SECVID setup\n");
++	gpu_write(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL, 0);
++
++	/*
++	 * Disable the trusted memory range - we don't actually supported secure
++	 * memory rendering at this point in time and we don't want to block off
++	 * part of the virtual memory space.
++	 */
++	gpu_write64(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO,
++		REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0x00000000);
++	gpu_write(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE, 0x00000000);
++	pr_info("HWINIT[06] after SECVID setup\n");
++
++	pr_info("HWINIT[07] ADDR64 BEGIN\n");
++	/* TEMPORARY experiment image 128 -- PROMOTE IF CP IDLES.
++	 * Restore the missing upstream A6xx 64-bit address-mode block:
++	 * immediately after SECVID, before set_hwcg. Order and values
++	 * match upstream/KGSL exactly. */
++	gpu_write(gpu, REG_A6XX_CP_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[00] CP_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_VSC_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[01] VSC_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_GRAS_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[02] GRAS_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_RB_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[03] RB_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_PC_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[04] PC_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_HLSQ_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[05] HLSQ_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_VFD_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[06] VFD_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_VPC_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[07] VPC_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_UCHE_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[08] UCHE_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_SP_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[09] SP_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_TPL1_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[10] TPL1_ADDR_MODE_CNTL value=0x1\n");
++	gpu_write(gpu, REG_A6XX_RBBM_SECVID_TSB_ADDR_MODE_CNTL, 0x1);
++	pr_info("ADDR64[11] RBBM_SECVID_TSB_ADDR_MODE_CNTL value=0x1\n");
++	pr_info("HWINIT[08] after ADDR64 RBBM_STATUS=0x%x STATUS3=0x%x\n",
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS3));
++	pr_info("HWINIT[09] before a6xx_set_hwcg\n");
++	/* enable hardware clockgating */
++	a6xx_set_hwcg(gpu, true);
++	pr_info("HWINIT[10] after a6xx_set_hwcg RBBM_STATUS=0x%x STATUS3=0x%x\n",
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS3));
++
++	pr_info("HWINIT[11] before interconnect start (A640=GBIF, else VBIF)\n");
++	if (adreno_is_a640(adreno_gpu)) {
++		if (!a640_qsb) pr_info("GBIF[00-03] QSB_SIDE0..3 SKIPPED (a640_qsb=0)\n");
++		pr_info("A640 interconnect path = GBIF\n");
++		pr_info("VBIF writes skipped = yes\n");
++		gpu_write(gpu, REG_A6XX_GBIF_QSB_SIDE0, 0x00071620);
++		gpu_write(gpu, REG_A6XX_GBIF_QSB_SIDE1, 0x00071620);
++		gpu_write(gpu, REG_A6XX_GBIF_QSB_SIDE2, 0x00071620);
++		gpu_write(gpu, REG_A6XX_GBIF_QSB_SIDE3, 0x00071620);
++		gpu_write(gpu, REG_A6XX_RBBM_GBIF_CLIENT_QOS_CNTL, 0x3);
++		pr_info("GBIF[04] CLIENT_QOS readback=0x%x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_GBIF_CLIENT_QOS_CNTL));
++	} else {
++		/* VBIF start (A630-family path, preserved) */
++		gpu_write(gpu, REG_A6XX_VBIF_GATE_OFF_WRREQ_EN, 0x00000009);
++		gpu_write(gpu, REG_A6XX_RBBM_VBIF_CLIENT_QOS_CNTL, 0x3);
++	}
++	pr_info("HWINIT[12] after VBIF start RBBM_STATUS=0x%x STATUS3=0x%x\n",
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS3));
++
++	/* Make all blocks contribute to the GPU BUSY perf counter */
++	gpu_write(gpu, REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++
++	/*
++	 * IMAGE 279 -- the UCHE's address filters, CAF's values.
++	 *
++	 * MEASURED (image 276, a healthy CP):
++	 *   - the CP DOES execute userspace command streams (a CP_EVENT_WRITE
++	 *     from a userspace IB landed in the memptrs page, 0x5A5A1234);
++	 *   - the CP DOES write a userspace buffer (CP_MEM_WRITE 0x11111111
++	 *     landed in the target buffer, A_WROTE=True);
++	 *   - while every shader-domain write still fails (SSBO 0/64, FBO
++	 *     0/6, CP_BLIT 0/4096) with no SMMU fault and a correct mapping.
++	 *
++	 * So the CP's write path is fine and the 3D domain's is not.  The UCHE
++	 * (the shader memory client) has its OWN address filters, and CAF's
++	 * power-up restore list says they belong at ZERO:
++	 *
++	 *   drivers/gpu/msm/adreno_a6xx.c: a6xx_pwrup_reglist[]
++	 *     { A6XX_UCHE_WRITE_RANGE_MAX_LO, 0x0 }, { ..._HI, 0x0 },
++	 *     { A6XX_UCHE_TRAP_BASE_LO, 0x0 },      { ..._HI, 0x0 },
++	 *     { A6XX_UCHE_WRITE_THRU_BASE_LO, 0x0 },{ ..._HI, 0x0 },
++	 *
++	 * We instead write upstream msm's values (a6xx_gpu.c: the "Disable L2
++	 * bypass in the UCHE" block):
++	 *     WRITE_RANGE_MAX = 0x0001ffff_ffffffc0
++	 *     TRAP_BASE       = 0x0001ffff_fffff000
++	 *     WRITE_THRU_BASE = 0x0001ffff_fffff000
++	 *
++	 * The project's audit compared these against UPSTREAM (we match) and
++	 * never against CAF, which is the one driver known to work on this
++	 * exact part under the same TZ.  The register names say exactly what
++	 * they are: a write-range limit and a trap base for the shader client.
++	 * With upstream's values the only writable window is near the top of
++	 * the 49-bit space, while our IOVAs live at 0x700000000.
++	 *
++	 * a6xx.uche_filter_clear=1 writes CAF's zeros (and reads them back);
++	 * default 0 keeps upstream's behaviour.
++	 */
++	if (uche_filter_clear) {
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_RANGE_MAX_LO, 0x0);
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_RANGE_MAX_HI, 0x0);
++		gpu_write(gpu, REG_A6XX_UCHE_TRAP_BASE_LO, 0x0);
++		gpu_write(gpu, REG_A6XX_UCHE_TRAP_BASE_HI, 0x0);
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_THRU_BASE_LO, 0x0);
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_THRU_BASE_HI, 0x0);
++		pr_info("UCHE279: filters CLEARED (CAF values): RANGE_MAX=0x%llx TRAP_BASE=0x%llx WRITE_THRU=0x%llx\n",
++			(unsigned long long)(((uint64_t)gpu_read(gpu, REG_A6XX_UCHE_WRITE_RANGE_MAX_HI) << 32) |
++					     gpu_read(gpu, REG_A6XX_UCHE_WRITE_RANGE_MAX_LO)),
++			(unsigned long long)(((uint64_t)gpu_read(gpu, REG_A6XX_UCHE_TRAP_BASE_HI) << 32) |
++					     gpu_read(gpu, REG_A6XX_UCHE_TRAP_BASE_LO)),
++			(unsigned long long)(((uint64_t)gpu_read(gpu, REG_A6XX_UCHE_WRITE_THRU_BASE_HI) << 32) |
++					     gpu_read(gpu, REG_A6XX_UCHE_WRITE_THRU_BASE_LO)));
++	} else {
++		/* Disable L2 bypass in the UCHE (upstream msm values) */
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_RANGE_MAX_LO, 0xffffffc0);
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_RANGE_MAX_HI, 0x0001ffff);
++		gpu_write(gpu, REG_A6XX_UCHE_TRAP_BASE_LO, 0xfffff000);
++		gpu_write(gpu, REG_A6XX_UCHE_TRAP_BASE_HI, 0x0001ffff);
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_THRU_BASE_LO, 0xfffff000);
++		gpu_write(gpu, REG_A6XX_UCHE_WRITE_THRU_BASE_HI, 0x0001ffff);
++	}
++
++	/*
++	 * IMAGE 282 -- the UCHE's GMEM (on-chip memory) window.
++	 *
++	 * We program [0x100000 : 0x100000 + gpu->gmem - 1], and gpu->gmem is
++	 * ZERO for a6xx in this tree (the per-chip info has no .gmem), so the
++	 * window we program is the degenerate 0x100000..0x0FFFFF.
++	 *
++	 * CAF programs it with its own formula
++	 * (drivers/gpu/msm/adreno.c:848-851, adreno_a6xx.c:822-828):
++	 *
++	 *   uche_gmem_base = ALIGN(gmem_size, SZ_1M);
++	 *   GMEM_RANGE_MIN = uche_gmem_base;
++	 *   GMEM_RANGE_MAX = uche_gmem_base + gmem_size - 1;
++	 *
++	 * with gmem_size = 256K -> [0x100000, 0x13FFFF].
++	 *
++	 * If the shader's private memory is misrouted out of the GMEM window
++	 * it would land in the system-memory path -- the path that is broken
++	 * for the 3D domain while the CP's works -- and a shader that cannot
++	 * use its scratch memory would never reach its stores.
++	 *
++	 * CAVEAT: upstream msm programs the same degenerate window as us and
++	 * works on a640 elsewhere, so this is a candidate, not a finding.  It
++	 * is cheap to test, so it is tested.
++	 *
++	 * a6xx.gmem_window=<KB> programs CAF's window for that size;
++	 * -1 (default) keeps the current behaviour.
++	 */
++	if (gmem_window >= 0) {
++		u32 size = gmem_window * 1024;
++		u32 base = (size + 0xFFFFF) & ~0xFFFFF;	/* ALIGN(size, 1M) */
++
++		gpu_write64(gpu, REG_A6XX_UCHE_GMEM_RANGE_MIN_LO,
++			REG_A6XX_UCHE_GMEM_RANGE_MIN_HI, base);
++		gpu_write64(gpu, REG_A6XX_UCHE_GMEM_RANGE_MAX_LO,
++			REG_A6XX_UCHE_GMEM_RANGE_MAX_HI, base + size - 1);
++		pr_info("GMEM282: window [0x%x, 0x%x] (CAF formula, %d KB)\n",
++			base, base + size - 1, gmem_window);
++	} else {
++		/* Set the GMEM VA range [0x100000:0x100000 + gpu->gmem - 1] */
++		gpu_write64(gpu, REG_A6XX_UCHE_GMEM_RANGE_MIN_LO,
++			REG_A6XX_UCHE_GMEM_RANGE_MIN_HI, 0x00100000);
++
++		gpu_write64(gpu, REG_A6XX_UCHE_GMEM_RANGE_MAX_LO,
++			REG_A6XX_UCHE_GMEM_RANGE_MAX_HI,
++			0x00100000 + adreno_gpu->gmem - 1);
++	}
++
++	gpu_write(gpu, REG_A6XX_UCHE_FILTER_CNTL, 0x804);
++	gpu_write(gpu, REG_A6XX_UCHE_CACHE_WAYS, 0x4);
++
++	if (adreno_is_a640(adreno_gpu) && a640_roq2)
++		gpu_write(gpu, REG_A6XX_CP_ROQ_THRESHOLDS_2, 0x02000140);
++	else
++		gpu_write(gpu, REG_A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0);
++	gpu_write(gpu, REG_A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c);
++	pr_info("ROQ243: THRESHOLDS_2=0x%08x a640_roq2=%d\n",
++		gpu_read(gpu, REG_A6XX_CP_ROQ_THRESHOLDS_2), a640_roq2);
++
++	if (a640_rbbm_nc)
++		gpu_write(gpu, REG_A6XX_RBBM_NC_MODE_CNTL, 1);
++	pr_info("RBBMCNC243: NC_MODE_CNTL=0x%x written=%d\n",
++		gpu_read(gpu, REG_A6XX_RBBM_NC_MODE_CNTL), a640_rbbm_nc);
++
++	/* Setting the mem pool size */
++	gpu_write(gpu, REG_A6XX_CP_MEM_POOL_SIZE, 128);
++
++	/*
++	 * IMAGE 280 -- the a640 value of PC_DBG_ECO_CNTL.
++	 *
++	 * MEASURED (image 276, a healthy CP, one boot):
++	 *   - the CP DOES execute userspace command streams (probe_cp_exec.py);
++	 *   - the CP DOES write a userspace buffer (CP_MEM_WRITE 0x11111111
++	 *     landed, A_WROTE=True);
++	 *   - every shader-domain write still fails (SSBO 0/64, FBO 0/6,
++	 *     CP_BLIT 0/4096) with NO SMMU fault, NO AHB error (and
++	 *     CP_AHB_CNTL=1 already makes unmapped AHB accesses error) and a
++	 *     correct page-table mapping.
++	 *
++	 * So the failure is inside the 3D domain, not in the memory path.
++	 *
++	 * This register sets the primFifo thresholds and the vccCacheSkipDis
++	 * bit -- the shader/primitive pipeline.  Upstream changed the a640
++	 * value in 2021 (commit 564499f5ddbb, "add missing PC_DBG_ECO_CNTL bit
++	 * for a640/a650", from downstream's "disable_tseskip" flag):
++	 *
++	 *   upstream master:
++	 *     a650 -> 0x00300200
++	 *     a640 -> 0x00200200
++	 *     else -> 0x00180000
++	 *
++	 * CAF on this part writes (0x400 << 11) = 0x00200000 for a640, and
++	 * Samsung's downstream sets the extra 0x200 (disable_tseskip), giving
++	 * 0x00200200 -- the same value upstream uses for a640.
++	 *
++	 * Our tree writes the GENERIC value, (0x300 << 11) = 0x00180000, for
++	 * every chip including a640.  The project's audit compared the hwcg
++	 * table and the UCHE/GBIF registers against CAF; it never looked at
++	 * this one.
++	 *
++	 * a6xx.pc_eco_a640=1 writes the a640 value and reads it back;
++	 * default 0 keeps the generic value.
++	 */
++	if (pc_eco_a640) {
++		gpu_write(gpu, REG_A6XX_PC_DBG_ECO_CNTL, 0x00200200);
++		pr_info("PCECO280: PC_DBG_ECO_CNTL=0x%08x (a640 value, was 0x%08x)\n",
++			gpu_read(gpu, REG_A6XX_PC_DBG_ECO_CNTL),
++			0x00180000);
++	} else {
++		/* Setting the primFifo thresholds default values */
++		gpu_write(gpu, REG_A6XX_PC_DBG_ECO_CNTL, (0x300 << 11));
++	}
++
++	/* Set the AHB default slave response to "ERROR" */
++	gpu_write(gpu, REG_A6XX_CP_AHB_CNTL, 0x1);
++
++	/* Turn on performance counters */
++	gpu_write(gpu, REG_A6XX_RBBM_PERFCTR_CNTL, 0x1);
++
++	/* Select CP0 to always count cycles */
++	gpu_write(gpu, REG_A6XX_CP_PERFCTR_CP_SEL_0, PERF_CP_ALWAYS_COUNT);
++
++	/* FIXME: not sure if this should live here or in a6xx_gmu.c */
++	gmu_write(&a6xx_gpu->gmu,  REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_MASK,
++		0xff000000);
++	gmu_rmw(&a6xx_gpu->gmu, REG_A6XX_GMU_CX_GMU_POWER_COUNTER_SELECT_0,
++		0xff, 0x20);
++	gmu_write(&a6xx_gpu->gmu, REG_A6XX_GMU_CX_GMU_POWER_COUNTER_ENABLE,
++		0x01);
++
++	/*
++	 * IMAGE 237 -- RB_NC_MODE_CNTL amsbc bit for A640 + UBWC 3.0.
++	 *
++	 * CAF (vendor adreno_a6xx.c:898-921): with DT qcom,ubwc-mode = <3>
++	 * (UBWC 3.0, which our sm8150-gpu.dtsi:125 sets), mode = 0 and
++	 * amsbc = 1, where the comment says amsbc is "Only valid for A640
++	 * and A680". With min-access-length 32 (mal = 0, :123) and
++	 * highest-bank-bit 15 (bit = (15-13)&3 = 2, :121), CAF writes:
++	 *
++	 *   RB_NC_MODE_CNTL   = (1<<4)|(0<<3)|(2<<1)|0 = 0x14
++	 *   TPL1_NC_MODE_CNTL = (0<<3)|(2<<1)|0        = 0x04
++	 *   SP_NC_MODE_CNTL   = (0<<3)|(2<<1)|0        = 0x04
++	 *
++	 * We wrote 0x04 to all three, i.e. the RB's amsbc field was 0.
++	 * This changes the RB's UBWC address-mode behaviour, so it can only
++	 * affect surfaces the RB writes -- which is exactly the failing path.
++	 *
++	 * Single-variable change: TPL1/SP keep 0x04 (CAF agrees), only the RB
++	 * write changes, 0x04 -> 0x14.
++	 */
++	gpu_write(gpu, REG_A6XX_RB_NC_MODE_CNTL, (1 << 4) | (2 << 1));
++	gpu_write(gpu, REG_A6XX_TPL1_NC_MODE_CNTL, 2 << 1);
++	gpu_write(gpu, REG_A6XX_SP_NC_MODE_CNTL, 2 << 1);
++	gpu_write(gpu, REG_A6XX_UCHE_MODE_CNTL, 2 << 21);
++
++	/* Enable fault detection */
++	if (reg_match)
++		gpu_write(gpu, REG_A6XX_RBBM_INTERFACE_HANG_INT_CNTL,
++			0x40cfffff);	/* the WORKING device's value */
++	else
++		gpu_write(gpu, REG_A6XX_RBBM_INTERFACE_HANG_INT_CNTL,
++			(1 << 30) | 0x1fffff);
++
++	gpu_write(gpu, REG_A6XX_UCHE_CLIENT_PF, 1);
++
++	/* Protect registers from the CP */
++	gpu_write(gpu, REG_A6XX_CP_PROTECT_CNTL, 0x00000003);
++
++	/*
++	 * IMAGE 285 -- CAF's CP_PROTECT table, verbatim.
++	 *
++	 * MEASURED (the ground-truth diff against the WORKING Android device):
++	 * our table is shifted by exactly one slot, because we merged CAF's two
++	 * entries {0xE00,1} and {0xE03,0xB} into a single {0xE00,0xE}.  The
++	 * hardware confirms it: on our device 0x8e01..0x8e77 read back as
++	 * 0xdeadbead (Adreno's "register protected" answer) while the working
++	 * device has real values there.  Every protection range from slot 14 on
++	 * lands in the wrong slot, and the 0x8E00 block -- the render block's
++	 * sub-block selection and the context-switch GMEM save/restore -- ends
++	 * up protected on ours and open on the working one.
++	 *
++	 * CAF also appends the MMU/SMMU register range from the DT property
++	 * qcom,protect = <0xa0000 0xc000> ("CB5(ATOS) & CB5/6/7 are protected
++	 * by HYP"), as extra read-protected slots of 0x2000 each, up to the
++	 * hardware's num_protected_regs (0x20 for a6xx).  We never applied it.
++	 */
++	if (cp_protect_caf) {
++		static const struct { u32 base, count; int read_protect; } prot[] = {
++			{ 0x600, 0x51, 0 },
++			{ 0xAE50, 0x2, 1 },
++			{ 0x9624, 0x13, 1 },
++			{ 0x8630, 0x8, 1 },
++			{ 0x9E70, 0x1, 1 },
++			{ 0x9E78, 0x187, 1 },
++			{ 0xF000, 0x810, 1 },
++			{ 0xFC00, 0x3, 0 },
++			{ 0x50E, 0x0, 1 },
++			{ 0x50F, 0x0, 0 },
++			{ 0x510, 0x0, 1 },
++			{ 0x0, 0x4F9, 0 },
++			{ 0x501, 0xA, 0 },
++			{ 0x511, 0x44, 0 },
++			{ 0xE00, 0x1, 1 },
++			{ 0xE03, 0xB, 1 },
++			{ 0x8E00, 0x0, 1 },
++			{ 0x8E50, 0xF, 1 },
++			{ 0xBE02, 0x0, 1 },
++			{ 0xBE20, 0x11F3, 1 },
++			{ 0x800, 0x82, 1 },
++			{ 0x8A0, 0x8, 1 },
++			{ 0x8AB, 0x19, 1 },
++			{ 0x900, 0x4D, 1 },
++			{ 0x98D, 0x76, 1 },
++			{ 0x8D0, 0x23, 0 },
++			{ 0x980, 0x4, 0 },
++			{ 0xA630, 0x0, 1 },
++		};
++		const int max_sets = 0x20;	/* a6xx num_protected_regs */
++		u32 mmu_base = 0xa0000, mmu_range = 0xc000;	/* DT: qcom,protect */
++		int i, num;
++
++		num = min_t(int, (int)ARRAY_SIZE(prot), max_sets);
++		for (i = 0; i < num; i++)
++			gpu_write(gpu, REG_A6XX_CP_PROTECT(i),
++				prot[i].base | (prot[i].count << 18) |
++				(prot[i].read_protect << 31));
++
++		while ((i < max_sets) && (mmu_range > 0)) {
++			u32 cur = min_t(u32, mmu_range, 0x2000);
++
++			gpu_write(gpu, REG_A6XX_CP_PROTECT(i),
++				mmu_base | ((cur - 1) << 18) | (1 << 31));
++			mmu_base += cur;
++			mmu_range -= cur;
++			i++;
++		}
++		pr_info("CPCAF285: CP_PROTECT slots: %d table + %d MMU (max %d)\n",
++			num, i - num, max_sets);
++	} else {
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(0),
++		A6XX_PROTECT_RDONLY(0x600, 0x51));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(1), A6XX_PROTECT_RW(0xae50, 0x2));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(2), A6XX_PROTECT_RW(0x9624, 0x13));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(3), A6XX_PROTECT_RW(0x8630, 0x8));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(4), A6XX_PROTECT_RW(0x9e70, 0x1));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(5), A6XX_PROTECT_RW(0x9e78, 0x187));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(6), A6XX_PROTECT_RW(0xf000, 0x810));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(7),
++		A6XX_PROTECT_RDONLY(0xfc00, 0x3));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(8), A6XX_PROTECT_RW(0x50e, 0x0));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(9), A6XX_PROTECT_RDONLY(0x50f, 0x0));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(10), A6XX_PROTECT_RW(0x510, 0x0));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(11),
++		A6XX_PROTECT_RDONLY(0x0, 0x4f9));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(12),
++		A6XX_PROTECT_RDONLY(0x501, 0xa));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(13),
++		A6XX_PROTECT_RDONLY(0x511, 0x44));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(14), A6XX_PROTECT_RW(0xe00, 0xe));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(15), A6XX_PROTECT_RW(0x8e00, 0x0));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(16), A6XX_PROTECT_RW(0x8e50, 0xf));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(17), A6XX_PROTECT_RW(0xbe02, 0x0));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(18),
++		A6XX_PROTECT_RW(0xbe20, 0x11f3));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(19), A6XX_PROTECT_RW(0x800, 0x82));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(20), A6XX_PROTECT_RW(0x8a0, 0x8));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(21), A6XX_PROTECT_RW(0x8ab, 0x19));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(22), A6XX_PROTECT_RW(0x900, 0x4d));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(23), A6XX_PROTECT_RW(0x98d, 0x76));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(24),
++			A6XX_PROTECT_RDONLY(0x8d0, 0x23));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(25),
++			A6XX_PROTECT_RDONLY(0x980, 0x4));
++	gpu_write(gpu, REG_A6XX_CP_PROTECT(26), A6XX_PROTECT_RW(0xa630, 0x0));
++	}
++
++	pr_info("HWINIT[17] before interrupt-mask programming\n");
++	/* Enable interrupts */
++	if (reg_match) {
++		gpu_write(gpu, REG_A6XX_RBBM_INT_0_MASK, 0x13d0e3c2);
++		pr_info("REG286: INT_0_MASK=0x%x HANG_INT_CNTL=0x%x CP_RB_CNTL=0x%x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_INT_0_MASK),
++			gpu_read(gpu, REG_A6XX_RBBM_INTERFACE_HANG_INT_CNTL),
++			gpu_read(gpu, REG_A6XX_CP_RB_CNTL));
++	} else
++		gpu_write(gpu, REG_A6XX_RBBM_INT_0_MASK, A6XX_INT_MASK);
++	pr_info("HWINIT[18] after interrupt-mask programming\n");
++
++	/* IMAGE 241: the image-240 inline SCID block stood here. It hung the
++	 * bring-up thread (R state, 5+ min) writing dword 0xF008 (= byte
++	 * 0x3C020, unmapped; correct canonical address is 0x3c02). The write is
++	 * now runtime-triggered via llcc_scid (default off): a bad address can
++	 * only wedge the triggering shell, never bring-up. See the param
++	 * setter near the module params. The SMMU-attr half of image 240 stays
++	 * inline (accepted = 0, safe). */
++	rbobs_gpu_stash = gpu;
++
++	pr_info("HWINIT[13] zap/secure: no zap init in this tree; SECVID_TRUST later\n");
++	pr_info("HWINIT[19] before adreno_hw_init\n");
++	gxstate_snap(gpu, "2");
++	ret = adreno_hw_init(gpu);
++	pr_info("HWINIT[20] after adreno_hw_init ret=%d\n", ret);
++	if (ret)
++		goto out;
++
++	ret = a6xx_ucode_init(gpu);
++	if (ret)
++		goto out;
++
++	/* Always come up on rb 0 */
++	pr_info("HWINIT[21] before SQE/ringbuffer base (cur_ring)\n");
++	a6xx_gpu->cur_ring = gpu->rb[0];
++	/*
++	 * TEMPORARY image 129 diagnostics -- REMOVE AFTER RESULT. Read-only
++	 * verification that ring HW programming (RB_BASE/CNTL/RPTR_ADDR in
++	 * adreno_hw_init, SQE_INSTR_BASE in ucode_init) already precedes SQE.
++	 * No move performed: the presumed post-cp_init ordering does not
++	 * exist in this tree.
++	 */
++	pr_info("RINGHW[00] SQE_INSTR_BASE=iova:0x%llx hw=0x%llx\n",
++		(unsigned long long)a6xx_gpu->sqe_iova,
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_SQE_INSTR_BASE_LO,
++			REG_A6XX_CP_SQE_INSTR_BASE_HI));
++	pr_info("RINGHW[01] CP_RB_BASE=iova:0x%llx hw=0x%llx\n",
++		(unsigned long long)gpu->rb_iova,
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_RB_BASE, REG_A6XX_CP_RB_BASE_HI));
++	pr_info("RINGHW[02] CP_RB_CNTL hw=0x%x\n",
++		gpu_read(gpu, REG_A6XX_CP_RB_CNTL));
++	pr_info("RINGHW[03] CP_RB_RPTR_ADDR hw=0x%llx\n",
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_RB_RPTR_ADDR_LO,
++			REG_A6XX_CP_RB_RPTR_ADDR_HI));
++	pr_info("RINGHW: rb_iova=0x%llx rb_size=%d sw_wptr_dw=%u\n",
++		(unsigned long long)gpu->rb_iova, gpu->rb[0]->size,
++		(unsigned)(gpu->rb[0]->cur - gpu->rb[0]->start));
++
++	/*
++	 * TEMPORARY image 209, condensed in 211 -- MEASUREMENT ONLY.
++	 *
++	 * memptrs_iova has been measured as 0 on three boots, which makes
++	 * rbmemptr(ring, fence) == 4, i.e. the CACHE_FLUSH_TS event is told to
++	 * write the fence at IOVA 0x4. memptrs_iova has never been printed
++	 * anywhere in this driver, so that zero was invisible for 200+ images.
++	 *
++	 * Condensed from three printk calls to one: this is the bring-up path,
++	 * and images 179-181 established that a printk here can wedge the
++	 * caller inside console_unlock and cost the machine its
++	 * responsiveness. One line, one format string, same information.
++	 */
++	pr_info("RINGHW[10] memptrs_iova=0x%llx rbmemptr_rptr=0x%llx rbmemptr_fence=0x%llx aspace=%px mmu=%px gmu_domain=%px\n",
++		(unsigned long long)adreno_gpu->memptrs_iova,
++		(unsigned long long)rbmemptr(gpu->rb[0], rptr),
++		(unsigned long long)rbmemptr(gpu->rb[0], fence),
++		(void *)gpu->aspace,
++		(gpu->aspace && gpu->aspace->mmu) ? (void *)gpu->aspace->mmu : NULL,
++		(void *)a6xx_gpu->gmu.domain);
++	gxstate_snap(gpu, "3");
++	if (gx_vote_done)
++		pr_info("GX132-CP: vote was sent this boot (see GX132-* above)\n");
++	pr_info("HWINIT[09] before CP_SQE_CNTL\n");
++	pr_info("RINGHW[04] CP_SQE_CNTL = 1\n");
++	/* Enable the SQE_to start the CP engine */
++	gpu_write(gpu, REG_A6XX_CP_SQE_CNTL, 1);
++	pr_info("HWINIT[10] after CP_SQE_CNTL RBBM_STATUS=0x%x\n",
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++
++	pr_info("HWINIT[11] before a6xx_cp_init\n");
++	pr_info("RINGHW[05] a6xx_cp_init enter\n");
++	ret = a6xx_cp_init(gpu);
++	pr_info("HWINIT[12] after a6xx_cp_init ret=%d\n", ret);
++	if (ret)
++		goto out;
++
++	/*
++	 * TEMPORARY image 134 secure probe -- REMOVE AFTER RESULT.
++	 * secure_probe=0: direct write (baseline). =1: skip it, continue.
++	 * =2: ZAP unavailable in this tree (no firmware, no zap-shader DT
++	 * child, no a6xx hookup) -> log and fall back to mode 0 path.
++	 */
++	pr_info("SECVID134: TRUST_CNTL=0x%x TSB_CNTL=0x%x TSB_BASE=0x%x SIZE=0x%x STATUS=0x%x RPTR=0x%x WPTR=0x%x OOB_H2G=0x%x OOB_G2H=0x%x RPMHPWR=0x%x mode=%d\n",
++		gpu_read(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL),
++		gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL),
++		gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO),
++		gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++		gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_HOST2GMU_INTR_RAW_INFO),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO),
++		gmu_read(&a6xx_gpu->gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++		secure_probe);
++
++	/*
++	 * IMAGE 277 -- switch out of secure mode the way the GPU's own CP is
++	 * asked to do it.  Stock KGSL (adreno.c:1870-1875) and mainline a5xx
++	 * (a5xx_gpu.c:578-588) both do exactly this once the ZAP shader has
++	 * authorised the CP; only the "no zap" fallback writes the register
++	 * from the host, and image 273 proved that fallback wedges this part.
++	 */
++	if (cp_secure_off) {
++		struct msm_ringbuffer *ring = gpu->rb[0];
++
++		pr_info("SECVID277: CP path: before TRUST_CNTL=0x%x TSB_CNTL=0x%x TSB_BASE=0x%x SIZE=0x%x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL),
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL),
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO),
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE));
++		OUT_PKT7(ring, CP_SET_SECURE_MODE, 1);
++		OUT_RING(ring, 0x00000000);
++		a6xx_flush(gpu, ring);
++		if (!a6xx_idle(gpu, ring)) {
++			pr_err("SECVID277: a6xx_idle TIMEOUT after CP_SET_SECURE_MODE(0)\n");
++			pr_info("SECVID277: RPTR=0x%x WPTR=0x%x STATUS=0x%x INT0=0x%x\n",
++				gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++				gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++				gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++				gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS));
++			ret = -ETIMEDOUT;
++			goto out;
++		}
++		pr_info("SECVID277: CP path: after TRUST_CNTL=0x%x TSB_CNTL=0x%x TSB_BASE=0x%x SIZE=0x%x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL),
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL),
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO),
++			gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE));
++		pr_info("SECVID277: RPTR=0x%x WPTR=0x%x STATUS=0x%x\n",
++			gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++			gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++	} else if (secure_probe == 1 || experimental_nonlegacy) {
++		/*
++		 * IMAGE 273 -- decouple the secure-video trust setup from the
++		 * HFI path.
++		 *
++		 * The condition above conflates two unrelated things.  The
++		 * `experimental_nonlegacy` flag selects the non-legacy HFI v2
++		 * path (a640/a650) and has nothing to do with the secure-video
++		 * trust configuration.  But because our cmdline sets
++		 * a6xx.experimental_nonlegacy=1, the SECVID_TRUST_CNTL write is
++		 * skipped on every boot -- and the tree's own HWINIT[13] message
++		 * says what it intended:
++		 *
++		 *   "HWINIT[13] zap/secure: no zap init in this tree; SECVID_TRUST later"
++		 *
++		 * i.e. "no ZAP init, so we will use SECVID_TRUST instead" --
++		 * and then the SECVID_TRUST write is skipped.  Neither trust
++		 * mechanism runs.
++		 *
++		 * a6xx.secvid=1 forces the write anyway, so the two concerns can
++		 * be tested separately.  The before/after readbacks make the
++		 * experiment falsifiable even if the render does not change: we
++		 * will see whether the write has any effect on the registers at
++		 * all.
++		 */
++		if (secvid) {
++			pr_info("SECVID273: FORCING SECVID_TRUST_CNTL write (a6xx.secvid=1) despite nonlegacy=%d\n",
++				(int)experimental_nonlegacy);
++			pr_info("SECVID273: before: TRUST_CNTL=0x%x TSB_CNTL=0x%x TSB_BASE=0x%x SIZE=0x%x\n",
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL),
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL),
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO),
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE));
++			gpu_write(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL, 0x0);
++			pr_info("SECVID273: after: TRUST_CNTL=0x%x TSB_CNTL=0x%x TSB_BASE=0x%x SIZE=0x%x\n",
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL),
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL),
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO),
++				gpu_read(gpu, REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE));
++		} else {
++			pr_info("SECVID134: mode=%d/nonlegacy=%d SKIP direct SECVID_TRUST_CNTL write\n",
++				secure_probe, (int)experimental_nonlegacy);
++		}
++	} else {
++		if (secure_probe == 2)
++			pr_info("SECVID134: mode=2 ZAP-UNAVAILABLE (no a640_zap fw, no zap-shader DT child, no a6xx hookup); using mode-0 write\n");
++		pr_info("SECVID134: mode=%d before direct SECVID_TRUST_CNTL write\n",
++			secure_probe);
++		gpu_write(gpu, REG_A6XX_RBBM_SECVID_TRUST_CNTL, 0x0);
++		pr_info("SECVID134: after direct SECVID_TRUST_CNTL write\n");
++	}
++
++out:
++	/*
++	 * Tell the GMU that we are done touching the GPU and it can start power
++	 * management
++	 */
++	pr_info("HWINIT[15] secure-submit: no secure path in this tree\n");
++	pr_info("HWINIT[23] before final OOB clear\n");
++	if (hold_boot) {
++		pr_info("HOLD150: keeping GPU_SET+BOOT_SLUMBER OOBs (no GMU power handoff)\n");
++	} else {
++		a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
++
++		/* Take the GMU out of its special boot mode */
++		a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_BOOT_SLUMBER);
++	}
++	pr_info("HWINIT[24] after final OOB clear\n");
++
++	/* TEMPORARY image 137 self-test + image 142 confidence loop.
++	 * Re-proves CPU->ring->CP->idle with the proven CP_ME_INIT sequence,
++	 * 10x. Timeout-bounded inside a6xx_idle; stops at first failure. */
++	if (experimental_nonlegacy && a6xx_selftest && !ret) {
++		int iter, stret = 0;
++		for (iter = 0; iter < 10; iter++) {
++			stret = a6xx_cp_init(gpu);
++			pr_info("SELFTEST142: iter=%d cp_init ret=%d RPTR=0x%x WPTR=0x%x STATUS=0x%x\n",
++				iter, stret,
++				gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++				gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++				gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++			bc132("SELFTEST", stret);
++			if (stret)
++				break;
++		}
++		pr_info("SELFTEST142: done last_iter=%d %s\n", iter,
++			stret ? "FAILED" : "ALL 10 PASS");
++	}
++
++	if (experimental_nonlegacy && !ret && a6xx_instr) {
++		dw161_ag = a6xx_gpu;
++		dw161_shot = 0;
++		/* SHOT-1: synchronous baseline (always lands, even if
++		 * death is <50ms out). Runs BEFORE [25] return, i.e.
++		 * before enable_irq in the caller. */
++		dw161_regs(a6xx_gpu, "SHOTN1");
++		schedule_delayed_work(&dw161_work,
++			msecs_to_jiffies(50));
++		sw165_arm(a6xx_gpu);
++		pr_info("DW161: armed (sync+50/250ms/1/5/30s)\n");
++	}
++
++	/*
++	 * TEMPORARY image 178 -- PROMOTE IFF SURVIVAL EXTENDS. Halt the
++	 * GMU firmware before slumber (clocks still on, GMU accessible).
++	 * See the param description for the rationale.
++	 */
++	if (halt_gmu && !ret) {
++		gmu_write(&a6xx_gpu->gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
++		pr_info("HALT178: GMU CM3 halted after successful hw_init\n");
++	}
++
++	/*
++	 * TEMPORARY image 165 -- PROMOTE IFF SURVIVAL EXTENDS. First
++	 * managed power cycle: instead of leaving the GPU awake at the
++	 * firmware's mercy (every prior image), drive it into proper
++	 * slumber via the existing suspend path (VBIF halt + wait_idle +
++	 * notify_slumber + hfi_stop + irq_disable + rpmh_stop + clocks
++	 * off). SHOTN1 above captured the awake state for comparison;
++	 * SHOT0 will verify slumber (RPMHPWR should read 0xf). Failure
++	 * logs loudly and continues awake (old behavior, instruments live).
++	 */
++	if (slumber165 && !ret) {
++		int sret = a6xx_pm_suspend(gpu);
++		pr_info("SLUM165: pm_suspend returned %d (RPMHPWR=0x%x BUSY=0x%x)\n",
++			sret,
++			gmu_read(&a6xx_gpu->gmu,
++				REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
++			gmu_read(&a6xx_gpu->gmu,
++				REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS));
++		if (sret)
++			pr_info("SLUM165: slumber failed, continuing awake (old behavior)\n");
++	}
++
++	pr_info("HWINIT[25] return ret=%d\n", ret);
++	return ret;
++}
++
++static void a6xx_dump(struct msm_gpu *gpu)
++{
++	dev_info(&gpu->pdev->dev, "status:   %08x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++	adreno_dump(gpu);
++}
++
++#define VBIF_RESET_ACK_TIMEOUT	100
++#define VBIF_RESET_ACK_MASK	0x00f0
++
++static void a6xx_recover(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	int i;
++
++	adreno_dump_info(gpu);
++
++	for (i = 0; i < 8; i++)
++		dev_info(&gpu->pdev->dev, "CP_SCRATCH_REG%d: %u\n", i,
++			gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(i)));
++
++	if (hang_debug)
++		a6xx_dump(gpu);
++
++	/*
++	 * Turn off keep alive that might have been enabled by the hang
++	 * interrupt
++	 */
++	gmu_write(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE, 0);
++
++	/*
++	 * TEMPORARY image 205 -- DIAGNOSTIC. The power cycle that used to be
++	 * here is removed on purpose.
++	 *
++	 * Measured on image 204. The hangcheck fired exactly once, at t=118s,
++	 * triggered by fence=0 while submitted=5. This function then ran
++	 * pm_suspend + pm_resume + msm_gpu_hw_init, and the machine never
++	 * recovered:
++	 *
++	 *   t=69.8   CPDUMP[auto-post]/auto-rest MMIO reads succeed
++	 *   t=100-118  five glstage runs PASS, render node healthy
++	 *   t=118.3  HANGCHK141 LOCKUP -> recover_worker -> a6xx_recover
++	 *   t=130+   a6xx_gpu_cpstate_show permanently D, 0 bytes returned
++	 *   t=700+   glstage HANGS AT STARTUP (was 5/5 passing minutes earlier)
++	 *
++	 * The post-recover symptom is MMIO that never returns: the cpstate
++	 * reader wedges inside its register reads, and EGL initialisation
++	 * blocks. An ioremap read against a power domain this tree left in a
++	 * half-transitioned state has no timeout and no watchdog, so it is D
++	 * forever with nothing in dmesg.
++	 *
++	 * That matters because it destroys the only instrument we have. The
++	 * one question left is whether the GPU actually EXECUTES the ring --
++	 * and answering it needs live register reads, which this power cycle
++	 * switches off permanently after a single spurious hangcheck.
++	 *
++	 * The power cycle is also the wrong tool on this tree by construction:
++	 * the GPU is powered by the on-demand sysfs trigger, which bypasses
++	 * runtime PM entirely, so calling pm_suspend/pm_resume here drives a
++	 * state machine the hardware was never put into. That is the same
++	 * mismatch that made pm_runtime_get_sync deadlock in image 203/204.
++	 *
++	 * So: keep the dumps (they are pure reads and are the whole point of
++	 * calling recover), drop the reset. If the GPU genuinely hangs, the
++	 * right response is a real fix to the hang, not a power cycle that
++	 * also takes out register access.
++	 */
++}
++
++static int a6xx_fault_handler(void *arg, unsigned long iova, int flags)
++{
++	struct msm_gpu *gpu = arg;
++
++	pr_warn_ratelimited("*** gpu fault: iova=%08lx, flags=%d (%u,%u,%u,%u)\n",
++			iova, flags,
++			gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(4)),
++			gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(5)),
++			gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(6)),
++			gpu_read(gpu, REG_A6XX_CP_SCRATCH_REG(7)));
++
++	return -EFAULT;
++}
++
++static void a6xx_cp_hw_err_irq(struct msm_gpu *gpu)
++{
++	u32 status = gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS);
++
++	if (status & A6XX_CP_INT_CP_OPCODE_ERROR) {
++		u32 val;
++
++		gpu_write(gpu, REG_A6XX_CP_SQE_STAT_ADDR, 1);
++		val = gpu_read(gpu, REG_A6XX_CP_SQE_STAT_DATA);
++		dev_err_ratelimited(&gpu->pdev->dev,
++			"CP | opcode error | possible opcode=0x%8.8X\n",
++			val);
++	}
++
++	if (status & A6XX_CP_INT_CP_UCODE_ERROR)
++		dev_err_ratelimited(&gpu->pdev->dev,
++			"CP ucode error interrupt\n");
++
++	if (status & A6XX_CP_INT_CP_HW_FAULT_ERROR)
++		dev_err_ratelimited(&gpu->pdev->dev, "CP | HW fault | status=0x%8.8X\n",
++			gpu_read(gpu, REG_A6XX_CP_HW_FAULT));
++
++	if (status & A6XX_CP_INT_CP_REGISTER_PROTECTION_ERROR) {
++		u32 val = gpu_read(gpu, REG_A6XX_CP_PROTECT_STATUS);
++
++		dev_err_ratelimited(&gpu->pdev->dev,
++			"CP | protected mode error | %s | addr=0x%8.8X | status=0x%8.8X\n",
++			val & (1 << 20) ? "READ" : "WRITE",
++			(val & 0x3ffff), val);
++	}
++
++	if (status & A6XX_CP_INT_CP_AHB_ERROR)
++		dev_err_ratelimited(&gpu->pdev->dev, "CP AHB error interrupt\n");
++
++	if (status & A6XX_CP_INT_CP_VSD_PARITY_ERROR)
++		dev_err_ratelimited(&gpu->pdev->dev, "CP VSD decoder parity error\n");
++
++	if (status & A6XX_CP_INT_CP_ILLEGAL_INSTR_ERROR)
++		dev_err_ratelimited(&gpu->pdev->dev, "CP illegal instruction error\n");
++
++}
++
++static void a6xx_fault_detect_irq(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct drm_device *dev = gpu->dev;
++	struct msm_drm_private *priv = dev->dev_private;
++	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
++
++	/*
++	 * Force the GPU to stay on until after we finish
++	 * collecting information
++	 */
++	gmu_write(&a6xx_gpu->gmu, REG_A6XX_GMU_GMU_PWR_COL_KEEPALIVE, 1);
++
++	/*
++	 * IMAGE 231: we have been blind at exactly the wrong moment.
++	 *
++	 * RBBM_STATUS alone cannot tell an SMMU stall from a shader-pipe
++	 * launch failure from a CP fault -- three very different bugs with
++	 * three different fixes. Upstream master reads STATUS3 FIRST and
++	 * bails on SMMU_STALLED_ON_FAULT (donor/master:1831-1832); our handler
++	 * never read STATUS3 at all, so that case has always been misread as a
++	 * generic hang.
++	 *
++	 * Dump the discriminating registers alongside the status.
++	 */
++	{
++		u32 status3 = gpu_read(gpu, REG_A6XX_RBBM_STATUS3);
++		u32 int0 = gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS);
++		u32 cpi = gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS);
++		u32 cphw = gpu_read(gpu, REG_A6XX_CP_HW_FAULT);
++
++		DRM_DEV_ERROR(&gpu->pdev->dev,
++			"  DIAG231 status3=0x%08x%s int0=0x%08x cp_int=0x%08x cp_hw_fault=0x%08x\n",
++			status3,
++			(status3 & A6XX_RBBM_STATUS3_SMMU_STALLED_ON_FAULT) ?
++				" *** SMMU_STALLED_ON_FAULT ***" : "",
++			int0, cpi, cphw);
++	}
++
++	DRM_DEV_ERROR(&gpu->pdev->dev,
++		"gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
++		ring ? ring->id : -1, ring ? ring->seqno : 0,
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++		gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++		gpu_read64(gpu, REG_A6XX_CP_IB1_BASE, REG_A6XX_CP_IB1_BASE_HI),
++		gpu_read(gpu, REG_A6XX_CP_IB1_REM_SIZE),
++		gpu_read64(gpu, REG_A6XX_CP_IB2_BASE, REG_A6XX_CP_IB2_BASE_HI),
++		gpu_read(gpu, REG_A6XX_CP_IB2_REM_SIZE));
++
++	/* Turn off the hangcheck timer to keep it from bothering us */
++	del_timer(&gpu->hangcheck_timer);
++
++	queue_work(priv->wq, &gpu->recover_work);
++}
++
++static irqreturn_t a6xx_irq(struct msm_gpu *gpu)
++{
++	u32 status = gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS);
++
++	gpu_write(gpu, REG_A6XX_RBBM_INT_CLEAR_CMD, status);
++
++	if (status & A6XX_RBBM_INT_0_MASK_RBBM_HANG_DETECT)
++		a6xx_fault_detect_irq(gpu);
++
++	if (status & A6XX_RBBM_INT_0_MASK_CP_AHB_ERROR)
++		dev_err_ratelimited(&gpu->pdev->dev, "CP | AHB bus error\n");
++
++	if (status & A6XX_RBBM_INT_0_MASK_CP_HW_ERROR)
++		a6xx_cp_hw_err_irq(gpu);
++
++	if (status & A6XX_RBBM_INT_0_MASK_RBBM_ATB_ASYNCFIFO_OVERFLOW)
++		dev_err_ratelimited(&gpu->pdev->dev, "RBBM | ATB ASYNC overflow\n");
++
++	if (status & A6XX_RBBM_INT_0_MASK_RBBM_ATB_BUS_OVERFLOW)
++		dev_err_ratelimited(&gpu->pdev->dev, "RBBM | ATB bus overflow\n");
++
++	if (status & A6XX_RBBM_INT_0_MASK_UCHE_OOB_ACCESS)
++		dev_err_ratelimited(&gpu->pdev->dev, "UCHE | Out of bounds access\n");
++
++	if (status & A6XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS)
++		msm_gpu_retire(gpu);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * TEMPORARY image 185 -- DIAGNOSTIC ONLY, safe to keep until answered.
++ *
++ * Dump the CP ring + interrupt state on demand. This exists because the
++ * first-pixels run (MESA-RENDER-ATTEMPT-2.md) produced a fully working
++ * EGL/GLES context on FD640 -- glClear and glFlush both return error 0 --
++ * yet glFinish and glReadPixels block forever. /proc/interrupts shows the
++ * GPU core IRQ (Linux 487, "A640") at ZERO while the HFI IRQ counted 7, so
++ * a6xx_irq() never runs and msm_gpu_retire() never releases the fence.
++ *
++ * Two very different bugs hide behind that, and they are not distinguishable
++ * from userspace: no /proc/gpu, no /dev/mem, debugfs dri/0/gpu is empty.
++ *
++ *   (A) The CP is not running the render ring at all.
++ *   (B) The CP runs it but never raises the completion interrupt.
++ *
++ * This answers it directly. The bring-up already proves the ring is
++ * programmed correctly (RINGHW[01] CP_RB_BASE=iova:0x1000 hw=0x1000, and
++ * rp_iova is 0x1000, so the HW ring IS the real render ring, not a scratch
++ * one), and RPTR demonstrably advances across the selftest -- so the
++ * "scratch ring" theory is already dead. What is unknown is the state of
++ * that ring *after* Mesa has submitted to it and is blocked in glFinish.
++ *
++ * Read-only. No register is written.
++ */
++/*
++ * TEMPORARY image 196 -- READABLE cpstate for userspace polling.
++ *
++ * Once the GPU actually executes (image 195), submitting GL work hard-resets
++ * the system with NO kernel record: no panic, no oops, no SMMU fault, no
++ * watchdog. dmesg just stops mid-stream and /proc/last_kmsg cannot help,
++ * because a hard reset writes no pstore record.
++ *
++ * The existing dump therefore fails exactly when needed -- its output goes to
++ * the ring buffer, which the reset discards. And there is no pure-userspace
++ * route: /dev/mem does not exist on this system, and msm's debugfs register
++ * interface is non-functional in this CAF tree (the `gpu` file is empty and
++ * writes are rejected).
++ *
++ * So the probe must RETURN values rather than print them. A userspace poller
++ * can then sample at high rate and fsync each sample itself, so the last
++ * samples before the reset survive on disk. The kernel hands values over
++ * early; userspace decides when they are durable.
++ *
++ * Caller holds gpu->dev->struct_mutex.
++ */
++int a6xx_cp_state_read(struct msm_gpu *gpu, char *page, size_t size)
++{
++	struct adreno_gpu *adreno = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx = to_a6xx_gpu(adreno);
++	struct a6xx_gmu *gmu = &a6xx->gmu;
++	size_t n = 0;
++
++	/* Values we most want at the instant the machine dies. */
++	n += scnprintf(page + n, size - n, "RBBM_STATUS 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS));
++	n += scnprintf(page + n, size - n, "RBBM_STATUS3 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_RBBM_STATUS3));
++	n += scnprintf(page + n, size - n, "CP_RB_CNTL 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_CP_RB_CNTL));
++	n += scnprintf(page + n, size - n, "CP_RB_WPTR 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_CP_RB_WPTR));
++	n += scnprintf(page + n, size - n, "CP_RB_RPTR 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_CP_RB_RPTR));
++	n += scnprintf(page + n, size - n, "CP_SQE_CNTL 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_CP_SQE_CNTL));
++	n += scnprintf(page + n, size - n, "CP_INTERRUPT_STATUS 0x%08x\n",
++			gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS));
++	n += scnprintf(page + n, size - n, "SPTPRAC_PWR_CLK_STATUS 0x%08x\n",
++			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
++	n += scnprintf(page + n, size - n, "RPMH_POWER_STATE 0x%08x\n",
++			gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE));
++	n += scnprintf(page + n, size - n, "GMU2HOST_INTR_INFO 0x%08x\n",
++			gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
++	n += scnprintf(page + n, size - n, "sw_rb_iova 0x%llx\n",
++			(unsigned long long)gpu->rb_iova);
++
++	/*
++	 * CP clock test, mirroring the CPF logic used by the auto-rest dump.
++	 * If this counter is not advancing the CP is not fetching, which is
++	 * the single most useful thing to know at the moment of death.
++	 */
++	{
++		u64 t0, t1;
++
++		t0 = gpu_read64(gpu, REG_A6XX_RBBM_PERFCTR_CP_0_LO,
++				REG_A6XX_RBBM_PERFCTR_CP_0_HI);
++		udelay(1000);
++		t1 = gpu_read64(gpu, REG_A6XX_RBBM_PERFCTR_CP_0_LO,
++				REG_A6XX_RBBM_PERFCTR_CP_0_HI);
++		n += scnprintf(page + n, size - n,
++				"CP_TIMESTAMP 0x%016llx delta %llu clocking %d\n",
++				(unsigned long long)t1,
++				(unsigned long long)(t1 - t0),
++				(t1 != t0));
++	}
++
++	return n;
++}
++
++/*
++ * IMAGE 283 -- read a list of GPU register offsets and print their values.
++ *
++ * WHY: the ground truth.  The WORKING device (Android/KGSL) has been
++ * captured: 2342 register entries, decoded against a6xx_reg.h, and saved as
++ * artifacts/gpu-bringup/ground-truth/android-gpu-regs.txt.  To compare, the
++ * same registers have to be read on THIS device.
++ *
++ * /dev/mem is no help: this kernel's devmem_is_allowed() refuses exclusive
++ * device regions, and the GPU's MMIO is claimed exclusively by the driver.
++ * But the driver has the ioremap, so it can read the registers itself.
++ *
++ * The offset list is read from /userdata/gpuwork/reg_offsets.txt (one hex
++ * offset per line), so the same list can be changed without a rebuild.
++ * Offsets are word indices, the same convention as the XML header and as
++ * CAF's a6xx_reg.h, and the same convention the Android snapshot uses.
++ */
++static void a6xx_cp_state_regs(struct msm_gpu *gpu)
++{
++	struct file *f;
++	char *buf, *line, *p;
++	loff_t pos = 0;
++	ssize_t n;
++	unsigned long count = 0;
++
++	f = filp_open("/userdata/gpuwork/reg_offsets.txt", O_RDONLY, 0);
++	if (IS_ERR(f)) {
++		pr_info("REGS: cannot open the offset list: %ld\n", PTR_ERR(f));
++		return;
++	}
++
++	buf = kzalloc(256 * 1024, GFP_KERNEL);
++	if (!buf) {
++		filp_close(f, NULL);
++		return;
++	}
++
++	n = kernel_read(f, buf, 256 * 1024 - 1, &pos);
++	filp_close(f, NULL);
++	if (n <= 0) {
++		pr_info("REGS: offset list is empty (%zd)\n", n);
++		kfree(buf);
++		return;
++	}
++	buf[n] = '\0';
++
++	p = buf;
++	while ((line = strsep(&p, "\n")) != NULL) {
++		unsigned long off;
++
++		if (!*line)
++			continue;
++		off = simple_strtoul(line, NULL, 0);
++		if (off >= 0x10000)	/* outside the a6xx register window */
++			continue;
++		pr_info("REGS %05lx %08x\n", off, gpu_read(gpu, (u32)off));
++		count++;
++	}
++	pr_info("REGS: %lu registers read\n", count);
++	kfree(buf);
++}
++
++int a6xx_cp_state_dump(struct msm_gpu *gpu, const char *tag)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	struct msm_ringbuffer *rb = gpu->rb[0];
++	u64 t0, t1;
++
++	if (!strcmp(tag, "REGS"))
++		a6xx_cp_state_regs(gpu);
++
++	pr_info("CPDUMP[%s] ---- a6xx CP state ----\n", tag);
++
++	pr_info("CPDUMP[%s] sw : rb_iova=0x%llx rb_size=%d wptr_dw=%u next_dw=%u\n",
++		tag,
++		(unsigned long long)gpu->rb_iova,
++		rb ? rb->size : -1,
++		rb ? (unsigned)(rb->cur - rb->start) : 0,
++		rb ? (unsigned)(rb->next - rb->start) : 0);
++
++	pr_info("CPDUMP[%s] hw : RB_BASE=0x%llx RB_CNTL=0x%x RB_RPTR_ADDR=0x%llx\n",
++		tag,
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_RB_BASE, REG_A6XX_CP_RB_BASE_HI),
++		gpu_read(gpu, REG_A6XX_CP_RB_CNTL),
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_RB_RPTR_ADDR_LO, REG_A6XX_CP_RB_RPTR_ADDR_HI));
++
++	pr_info("CPDUMP[%s] hw : RB_RPTR=0x%x RB_WPTR=0x%x SQE_CNTL=0x%x SQE_BASE=0x%llx (sw 0x%llx)\n",
++		tag,
++		gpu_read(gpu, REG_A6XX_CP_RB_RPTR),
++		gpu_read(gpu, REG_A6XX_CP_RB_WPTR),
++		gpu_read(gpu, REG_A6XX_CP_SQE_CNTL),
++		(unsigned long long)gpu_read64(gpu,
++			REG_A6XX_CP_SQE_INSTR_BASE_LO,
++			REG_A6XX_CP_SQE_INSTR_BASE_HI),
++		(unsigned long long)a6xx_gpu->sqe_iova);
++
++	pr_info("CPDUMP[%s] irq: INT_0_STATUS=0x%x INT_0_MASK=0x%x CP_INTERRUPT_STATUS=0x%x\n",
++		tag,
++		gpu_read(gpu, REG_A6XX_RBBM_INT_0_STATUS),
++		gpu_read(gpu, REG_A6XX_RBBM_INT_0_MASK),
++		gpu_read(gpu, REG_A6XX_CP_INTERRUPT_STATUS));
++
++	pr_info("CPDUMP[%s] st : RBBM_STATUS=0x%x RBBM_STATUS3=0x%x linux_irq=%u irqs=%lu\n",
++		tag,
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS),
++		gpu_read(gpu, REG_A6XX_RBBM_STATUS3),
++		gpu->irq,
++		gpu->irq >= 0 ? kstat_irqs((unsigned int)gpu->irq) : 0UL);
++
++	/*
++	 * The decisive bit. PERFCTR_CP_0 is clocked by the command processor
++	 * itself, so if it advances over a short interval the CP is genuinely
++	 * running right now -- independently of whether the interrupt ever
++	 * fires. That is exactly the (A)/(B) discriminator, and it works even
++	 * though the IRQ path is the thing that is broken.
++	 */
++	t0 = gpu_read64(gpu, REG_A6XX_RBBM_PERFCTR_CP_0_LO,
++		REG_A6XX_RBBM_PERFCTR_CP_0_HI);
++	msleep(50);
++	t1 = gpu_read64(gpu, REG_A6XX_RBBM_PERFCTR_CP_0_LO,
++		REG_A6XX_RBBM_PERFCTR_CP_0_HI);
++	pr_info("CPDUMP[%s] CPF: t0=0x%llx t1=0x%llx delta=%llu => CP is %s\n",
++		tag, t0, t1, (unsigned long long)(t1 - t0),
++		(t1 != t0) ? "CLOCKING (running, problem is the IRQ)"
++			   : "NOT CLOCKING (stalled, problem is the ring)");
++
++	pr_info("CPDUMP[%s] ---- end ----\n", tag);
++	return 0;
++}
++
++static const u32 a6xx_register_offsets[REG_ADRENO_REGISTER_MAX] = {
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_BASE, REG_A6XX_CP_RB_BASE),
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_BASE_HI, REG_A6XX_CP_RB_BASE_HI),
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_RPTR_ADDR,
++		REG_A6XX_CP_RB_RPTR_ADDR_LO),
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_RPTR_ADDR_HI,
++		REG_A6XX_CP_RB_RPTR_ADDR_HI),
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_RPTR, REG_A6XX_CP_RB_RPTR),
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_WPTR, REG_A6XX_CP_RB_WPTR),
++	REG_ADRENO_DEFINE(REG_ADRENO_CP_RB_CNTL, REG_A6XX_CP_RB_CNTL),
++};
++
++static const u32 a6xx_registers[] = {
++	0x0000, 0x0002, 0x0010, 0x0010, 0x0012, 0x0012, 0x0018, 0x001b,
++	0x001e, 0x0032, 0x0038, 0x003c, 0x0042, 0x0042, 0x0044, 0x0044,
++	0x0047, 0x0047, 0x0056, 0x0056, 0x00ad, 0x00ae, 0x00b0, 0x00fb,
++	0x0100, 0x011d, 0x0200, 0x020d, 0x0210, 0x0213, 0x0218, 0x023d,
++	0x0400, 0x04f9, 0x0500, 0x0500, 0x0505, 0x050b, 0x050e, 0x0511,
++	0x0533, 0x0533, 0x0540, 0x0555, 0x0800, 0x0808, 0x0810, 0x0813,
++	0x0820, 0x0821, 0x0823, 0x0827, 0x0830, 0x0833, 0x0840, 0x0843,
++	0x084f, 0x086f, 0x0880, 0x088a, 0x08a0, 0x08ab, 0x08c0, 0x08c4,
++	0x08d0, 0x08dd, 0x08f0, 0x08f3, 0x0900, 0x0903, 0x0908, 0x0911,
++	0x0928, 0x093e, 0x0942, 0x094d, 0x0980, 0x0984, 0x098d, 0x0996,
++	0x0998, 0x099e, 0x09a0, 0x09a6, 0x09a8, 0x09ae, 0x09b0, 0x09b1,
++	0x09c2, 0x09c8, 0x0a00, 0x0a03, 0x0c00, 0x0c04, 0x0c06, 0x0c06,
++	0x0c10, 0x0cd9, 0x0e00, 0x0e0e, 0x0e10, 0x0e13, 0x0e17, 0x0e19,
++	0x0e1c, 0x0e2b, 0x0e30, 0x0e32, 0x0e38, 0x0e39, 0x8600, 0x8601,
++	0x8610, 0x861b, 0x8620, 0x8620, 0x8628, 0x862b, 0x8630, 0x8637,
++	0x8e01, 0x8e01, 0x8e04, 0x8e05, 0x8e07, 0x8e08, 0x8e0c, 0x8e0c,
++	0x8e10, 0x8e1c, 0x8e20, 0x8e25, 0x8e28, 0x8e28, 0x8e2c, 0x8e2f,
++	0x8e3b, 0x8e3e, 0x8e40, 0x8e43, 0x8e50, 0x8e5e, 0x8e70, 0x8e77,
++	0x9600, 0x9604, 0x9624, 0x9637, 0x9e00, 0x9e01, 0x9e03, 0x9e0e,
++	0x9e11, 0x9e16, 0x9e19, 0x9e19, 0x9e1c, 0x9e1c, 0x9e20, 0x9e23,
++	0x9e30, 0x9e31, 0x9e34, 0x9e34, 0x9e70, 0x9e72, 0x9e78, 0x9e79,
++	0x9e80, 0x9fff, 0xa600, 0xa601, 0xa603, 0xa603, 0xa60a, 0xa60a,
++	0xa610, 0xa617, 0xa630, 0xa630,
++	~0
++};
++
++static int a6xx_pm_resume(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	int ret;
++
++	pr_info("A6XX_TRACE: enter a6xx_pm_resume\n");
++
++	ret = a6xx_gmu_resume(a6xx_gpu);
++
++	gpu->needs_hw_init = true;
++
++	pr_info("A6XX_TRACE: a6xx_pm_resume returned (ret=%d)\n", ret);
++
++	/* TEMPORARY diagnostic stop -- REMOVE AFTER RESULT. */
++	{
++		extern int a6xx_gmu_boot_error;
++		a6xx_gmu_boot_error = ret;
++	}
++
++	return ret;
++}
++
++static int a6xx_pm_suspend(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	/*
++	 * TEMPORARY image 210 -- allow a genuine re-init after suspend.
++	 *
++	 * msm_gpu_hw_init() refuses to re-run while hw_init_done is set, which
++	 * is what stops a second bring-up from reprogramming a live GPU (the
++	 * image 209 freezes). A real suspend/resume must still be able to
++	 * re-initialise, so clear the latch here. No printk: this is the
++	 * suspend path, and images 179-181 established that a printk here can
++	 * wedge the caller inside console_unlock.
++	 */
++	gpu->hw_init_done = false;
++
++	/*
++	 * Make sure the GMU is idle before continuing (because some transitions
++	 * may use VBIF
++	 *
++	 * Image 182: the enter/wait_for_idle prints are gone unconditionally
++	 * (not just behind a6xx_instr). Images 179-181 proved the FIRST of
++	 * these two printks wedges the caller inside console_unlock
++	 * (CPU3, RCU stalls 6302->63017 jiffies): the writer never reaches
++	 * wait_for_idle at all. A printk that can cost the machine's
++	 * responsiveness has no place on the suspend path.
++	 */
++	a6xx_gmu_wait_for_idle(a6xx_gpu);
++	if (a6xx_instr)
++		pr_info("SSTEP171: wait_for_idle done\n");
++
++	/*
++	 * IMAGE 245 -- do NOT halt VBIF on a GBIF part.
++	 *
++	 * This was the pm_runtime livelock: runtime_status pinned at
++	 * "suspending", active_time climbing ~1000 ms/s, suspended_time frozen,
++	 * RCU stalls every ~63 s in pm_runtime_work, task state R. No panic, so no
++	 * pstore. It looked like general instability for months.
++	 *
++	 * RETRACTED: spin_until() is NOT the kernel's unbounded macro here. It is
++	 * locally redefined at adreno_gpu.h:178 and bounded to 1000 ms
++	 * (ADRENO_IDLE_TIMEOUT), so this poll cannot livelock. The original
++	 * diagnosis in ROOT-CAUSE-GLREADPIXELS-LIVELOCK.md was wrong; see
++	 * RETRACTION-VBIF-LIVELOCK.md.
++	 *
++	 * The GBIF guard below is still correct on its own merits -- upstream
++	 * gates this sequence on !a6xx_has_gbif() (a6xx_gpu.c:2179) and a640 IS
++	 * a GBIF part, so upstream never touches VBIF_XIN_HALT_CTRL0 here at
++	 * all. It was declined as cosmetic-only, so the sequence is restored
++	 * verbatim and this note is all that remains of it.
++	 */
++	gpu_write(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL0, 0xf);
++	spin_until((gpu_read(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL1) & 0xf) == 0xf);
++	gpu_write(gpu, REG_A6XX_VBIF_XIN_HALT_CTRL0, 0);
++	if (a6xx_instr)
++		pr_info("SSTEP171: vbif halt done\n");
++
++	return a6xx_gmu_stop(a6xx_gpu);
++}
++
++/*
++ * TEMPORARY image 184 -- PROMOTE (Mesa unblock). MSM_PARAM_TIMESTAMP is
++ * the FIRST ioctl Mesa issues when it creates a context, so anything
++ * that wedges here blocks all of userspace before a surface exists.
++ *
++ * Two hazards, both proven live (MESA-RENDER-ATTEMPT-1.md):
++ *
++ *  1. adreno_get_param() wraps this in pm_runtime_get_sync/put_autosuspend.
++ *     We leave the GPU powered after bring-up (slumber off since 182), so
++ *     the extra ref is pure risk: python3 sat in D inside rpm_resume for
++ *     minutes holding it. The read needs a live GPU, not a power
++ *     transition.
++ *
++ *  2. GMU_OOB_GPU_SET is a live handshake with the GMU firmware. When the
++ *     firmware is quiet the set never ACKs and this function never
++ *     returns -- an uninterruptible wedge from an ioctl, the worst
++ *     possible failure mode. A timestamp is diagnostics; it must never be
++ *     able to hang a process.
++ *
++ * So: check the OOB result, read either way, and only clear when we own
++ * it. A quiet firmware yields a stale-but-harmless timestamp, exactly
++ * what the -110 paths already teach us to accept everywhere else.
++ */
++static int a6xx_get_timestamp(struct msm_gpu *gpu, uint64_t *value)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++	int oob_ret;
++
++	/* Only meaningful if the GMU is actually managing our power state. */
++	oob_ret = a6xx_gmu_set_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
++	if (oob_ret)
++		pr_warn_ratelimited("a6xx: timestamp: GPU_SET OOB ret=%d, reading anyway\n",
++			oob_ret);
++
++	*value = gpu_read64(gpu, REG_A6XX_RBBM_PERFCTR_CP_0_LO,
++		REG_A6XX_RBBM_PERFCTR_CP_0_HI);
++
++	if (!oob_ret)
++		a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
++	return 0;
++}
++
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
++static void a6xx_show(struct msm_gpu *gpu, struct msm_gpu_state *state,
++		struct drm_printer *p)
++{
++	struct msm_ringbuffer *ring = gpu->rb[0];
++	struct adreno_gpu *ag = to_adreno_gpu(gpu);
++
++	/*
++	 * Upstream's adreno_show() takes (msm_gpu_state *, drm_printer *).
++	 * This tree's adreno_show() is the older CAF form taking a seq_file,
++	 * so the full register dump is not reproduced here; the ring and
++	 * firmware state that matters for bring-up is reported instead.
++	 */
++	drm_printf(p, "rb wptr: %d\n", get_wptr(ring));
++	if (ring->memptrs)
++		drm_printf(p, "rb rpdr: %d\n", ring->memptrs->rptr);
++	if (ring->memptrs)
++		drm_printf(p, "rb fence: %u\n", ring->memptrs->fence);
++
++	drm_printf(p, "sqe: %d bytes\n",
++		ag->fw[ADRENO_FW_SQE] ? ag->fw[ADRENO_FW_SQE]->size : 0);
++	drm_printf(p, "gmu: %d bytes\n",
++		ag->fw[ADRENO_FW_GMU] ? ag->fw[ADRENO_FW_GMU]->size : 0);
++}
++#endif
++
++static struct msm_ringbuffer *a6xx_active_ring(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	return a6xx_gpu->cur_ring;
++}
++
++/*
++ * TEMPORARY image 203 -- the missing last_fence.
++ *
++ * Three call sites in msm_gpu.c unconditionally dereference
++ * gpu->funcs->last_fence():
++ *
++ *   msm_gpu.c:294  recover_worker():  fence = gpu->funcs->last_fence(gpu)
++ *   msm_gpu.c:348  hangcheck_handler():fence = gpu->funcs->last_fence(gpu)
++ *   msm_gpu.c:521  retire_worker():   fence = gpu->funcs->last_fence(gpu)
++ *
++ * and our a6xx funcs table never provided it (msm_gpu.h:78 documents the
++ * design as "a6xx provides active_ring instead of last_fence"). So the first
++ * time any of those three paths runs, the kernel jumps through a NULL function
++ * pointer. The oops is unmistakable:
++ *
++ *   Workqueue: msm_drm retire_worker
++ *   pc : jopp_springboard_blr_x8+0x4
++ *   lr : retire_worker+0x30
++ *   virtual address fffffffffffffffc  (= NULL - 4, the prefetch slot)
++ *
++ * retire_worker is queued from msm_gpu_retire(), which runs on every submit
++ * completion path -- so the first real GL submit or retire is what kills the
++ * machine. That is why bring-up (which never submits) is 5-for-5 clean while
++ * the first GL work dies with no kernel record: the oops IS the record, and
++ * the resets before this log simply never had pstore/last_kmsg read back.
++ *
++ * The implementation reads the fence from the active ring's shadow, exactly as
++ * upstream v419 does everywhere it needs a fence value (never via
++ * funcs->last_fence in the retire path):
++ *
++ *   donor/v419/msm_gpu.c:526  fence = ring->memptrs->fence
++ *   donor/v419/msm_gpu.c:696  update_fences(gpu, ring, ring->memptrs->fence)
++ *
++ * NULL-safe: if there is no current ring yet, report 0 (nothing retired).
++ */
++static uint32_t a6xx_last_fence(struct msm_gpu *gpu)
++{
++	struct msm_ringbuffer *ring = a6xx_active_ring(gpu);
++
++	if (!ring || !ring->memptrs)
++		return 0;
++
++	return ring->memptrs->fence;
++}
++
++static void a6xx_destroy(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	if (a6xx_gpu->sqe_bo) {
++		if (a6xx_gpu->sqe_iova)
++			msm_gem_put_iova(a6xx_gpu->sqe_bo, gpu->aspace);
++		drm_gem_object_unreference_unlocked(a6xx_gpu->sqe_bo);
++	}
++
++	a6xx_gmu_remove(a6xx_gpu);
++
++	adreno_gpu_cleanup(adreno_gpu);
++	kfree(a6xx_gpu);
++}
++
++static const struct adreno_gpu_funcs funcs = {
++	.base = {
++		.get_param = adreno_get_param,
++		.hw_init = a6xx_hw_init,
++		.pm_suspend = a6xx_pm_suspend,
++		.pm_resume = a6xx_pm_resume,
++		.recover = a6xx_recover,
++		.submit = a6xx_submit,
++		.flush_ring = a6xx_flush,
++		.active_ring = a6xx_active_ring,
++		.last_fence = a6xx_last_fence,
++		.irq = a6xx_irq,
++		.destroy = a6xx_destroy,
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
++		.show_state = a6xx_show,
++#endif
++	},
++	.get_timestamp = a6xx_get_timestamp,
++};
++
++struct msm_gpu *a6xx_gpu_init(struct drm_device *dev)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++	struct platform_device *pdev = priv->gpu_pdev;
++	struct device_node *node;
++	struct a6xx_gpu *a6xx_gpu;
++	struct adreno_gpu *adreno_gpu;
++	struct msm_gpu *gpu;
++	int ret;
++
++	a6xx_gpu = kzalloc(sizeof(*a6xx_gpu), GFP_KERNEL);
++	if (!a6xx_gpu)
++		return ERR_PTR(-ENOMEM);
++
++	adreno_gpu = &a6xx_gpu->base;
++	gpu = &adreno_gpu->base;
++
++	adreno_gpu->registers = a6xx_registers;
++	adreno_gpu->reg_offsets = a6xx_register_offsets;
++
++	/*
++	 * Build the GPU address space FIRST, before adreno_gpu_init().
++	 *
++	 * Ordering requirement: msm_gpu_init() (called by adreno_gpu_init())
++	 * attaches the MMU, and msm_iommu_attach() does pm_runtime_get_sync(),
++	 * which can trigger runtime-resume of the GPU platform device and hence
++	 * a6xx_pm_resume() -> a6xx_gmu_resume(). That path dereferences the MMU
++	 * (mmu->dev), so the MMU must already exist and be populated by then.
++	 *
++	 * msm_gpu_init() would otherwise allocate its own address space with a
++	 * bare iommu_domain_alloc(), which on this platform has no SMMU behind
++	 * it (the GPU node has no "iommus" property; the context banks do).
++	 * msm_gpu_init() therefore leaves gpu->aspace alone when it is already
++	 * set - see msm_gpu.c.
++	 *
++	 * The A640 GPU core runs from gfx3d_user (CB 0, SID 0x401). The GMU's
++	 * own buffers are handled separately, in a6xx_gmu_memory_probe(), on
++	 * gmu_kernel (CB 5).
++	 */
++	if (!gpu->aspace) {
++		struct msm_gem_address_space *aspace;
++
++		aspace = msm_gpu_aspace_new("gfx3d_user", "gfx3d");
++		if (IS_ERR(aspace)) {
++			DRM_DEV_ERROR(&pdev->dev,
++				"failed to create GPU address space on gfx3d_user: %ld\n",
++				PTR_ERR(aspace));
++			/* nothing else is initialised yet, so free directly */
++			kfree(a6xx_gpu);
++			return ERR_CAST(aspace);
++		}
++
++		gpu->aspace = aspace;
++
++		mmu_dbg(&pdev->dev, "GPU address space ready on gfx3d_user\n");
++	}
++
++	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs, 1);
++	if (ret) {
++		a6xx_destroy(&(a6xx_gpu->base.base));
++		return ERR_PTR(ret);
++	}
++
++	/* Check if there is a GMU phandle and set it up */
++	node = of_parse_phandle(pdev->dev.of_node, "gmu", 0);
++
++	/* FIXME: How do we gracefully handle this? */
++	BUG_ON(!node);
++
++	ret = a6xx_gmu_probe(a6xx_gpu, node);
++	if (ret) {
++		a6xx_destroy(&(a6xx_gpu->base.base));
++		return ERR_PTR(ret);
++	}
++	pr_info("A6XX_TRACE: a6xx_gpu_init probe returned, registering fault handler\n");
++
++	if (gpu->aspace)
++		msm_mmu_set_fault_handler(gpu->aspace->mmu, gpu,
++				a6xx_fault_handler);
++
++	return gpu;
++}

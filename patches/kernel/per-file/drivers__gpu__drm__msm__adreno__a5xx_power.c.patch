@@ -1,0 +1,11 @@
+--- a/drivers/gpu/drm/msm/adreno/a5xx_power.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_power.c
+@@ -173,7 +173,7 @@
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	struct a5xx_gpu *a5xx_gpu = to_a5xx_gpu(adreno_gpu);
+-	struct msm_ringbuffer *ring = gpu->rb;
++	struct msm_ringbuffer *ring = gpu->rb[0];
+ 
+ 	if (!a5xx_gpu->gpmu_dwords)
+ 		return 0;

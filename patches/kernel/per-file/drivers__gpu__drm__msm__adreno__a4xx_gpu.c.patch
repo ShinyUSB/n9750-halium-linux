@@ -1,0 +1,29 @@
+--- a/drivers/gpu/drm/msm/adreno/a4xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a4xx_gpu.c
+@@ -116,7 +116,7 @@
+ 
+ static bool a4xx_me_init(struct msm_gpu *gpu)
+ {
+-	struct msm_ringbuffer *ring = gpu->rb;
++	struct msm_ringbuffer *ring = gpu->rb[0];
+ 
+ 	OUT_PKT3(ring, CP_ME_INIT, 17);
+ 	OUT_RING(ring, 0x000003f7);
+@@ -337,7 +337,7 @@
+ static bool a4xx_idle(struct msm_gpu *gpu)
+ {
+ 	/* wait for ringbuffer to drain: */
+-	if (!adreno_idle(gpu))
++	if (!adreno_idle(gpu, gpu->rb[0]))
+ 		return false;
+ 
+ 	/* then wait for GPU to finish: */
+@@ -574,7 +574,7 @@
+ 	adreno_gpu->registers = a4xx_registers;
+ 	adreno_gpu->reg_offsets = a4xx_register_offsets;
+ 
+-	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs);
++	ret = adreno_gpu_init(dev, pdev, adreno_gpu, &funcs, 1);
+ 	if (ret)
+ 		goto fail;
+ 

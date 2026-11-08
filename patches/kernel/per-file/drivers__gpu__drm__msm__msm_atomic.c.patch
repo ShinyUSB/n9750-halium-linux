@@ -1,0 +1,87 @@
+--- a/drivers/gpu/drm/msm/msm_atomic.c
++++ b/drivers/gpu/drm/msm/msm_atomic.c
+@@ -763,6 +763,49 @@
+  * RETURNS
+  * Zero for success or -errno.
+  */
++
++/* ---- IMAGE 296 instrumentation: show what each atomic commit really changes ---- */
++static int d2q_atm_cnt;
++static void d2q_atm_dump(struct drm_atomic_state *state, const char *tag)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *ps;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *cs;
++	int i;
++
++	if (!state || d2q_atm_cnt >= 160)
++		return;
++	d2q_atm_cnt++;
++	pr_info("D2QATM[%s] comm=%s/%d allow_modeset=%d nconn=%d\n",
++		tag, current->comm, current->pid, state->allow_modeset,
++		state->num_connector);
++	for_each_new_crtc_in_state(state, crtc, cs, i)
++		pr_info("D2QATM[%s]  crtc%d '%s' enable=%d active=%d mode=%dx%d clk=%d\n",
++			tag, crtc->index, crtc->name, cs->enable, cs->active,
++			cs->mode.hdisplay, cs->mode.vdisplay, cs->mode.clock);
++	for_each_new_plane_in_state(state, plane, ps, i)
++		pr_info("D2QATM[%s]  plane%d '%s' crtc=%d fb=%u pos=%d,%d src=%ux%u\n",
++			tag, plane->base.id, plane->name,
++			ps->crtc ? (int)ps->crtc->index : -1,
++			ps->fb ? ps->fb->base.id : 0,
++			ps->crtc_x, ps->crtc_y,
++			ps->src_w >> 16, ps->src_h >> 16);
++}
++
++static void d2q_atm_after(struct drm_device *dev, const char *tag, int ret)
++{
++	struct drm_crtc *crtc;
++
++	drm_for_each_crtc(crtc, dev) {
++		struct drm_plane_state *ps = crtc->primary->state;
++		pr_info("D2QATM[%s] ret=%d crtc%d primary_fb=%u crtc_enable=%d\n",
++			tag, ret, crtc->index,
++			ps && ps->fb ? ps->fb->base.id : 0,
++			crtc->state ? crtc->state->enable : -1);
++	}
++}
++
+ int msm_atomic_commit(struct drm_device *dev,
+ 		struct drm_atomic_state *state, bool nonblock)
+ {
+@@ -783,6 +826,8 @@
+ 		return -EINVAL;
+ 	}
+ 
++	d2q_atm_dump(state, "in");
++
+ #if defined(CONFIG_DISPLAY_SAMSUNG_LEGO)
+ 	ndx = ss_get_vdd_ndx_from_state(state);
+ 
+@@ -879,12 +924,25 @@
+ 	drm_atomic_state_get(state);
+ 	msm_atomic_commit_dispatch(dev, state, c);
+ 
++#ifdef CONFIG_DRM_FBDEV_EMULATION
++	/* d2q: every userspace atomic commit needs the same DPU kick the
++	 * dirtyfb path performs - this cmd-mode panel does not latch a flip
++	 * reliably without a redundant plane re-assert. The kick itself runs
++	 * plane-only commits with d2q_kick_active() set, so no recursion. */
++	if (!d2q_kick_active()) {
++		d2q_atm_after(dev, "out", 0);
++		d2q_kick_arm(dev);
++	}
++#else
++	d2q_atm_after(dev, "out", 0);
++#endif
+ 	SDE_ATRACE_END("atomic_commit");
+ 	return 0;
+ 
+ err_free:
+ 	kfree(c);
+ error:
++	pr_info("D2QATM[fail] ret=%d comm=%s/%d\n", ret, current->comm, current->pid);
+ 	drm_atomic_helper_cleanup_planes(dev, state);
+ 	SDE_ATRACE_END("atomic_commit");
+ 	return ret;

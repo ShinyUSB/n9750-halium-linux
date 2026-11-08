@@ -1,0 +1,48 @@
+--- a/arch/arm64/boot/dts/qcom/sm8150.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8150.dtsi
+@@ -1833,7 +1833,16 @@
+ 		interrupts = <0 0 0>, <0 1 0>;
+ 		qcom,bark-time = <11000>;
+ 		qcom,pet-time = <9360>;
+-		qcom,ipi-ping;
++		/*
++		 * Image 181 -- REMOVED (survivability).
++		 * qcom,ipi-ping; made watchdog_kthread cross-CPU IPI every
++		 * online CPU before petting. With GPU bring-up wedging CPUs
++		 * (alive_mask f7, "cpu N no IPI ack") that ping is the only
++		 * link that can cost the whole cycle, and the WDT is the only
++		 * fatal surface left on this machine. The mask it fills is
++		 * used solely by the bark dump; losing it costs one
++		 * diagnostic line, not correctness.
++		 */
+ 		qcom,wakeup-enable;
+ 		qcom,scandump-sizes = <0x10100 0x10100 0x10100 0x10100
+ 		0x18100 0x18100 0x18100 0x18100>;
+@@ -2290,6 +2299,27 @@
+ 		phys = <&ufsphy_mem>;
+ 		phy-names = "ufsphy";
+ 
++		/*
++		 * IMAGE 233: disable UFS LPM/clock gating.
++		 *
++		 * With this absent, ufs-qcom sets UFSHCD_CAP_CLK_GATING and the
++		 * ufs_clk_gating_<n> workqueue runs ufshcd_ungate_work(), which
++		 * BUGs in rpmh_write_batch() (drivers/soc/qcom/rpmh.c). This is
++		 * a PRE-EXISTING crash unrelated to the GPU: it appears in 21
++		 * archived /proc/last_kmsg captures going back to image ~1006
++		 * (crashes/last_kmsg-1009-175815..., Workqueue:
++		 * ufs_clk_gating_0 ufshcd_ungate_work, pc:
++		 * rpmh_write_batch+0x46c), and it killed images 228 and 232
++		 * of this project mid-GPU-capture.
++		 *
++		 * qcom,disable-lpm is read by ufs_qcom_parse_lpm()
++		 * (ufs-qcom.c:2010) and gates the whole cap set at
++		 * ufs-qcom.c:1492. Cost is UFS clocks staying on -- slightly
++		 * more power, no functional loss. Worth it: this crash is
++		 * destroying GPU debugging runs at random.
++		 */
++		qcom,disable-lpm;
++
+ 		lanes-per-direction = <2>;
+ 		dev-ref-clk-freq = <0>; /* 19.2 MHz */
+ 

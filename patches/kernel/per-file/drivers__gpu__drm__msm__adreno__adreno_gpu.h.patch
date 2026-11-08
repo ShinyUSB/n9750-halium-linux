@@ -1,0 +1,159 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -53,6 +53,21 @@
+ 	ADRENO_QUIRK_FAULT_DETECT_MASK = 2,
+ };
+ 
++/* Firmware slots. Ported from upstream v4.19. The CAF tree used to carry
++ * discrete pm4fw/pfpfw/gpmufw pointers; those are retained below for the
++ * legacy a2xx-a5xx sources, while a6xx indexes the unified fw[] array.
++ * The slot values deliberately overlap so a single array serves both
++ * generations (this is upstream's own encoding).
++ */
++enum {
++	ADRENO_FW_PM4 = 0,
++	ADRENO_FW_SQE = 0, /* a6xx */
++	ADRENO_FW_PFP = 1,
++	ADRENO_FW_GMU = 1, /* a6xx */
++	ADRENO_FW_GPMU = 2,
++	ADRENO_FW_MAX,
++};
++
+ struct adreno_rev {
+ 	uint8_t  core;
+ 	uint8_t  major;
+@@ -74,21 +89,68 @@
+ 	const char *name;
+ 	const char *pm4fw, *pfpfw;
+ 	const char *gpmufw;
++	/* unified firmware table, used by a6xx (upstream v4.19 layout) */
++	const char *fw[ADRENO_FW_MAX];
+ 	uint32_t gmem;
+ 	enum adreno_quirks quirks;
+ 	struct msm_gpu *(*init)(struct drm_device *dev);
+ 	const char *zapfw;
++	/* a6xx: keep the GPU out of GDSC bounce (upstream v4.19) */
++	u32 inactive_period;
+ };
+ 
+ const struct adreno_info *adreno_info(struct adreno_rev rev);
+ 
+-#define rbmemptr(adreno_gpu, member)  \
++/* Legacy CAF accessor (operates on adreno_gpu). The ring-based rbmemptr()
++ * lives in msm_ringbuffer.h for a6xx. The two structs are layout-identical.
++ */
++#define adreno_rbmemptr(adreno_gpu, member)  \
+ 	((adreno_gpu)->memptrs_iova + offsetof(struct adreno_rbmemptrs, member))
+ 
+-struct adreno_rbmemptrs {
+-	volatile uint32_t rptr;
+-	volatile uint32_t fence;
+-};
++/*
++ * Legacy CAF name for the same rptr/fence pair that upstream v4.19 reaches
++ * through the ringbuffer as struct msm_rbmemptrs. Both views must refer to
++ * ONE type, otherwise ring->memptrs and adreno_gpu->memptrs become
++ * incompatible pointer types when the two are wired together.
++ */
++#define adreno_rbmemptrs msm_rbmemptrs
++
++/*
++ * IMAGE 266 -- CP-view capture space, carved out of the EXISTING memptrs BO.
++ *
++ * Why not a fresh msm_gem_kernel_new():
++ *   - image 264 allocated one lazily inside a6xx_submit() and deadlocked the
++ *     machine (lock-order inversion against struct_mutex).
++ *   - image 265 allocated one at init from inside hw_init and ALSO deadlocked:
++ *     the a6xx-load thread ended up in D state inside msm_gem_new_impl.
++ *     Upstream avoids this because it calls a6xx_ucode_load() from
++ *     msm_gpu_init(), BEFORE hw_init, with fewer locks held. This CAF tree
++ *     calls a6xx_ucode_init() from inside hw_init, where the GEM lock
++ *     conflicts. So moving the call earlier is not enough -- the allocation
++ *     site itself is wrong for this tree.
++ *
++ * The memptrs object is allocated in adreno_gpu_init(), the ordinary DRM init
++ * path, and that demonstrably works (memptrs_iova reads 0x700000000). So we
++ * simply make that one allocation a little larger and use the tail for the
++ * CP_REG_TO_MEM capture. No new allocation is introduced anywhere, and no
++ * lock-ordering question arises in the GPU bring-up path.
++ *
++ * The capture lives AFTER sizeof(struct msm_rbmemptrs) (rptr + fence = 8 B),
++ * so the two live fields are untouched.
++ */
++#define ADRENO_IBCAP_OFF   sizeof(struct msm_rbmemptrs)
++#define ADRENO_IBCAP_LEN   256
++
++/* Upstream v4.19 uses a single fixed ring size for all targets. */
++#define MSM_GPU_RINGBUFFER_SZ SZ_32K
++
++/* Moved here from adreno_gpu.c (where it was static) because the a6xx
++ * sources ported from upstream v4.19 call it directly.
++ */
++static inline uint32_t get_wptr(struct msm_ringbuffer *ring)
++{
++	return (ring->cur - ring->start) % (MSM_GPU_RINGBUFFER_SZ >> 2);
++}
+ 
+ struct adreno_gpu {
+ 	struct msm_gpu base;
+@@ -103,6 +165,14 @@
+ 
+ 	/* firmware: */
+ 	const struct firmware *pm4, *pfp;
++	/* a6xx firmware blobs (upstream v4.19) */
++	const struct firmware *fw[ADRENO_FW_MAX];
++	enum {
++		FW_LOCATION_UNKNOWN = 0,
++		FW_LOCATION_NEW,     /* qcom/<fw> */
++		FW_LOCATION_LEGACY,  /* <fw> */
++		FW_LOCATION_HELPER,  /* via usermode helper */
++	} fwloc;
+ 
+ 	/* ringbuffer rptr/wptr: */
+ 	// TODO should this be in msm_ringbuffer?  I think it would be
+@@ -190,6 +260,15 @@
+        return gpu->revn == 430;
+ }
+ 
++/*
++ * A640 uses the block-format GMU firmware and HFI v2, unlike A618/A630.
++ * Needed by a6xx_gmu.c to select the bring-up path.
++ */
++static inline bool adreno_is_a640(struct adreno_gpu *gpu)
++{
++	return gpu->revn == 640;
++}
++
+ static inline int adreno_is_a530(struct adreno_gpu *gpu)
+ {
+ 	return gpu->revn == 530;
+@@ -202,16 +281,27 @@
+ void adreno_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit,
+ 		struct msm_file_private *ctx);
+ void adreno_flush(struct msm_gpu *gpu);
+-bool adreno_idle(struct msm_gpu *gpu);
++bool adreno_idle(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ #ifdef CONFIG_DEBUG_FS
+ void adreno_show(struct msm_gpu *gpu, struct seq_file *m);
+ #endif
+ void adreno_dump_info(struct msm_gpu *gpu);
+ void adreno_dump(struct msm_gpu *gpu);
++
++/* a6xx firmware loading, ported from upstream v4.19 */
++const struct firmware *adreno_request_fw(struct adreno_gpu *adreno_gpu,
++		const char *fwname);
++int adreno_load_fw(struct adreno_gpu *adreno_gpu);
++struct drm_gem_object *adreno_fw_create_bo(struct msm_gpu *gpu,
++		const struct firmware *fw, u64 *iova);
++
++/* a6xx, ported from upstream v4.19 */
++struct msm_gpu *a6xx_gpu_init(struct drm_device *dev);
+ void adreno_wait_ring(struct msm_gpu *gpu, uint32_t ndwords);
+ 
+ int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+-		struct adreno_gpu *gpu, const struct adreno_gpu_funcs *funcs);
++		struct adreno_gpu *gpu, const struct adreno_gpu_funcs *funcs,
++		int nr_rings);
+ void adreno_gpu_cleanup(struct adreno_gpu *gpu);
+ 
+ 

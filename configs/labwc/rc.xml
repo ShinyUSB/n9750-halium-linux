@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<labwc_config>
+  <core>
+    <gap>0</gap>
+  </core>
+  <libinput>
+    <device category="touch">
+      <calibrationMatrix>0 -1 1 1 0 0</calibrationMatrix>
+    </device>
+  </libinput>
+  <windowRules>
+    <!-- pcmanfm desktop background window: no titlebar (file manager windows keep theirs) -->
+    <windowRule title="PCManFM-Qt" serverDecoration="no" />
+  </windowRules>
+  <keyboard>
+    <default />
+    <keybind key="XF86AudioRaiseVolume">
+      <action name="Execute" command="sh -c 'pactl set-sink-volume @DEFAULT_SINK@ +5%'" />
+    </keybind>
+    <keybind key="XF86AudioLowerVolume">
+      <action name="Execute" command="sh -c 'pactl set-sink-volume @DEFAULT_SINK@ -5%'" />
+    </keybind>
+    <keybind key="XF86AudioMute">
+      <action name="Execute" command="sh -c 'pactl set-sink-mute @DEFAULT_SINK@ toggle'" />
+    </keybind>
+    <keybind key="XF86PowerOff">
+      <action name="ShowMenu" menu="root-menu" />
+    </keybind>
+  </keyboard>
+</labwc_config>

@@ -1,0 +1,12 @@
+[Unit]
+Description=d2q mic capture route (MultiMedia1 -> SLIM_0_TX)
+After=d2q-audio-init.service
+Wants=d2q-audio-init.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/d2q-mic-init.sh main
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

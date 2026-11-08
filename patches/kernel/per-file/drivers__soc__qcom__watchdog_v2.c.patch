@@ -1,0 +1,232 @@
+--- a/drivers/soc/qcom/watchdog_v2.c
++++ b/drivers/soc/qcom/watchdog_v2.c
+@@ -27,6 +27,7 @@
+ #include <linux/cpu_pm.h>
+ #include <linux/platform_device.h>
+ #include <linux/wait.h>
++#include <linux/completion.h>
+ #include <soc/qcom/scm.h>
+ #include <soc/qcom/memory_dump.h>
+ #include <soc/qcom/minidump.h>
+@@ -101,6 +102,12 @@
+ 	unsigned long long thread_start;
+ 	unsigned long long ping_start[NR_CPUS];
+ 	unsigned long long ping_end[NR_CPUS];
++	/* TEMPORARY image 175: last ack time per CPU, never zeroed
++	 * (ping_start/end are cleared every cycle). */
++	unsigned long long last_ack[NR_CPUS];
++	/* Image 181: barks survived so far (bark handler pets instead of
++	 * biting). Diagnostic only. */
++	unsigned int bark_count;
+ 	unsigned int cpu_scandump_sizes[NR_CPUS];
+ 
+ 	/* When single buffer is used to collect Scandump */
+@@ -379,7 +386,7 @@
+ 
+ static void pet_watchdog(struct msm_watchdog_data *wdog_dd)
+ {
+-	int slack, i, count, prev_count = 0;
++	int slack, count;
+ 	unsigned long long time_ns;
+ 	unsigned long long slack_ns;
+ 	unsigned long long bark_time_ns = wdog_dd->bark_time * 1000000ULL;
+@@ -387,17 +394,24 @@
+ 	static int last_count;
+ #endif
+ 
+-	for (i = 0; i < 2; i++) {
+-		count = (__raw_readl(wdog_dd->base + WDT0_STS) >> 1) & 0xFFFFF;
+-		if (count != prev_count) {
+-			prev_count = count;
+-			i = 0;
+-		}
+-	}
++	/*
++	 * Image 181 -- PROMOTE (survivability). The WDT is now the only
++	 * fatal surface on this machine, so the pet must be the first
++	 * thing this function does: no status read, no loop, no printk
++	 * ahead of it. Previously the STS stability loop ran first, so any
++	 * bus trouble there cost the whole cycle. The status read below is
++	 * bookkeeping only and happens after the counter is already reset.
++	 */
++	__raw_writel(1, wdog_dd->base + WDT0_RST);
++	mb();
++
++	/* Bookkeeping (image 176's cap made redundant by the write-first
++	 * order: this can no longer delay a pet). */
++	count = (__raw_readl(wdog_dd->base + WDT0_STS) >> 1) & 0xFFFFF;
+ 	slack = ((wdog_dd->bark_time * WDT_HZ) / 1000) - count;
+ 	if (slack < wdog_dd->min_slack_ticks)
+ 		wdog_dd->min_slack_ticks = slack;
+-	__raw_writel(1, wdog_dd->base + WDT0_RST);
++
+ 	time_ns = sched_clock();
+ 	slack_ns = (wdog_dd->last_pet + bark_time_ns) - time_ns;
+ 	if (slack_ns < wdog_dd->min_slack_ns)
+@@ -417,21 +431,29 @@
+ #endif
+ }
+ 
+-static void keep_alive_response(void *info)
++/*
++ * If this function does not return, it implies one of the
++ * other cpu's is not responsive.
++ */
++struct ping_done173 {
++	struct completion c;
++	struct msm_watchdog_data *wdog_dd;
++};
++
++static void keep_alive_response_async(void *info)
+ {
++	struct ping_done173 *d = info;
++	struct msm_watchdog_data *wdog_dd = d->wdog_dd;
+ 	int cpu = smp_processor_id();
+-	struct msm_watchdog_data *wdog_dd = (struct msm_watchdog_data *)info;
+ 
+ 	cpumask_set_cpu(cpu, &wdog_dd->alive_mask);
+ 	wdog_dd->ping_end[cpu] = sched_clock();
++	wdog_dd->last_ack[cpu] = wdog_dd->ping_end[cpu];
+ 	/* Make sure alive mask is cleared and set in order */
+ 	smp_mb();
++	complete(&d->c);
+ }
+ 
+-/*
+- * If this function does not return, it implies one of the
+- * other cpu's is not responsive.
+- */
+ static void ping_other_cpus(struct msm_watchdog_data *wdog_dd)
+ {
+ 	int cpu;
+@@ -441,9 +463,42 @@
+ 	smp_mb();
+ 	for_each_cpu(cpu, cpu_online_mask) {
+ 		if (!cpu_idle_pc_state[cpu] && !cpu_isolated(cpu)) {
++			struct ping_done173 d;
++			long wret;
++			u64 now = sched_clock();
++
++			/*
++			 * TEMPORARY image 175 -- PROMOTE with survival.
++			 * A CPU silent for >30s (3+ missed acks) is
++			 * presumed dead (firmware-initiated collapse
++			 * strands it holding queue locks; any smp_call
++			 * to it wedges the caller pre-timeout). Skip it:
++			 * total hangs still bite (kthread itself wedged),
++			 * partial ones survive on live CPUs.
++			 */
++			if (wdog_dd->last_ack[cpu] &&
++			    now - wdog_dd->last_ack[cpu] > 30000000000ULL) {
++				pr_info_ratelimited("msm_watchdog: cpu %d silent >30s (skipped)\n",
++					cpu);
++				continue;
++			}
++			init_completion(&d.c);
++			d.wdog_dd = wdog_dd;
+ 			wdog_dd->ping_start[cpu] = sched_clock();
+-			smp_call_function_single(cpu, keep_alive_response,
+-						 wdog_dd, 1);
++			smp_call_function_single(cpu,
++				keep_alive_response_async, &d, 0);
++			/*
++			 * TEMPORARY image 173 -- PROMOTE with survival. A
++			 * CPU that never acks (wedged/offline-racing) must
++			 * not wedge the pet forever: 11s later the machine
++			 * resets despite healthy CPUs. Bound the wait;
++			 * unacked CPUs stay out of the alive mask.
++			 */
++			wret = wait_for_completion_timeout(&d.c,
++				msecs_to_jiffies(100));
++			if (!wret)
++				pr_info_ratelimited("msm_watchdog: cpu %d no IPI ack (skipped)\n",
++					cpu);
+ 		}
+ 	}
+ }
+@@ -466,6 +521,17 @@
+ 	int ret, cpu;
+ 
+ 	sched_setscheduler(current, SCHED_FIFO, &param);
++
++	/*
++	 * Image 181 -- PROMOTE (survivability). Pin to CPU0. GPU bring-up
++	 * on this SoX intermittently stops CPUs from taking IPIs
++	 * ("cpu N no IPI ack", alive_mask f7), and a plain RT kthread can
++	 * be migrated onto one of those. Pinning costs nothing (the thread
++	 * does nothing but one MMIO write) and keeps the pet on a CPU that
++	 * is known to have been running since boot.
++	 */
++	set_cpus_allowed_ptr(current, cpumask_of(0));
++
+ 	while (!kthread_should_stop()) {
+ 		do {
+ 			ret = wait_event_interruptible(wdog_dd->pet_complete,
+@@ -476,6 +542,14 @@
+ 		for_each_cpu(cpu, cpu_present_mask)
+ 			wdog_dd->ping_start[cpu] = wdog_dd->ping_end[cpu] = 0;
+ 
++		/*
++		 * Image 181 -- the per-cycle PET174 markers are gone. Two
++		 * printks every 9.36s for the life of the boot, straight
++		 * into a ramoops ring a wedged SoC is already overflowing,
++		 * answering nothing that BARK181 does not answer better.
++		 * do_ipi_ping is off as of this image (qcom,ipi-ping removed
++		 * from sm8150.dtsi), so the ping is normally a no-op.
++		 */
+ 		if (wdog_dd->do_ipi_ping)
+ 			ping_other_cpus(wdog_dd);
+ 
+@@ -572,10 +646,23 @@
+ 	unsigned long nanosec_rem;
+ 	unsigned long long t = sched_clock();
+ 
+-#ifdef CONFIG_SEC_DEBUG
+-	sec_debug_prepare_for_wdog_bark_reset();
+-#endif
+-
++	/*
++	 * Image 181 -- PROMOTE (survivability). A bark used to mean a
++	 * guaranteed reset: sec_debug armed the upload cause, the bite was
++	 * forced, and the fallback was panic(). With GPU bring-up on this
++	 * SoC wedging CPUs (and therefore the pet path) for seconds at a
++	 * time, "unpetted once" was indistinguishable from "dead", and
++	 * every bring-up attempt cost the machine.
++	 *
++	 * Bark now means "log it and pet from IRQ context". This handler
++	 * runs on a live CPU even when the pet kthread is wedged inside a
++	 * cross-CPU IPI, so writing WDT0_RST here clears the counter and
++	 * the BITE deadline (bark + 3s) never arrives. Deliberately NOT
++	 * calling sec_debug_prepare_for_wdog_bark_reset(): that sets
++	 * upload_cause + dload magic and drops the next boot into dump
++	 * mode. A wedged SoC stays a debuggable phone instead of a
++	 * reboot loop.
++	 */
+ 	nanosec_rem = do_div(t, 1000000000);
+ 	dev_info(wdog_dd->dev, "Watchdog bark! Now = %lu.%06lu\n",
+ 			(unsigned long) t, nanosec_rem / 1000);
+@@ -585,8 +672,22 @@
+ 			(unsigned long) wdog_dd->last_pet, nanosec_rem / 1000);
+ 	if (wdog_dd->do_ipi_ping)
+ 		dump_cpu_alive_mask(wdog_dd);
+-	msm_trigger_wdog_bite();
+-	panic("Failed to cause a watchdog bite! - Falling back to kernel panic!");
++
++	/* Count the event so repeated barks are visible without spamming. */
++	wdog_dd->bark_count++;
++
++	__raw_writel(1, wdog_dd->base + WDT0_RST);
++	mb();
++
++	dev_info(wdog_dd->dev,
++		 "BARK181: bark #%u survived, petted from IRQ (RST written)\n",
++		 wdog_dd->bark_count);
++
++	/* Keep the accounting honest so the next bark reports a real gap. */
++	wdog_dd->last_pet = sched_clock();
++#ifdef CONFIG_SEC_DEBUG
++	sec_debug_save_last_pet(wdog_dd->last_pet);
++#endif
+ 	return IRQ_HANDLED;
+ }
+ 

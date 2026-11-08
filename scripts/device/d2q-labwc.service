@@ -1,0 +1,20 @@
+[Unit]
+Description=d2q labwc + LXQt session
+Wants=dbus.socket
+After=dbus.socket systemd-user-sessions.service
+
+[Service]
+Environment=XDG_CURRENT_DESKTOP=LXQt
+ExecStart=/usr/local/bin/d2q-labwc-start.sh
+User=1000
+PAMName=login
+WorkingDirectory=/home/d2q
+Restart=always
+RestartSec=5s
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty-fail
+
+[Install]
+WantedBy=graphical.target

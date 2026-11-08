@@ -1,0 +1,145 @@
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -27,6 +27,13 @@
+ 
+ struct msm_gem_submit;
+ struct msm_gpu_perfcntr;
++struct msm_gpu_state;
++
++/* Number of ringbuffers. Upstream v4.19 a6xx only ever uses ring 0
++ * ("Always come up on rb 0"), so a single ring is sufficient to compile
++ * and is the minimum needed for the A640. Upstream reserves 10.
++ */
++#define MSM_GPU_MAX_RINGS 1
+ 
+ struct msm_gpu_config {
+ 	const char *ioname;
+@@ -58,13 +65,27 @@
+ 	void (*submit)(struct msm_gpu *gpu, struct msm_gem_submit *submit,
+ 			struct msm_file_private *ctx);
+ 	void (*flush)(struct msm_gpu *gpu);
++	/*
++	 * a6xx flushes a specific ring and shadows commands into ring->next
++	 * before committing them to ring->cur. The legacy one-argument flush()
++	 * above is retained unchanged for a2xx-a5xx, so adding the a6xx form
++	 * as a separate member keeps both generations working without
++	 * touching the SDE-adjacent call paths.
++	 */
++	void (*flush_ring)(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ 	irqreturn_t (*irq)(struct msm_gpu *irq);
+ 	uint32_t (*last_fence)(struct msm_gpu *gpu);
++	/* a6xx provides this instead of last_fence */
++	struct msm_ringbuffer *(*active_ring)(struct msm_gpu *gpu);
+ 	void (*recover)(struct msm_gpu *gpu);
+ 	void (*destroy)(struct msm_gpu *gpu);
+ #ifdef CONFIG_DEBUG_FS
+ 	/* show GPU status in debugfs: */
+ 	void (*show)(struct msm_gpu *gpu, struct seq_file *m);
++	/* generation specific debugfs (a6xx) */
++	void (*show_state)(struct msm_gpu *gpu, struct msm_gpu_state *state,
++			struct drm_printer *p);
++	int (*debugfs_init)(struct msm_gpu *gpu, struct drm_minor *minor);
+ #endif
+ };
+ 
+@@ -86,9 +107,16 @@
+ 	const struct msm_gpu_perfcntr *perfcntrs;
+ 	uint32_t num_perfcntrs;
+ 
+-	/* ringbuffer: */
+-	struct msm_ringbuffer *rb;
++	/* ringbuffer: a6xx indexes this as rb[0]; MSM_GPU_MAX_RINGS is 1
++	 * because upstream v4.19 a6xx only ever uses ring 0 ("always come
++	 * up on rb 0"), so the full multi-ring submitqueue rework is not
++	 * required. Legacy a2xx-a5xx users are updated to rb[0].
++	 */
++	struct msm_ringbuffer *rb[MSM_GPU_MAX_RINGS];
++	int nr_rings;
+ 	uint64_t rb_iova;
++	/* backing object for the ring's fence/rptr memptrs */
++	struct drm_gem_object *memptrs_bo;
+ 
+ 	/* list of GEM active objects: */
+ 	struct list_head active_list;
+@@ -99,6 +127,19 @@
+ 	/* does gpu need hw_init? */
+ 	bool needs_hw_init;
+ 
++	/*
++	 * TEMPORARY image 210 -- has hw_init ever completed for this GPU?
++	 *
++	 * needs_hw_init alone cannot prevent a second hw_init over live
++	 * hardware, because both msm_gpu_pm_runtime_resume() and
++	 * a6xx_pm_resume() set it back to true, and adreno_load_gpu() takes a
++	 * pm_runtime reference on every call. This flag is set once hw_init
++	 * completes and is cleared only by the suspend path, so a genuine
++	 * suspend/resume can still re-initialise while any accidental re-entry
++	 * is refused. See the guard in msm_gpu_hw_init().
++	 */
++	bool hw_init_done;
++
+ 	/* worker for handling active-list retiring: */
+ 	struct work_struct retire_work;
+ 
+@@ -130,10 +171,53 @@
+ 	struct work_struct recover_work;
+ 
+ 	struct list_head submit_list;
++
++	struct msm_gpu_state *crashstate;
++};
++
++/* Minimal version of upstream's crash/debug state, sufficient for
++ * a6xx_show(). Not yet populated by this experimental tree - the
++ * states are filled in by devcoredump integration which is out of
++ * scope for the compile-only milestone.
++ */
++struct msm_gpu_state_bo {
++	u64 iova;
++	size_t size;
++	void *data;
++};
++
++struct msm_gpu_state {
++	struct kref ref;
++	struct timespec64 time;
++
++	struct {
++		u64 iova;
++		u32 fence;
++		u32 seqno;
++		u32 rptr;
++		u32 wptr;
++		void *data;
++		int data_size;
++	} ring[MSM_GPU_MAX_RINGS];
++
++	int nr_registers;
++	u32 *registers;
++
++	u32 rbbm_status;
++
++	char *comm;
++	char *cmd;
++
++	int nr_bos;
++	struct msm_gpu_state_bo *bos;
+ };
+ 
+ static inline bool msm_gpu_active(struct msm_gpu *gpu)
+ {
++	/* a6xx reports the active ring rather than a fence counter */
++	if (gpu->funcs->active_ring)
++		return !!gpu->funcs->active_ring(gpu);
++
+ 	return gpu->fctx->last_fence > gpu->funcs->last_fence(gpu);
+ }
+ 
+@@ -203,6 +287,7 @@
+ int msm_gpu_pm_resume(struct msm_gpu *gpu);
+ 
+ int msm_gpu_hw_init(struct msm_gpu *gpu);
++void bc132(const char *ev, int ret);
+ 
+ void msm_gpu_perfcntr_start(struct msm_gpu *gpu);
+ void msm_gpu_perfcntr_stop(struct msm_gpu *gpu);

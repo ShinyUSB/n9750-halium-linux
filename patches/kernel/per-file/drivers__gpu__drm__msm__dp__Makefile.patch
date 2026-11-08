@@ -1,0 +1,26 @@
+--- /dev/null
++++ b/drivers/gpu/drm/msm/dp/Makefile
+@@ -0,0 +1,23 @@
++obj-y += dp_usbpd.o \
++	dp_parser.o \
++	dp_power.o \
++	dp_catalog.o \
++	dp_catalog_v420.o \
++	dp_catalog_v200.o \
++	dp_aux.o \
++	dp_panel.o \
++	dp_link.o \
++	dp_ctrl.o \
++	dp_audio.o \
++	dp_debug.o \
++	dp_mst_sim_helper.o \
++	dp_mst_sim.o \
++	dp_hpd.o \
++	dp_aux_bridge.o \
++	dp_bridge_hpd.o \
++	dp_gpio_hpd.o \
++	dp_lphw_hpd.o \
++	dp_display.o \
++	dp_drm.o \
++	dp_hdcp2p2.o \
++	dp_mst_drm.o

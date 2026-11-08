@@ -1,0 +1,42 @@
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -619,6 +619,13 @@
+ 
+ 	/* when we have more than one 'msm_gpu' these need to be an array: */
+ 	struct msm_gpu *gpu;
++
++	/*
++	 * Deferred GPU bring-up (see gpu_init_delay_ms in a6xx_gmu.c).
++	 * Diagnostics only; normally idle.
++	 */
++	struct delayed_work gpu_load_work;
++	bool gpu_load_queued;
+ 	struct msm_file_private *lastctx;
+ 
+ 	struct drm_fb_helper *fbdev;
+@@ -885,6 +892,10 @@
+ 		struct drm_file *file_priv, unsigned int flags,
+ 		unsigned int color, struct drm_clip_rect *clips,
+ 		unsigned int num_clips);
++#ifdef CONFIG_DRM_FBDEV_EMULATION
++void d2q_kick_arm(struct drm_device *dev);
++bool d2q_kick_active(void);
++#endif
+ 
+ #if defined(CONFIG_DISPLAY_SAMSUNG) || defined(CONFIG_DISPLAY_SAMSUNG_LEGO)
+ int __msm_drm_notifier_call_chain(unsigned long event, void *data);
+@@ -971,6 +982,14 @@
+ #endif
+ 
+ struct clk *msm_clk_get(struct platform_device *pdev, const char *name);
++
++/* Ported from upstream v4.19 msm_drv.c - required by a6xx_gpu.c to
++ * acquire the GPU core/interconnect clocks from the "clock-names"
++ * property of the gpu node.
++ */
++int msm_clk_bulk_get(struct device *dev, struct clk_bulk_data **bulk);
++struct clk *msm_clk_bulk_get_clock(struct clk_bulk_data *bulk, int count,
++		const char *name);
+ void __iomem *msm_ioremap(struct platform_device *pdev, const char *name,
+ 		const char *dbgname);
+ unsigned long msm_iomap_size(struct platform_device *pdev, const char *name);

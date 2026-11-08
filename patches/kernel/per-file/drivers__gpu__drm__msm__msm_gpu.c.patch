@@ -1,0 +1,422 @@
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -175,6 +175,8 @@
+ 
+ 	gpu->needs_hw_init = true;
+ 
++	pr_info("POSTINIT-PM: runtime_resume ret=0\n");
++	bc132("RUNTIME_RESUME", 0);
+ 	return 0;
+ }
+ 
+@@ -196,24 +198,156 @@
+ 	if (ret)
+ 		return ret;
+ 
++	pr_info("POSTINIT-PM: runtime_suspend ret=0\n");
++	bc132("RUNTIME_SUSPEND", 0);
+ 	return 0;
+ }
+ 
++/* TEMPORARY image 137 -- REMOVE AFTER RESULT. Last-32 power-transition
++ * breadcrumbs. Every event is also printk'd, so /proc/last_kmsg preserves
++ * the tail across the silent reboot (existing persistent mechanism). */
++#define BC132_N 64
++static struct {
++	u32 ms;
++	char ev[56];
++	int ret;
++} bc132_ring[BC132_N];
++static int bc132_idx;
++
++void bc132(const char *ev, int ret)
++{
++	u32 ms = jiffies_to_msecs(jiffies);
++	int i = bc132_idx % BC132_N;
++
++	bc132_ring[i].ms = ms;
++	strlcpy(bc132_ring[i].ev, ev, sizeof(bc132_ring[i].ev));
++	bc132_ring[i].ret = ret;
++	bc132_idx++;
++	pr_info("BC132: ms=%u ev=%s ret=%d depth=%d\n", ms, ev, ret, bc132_idx);
++}
++static bool pm_hold = true;
++module_param(pm_hold, bool, 0644);
++MODULE_PARM_DESC(pm_hold, "Hold a permanent runtime PM reference on the GPU so autosuspend can never fire. a6xx_pm_suspend() blocks on this part and wedges the device at runtime_status=suspending, and that cannot be prevented from userspace (msm_gpu_retire() calls pm_runtime_put_autosuspend() after every submit). Costs GPU power gating. Set 0 to allow suspend, at the risk of the wedge");
++
+ int msm_gpu_hw_init(struct msm_gpu *gpu)
+ {
+ 	int ret;
+ 
++	/* TEMPORARY bring-up tracing -- REMOVE ONCE GPU HW INIT IS STABLE. */
++	pr_info("A6XX_TRACE: enter msm_gpu_hw_init\n");
++	pr_info("POSTINIT[00] ENTER_HW_INIT_WRAPPER needs_hw_init=%d\n",
++		gpu->needs_hw_init);
++	bc132("ENTER_HW_INIT_WRAPPER", gpu->needs_hw_init);
++
+ 	WARN_ON(!mutex_is_locked(&gpu->dev->struct_mutex));
+ 
+-	if (!gpu->needs_hw_init)
++	if (!gpu->needs_hw_init) {
++		pr_info("A6XX_TRACE: msm_gpu_hw_init no-op (needs_hw_init==0)\n");
++		pr_info("POSTINIT[20] NEEDS_HW_INIT=0 idle-path\n");
++		bc132("NEEDS_HW_INIT_IDLE", 0);
+ 		return 0;
++	}
+ 
++	/*
++	 * TEMPORARY image 210 -- defence in depth against re-initialising a
++	 * live GPU.
++	 *
++	 * The needs_hw_init test above is NOT sufficient protection, because
++	 * needs_hw_init is set to true by msm_gpu_pm_runtime_resume()
++	 * (msm_gpu.c:176) and by a6xx_pm_resume() (a6xx_gpu.c:1539). Any path
++	 * that takes a pm_runtime reference on an already-programmed GPU --
++	 * which includes the pm_runtime_get_sync() in adreno_load_gpu() -- will
++	 * therefore re-arm needs_hw_init and drive a full hw_init over live
++	 * hardware state.
++	 *
++	 * Measured on image 209, twice: the second bring-up wedged the machine
++	 * (no oops, no panic, log just stops) and cost a manual reboot both
++	 * times. msm_drv.c now refuses a repeat trigger at the source; this
++	 * catches every other route to the same mistake.
++	 *
++	 * hw_init_done is only cleared by the suspend path, so a real
++	 * suspend/resume cycle can still legitimately re-initialise.
++	 */
++	if (gpu->hw_init_done) {
++		pr_info("A6XX_TRACE: msm_gpu_hw_init REFUSING re-init (hw_init_done=1, GPU already programmed)\n");
++		gpu->needs_hw_init = false;
++		bc132("HW_INIT_ALREADY_DONE", 1);
++		return 0;
++	}
++
++#ifndef CONFIG_QCOM_KGSL
++	{
++		/* TEMPORARY diagnostic stop -- REMOVE AFTER RESULT. */
++		extern int a6xx_gmu_boot_error;
++		if (a6xx_gmu_boot_error) {
++			/*
++			 * TEMPORARY diagnostic stay-alive -- REMOVE AFTER RESULT.
++			 * Report success so adreno_load_gpu does NOT destroy (the
++			 * image-98 teardown Oops came from destroy-after-failure
++			 * unmapping into a torn-down SMMU). Dead GMU simply sits
++			 * idle; no GL userspace exists to touch it.
++			 */
++			pr_info("A6XX_DIAG: hw_init suppressed after GMU boot error %d; staying alive\n",
++				a6xx_gmu_boot_error);
++			gpu->needs_hw_init = false;
++			return 0;
++		}
++	}
++#endif /* !CONFIG_QCOM_KGSL (IMAGE 288: symbol lives in the excluded a6xx_gmu.o) */
++
++	pr_info("POSTINIT[10] HW_INIT_RET follows\n");
+ 	disable_irq(gpu->irq);
++	pr_info("A6XX_TRACE: calling gpu->funcs->hw_init\n");
+ 	ret = gpu->funcs->hw_init(gpu);
+-	if (!ret)
++	pr_info("A6XX_TRACE: gpu->funcs->hw_init returned (ret=%d)\n", ret);
++	pr_info("POSTINIT[10] HW_INIT_RET ret=%d\n", ret);
++	bc132("HW_INIT_RET", ret);
++	if (!ret) {
+ 		gpu->needs_hw_init = false;
++		/* TEMPORARY image 210: latch, so a repeat hw_init is refused. */
++		gpu->hw_init_done = true;
++
++		/*
++		 * IMAGE 248 -- hold runtime PM, permanently.
++		 *
++		 * a6xx_pm_suspend() BLOCKS on this part: the device pins at
++		 * runtime_status=suspending with a kworker in D state and never
++		 * recovers. Until that block is root-caused, every suspend is a
++		 * landmine, and it cannot be dodged from userspace --
++		 * msm_gpu_retire() calls pm_runtime_put_autosuspend() after every
++		 * submit (msm_gpu.c:564), so usage_count can reach zero regardless
++		 * of power/control. Observed wedging even with control=on and
++		 * autosuspend_delay still reporting 66.
++		 *
++		 * Taking one reference that is never released makes usage_count
++		 * unable to reach zero, so autosuspend can never fire and the
++		 * broken suspend path becomes unreachable. Costs GPU power
++		 * gating, which is irrelevant on a bring-up kernel.
++		 *
++		 * PLACEMENT MATTERS (image 247 got this wrong):
++		 * doing this in msm_gpu_init(), i.e. with
++		 * pm_runtime_get_sync(), HANGS GPU attach -- it resumes the device
++		 * before the driver has finished attaching. Here the GPU is already
++		 * up and fully initialised, and pm_runtime_get_noresume() takes the
++		 * reference without triggering any resume side effects.
++		 *
++		 * Deliberately unbalanced: that is the entire point. Any later
++		 * get/put pair inside the driver only moves the count further from
++		 * zero, never to it.
++		 */
++		if (pm_hold) {
++			pm_runtime_get_noresume(&gpu->pdev->dev);
++			pr_info("PMHOLD248: holding permanent runtime PM reference "
++				"on %s (suspend is unreliable on this part)\n",
++				gpu->name);
++		}
++	}
+ 	enable_irq(gpu->irq);
++	pr_info("POSTINIT[30] IRQ_REENABLE done\n");
+ 
++	pr_info("A6XX_TRACE: msm_gpu_hw_init RETURNING ret=%d\n", ret);
++	pr_info("POSTINIT[40] RETURN_TO_CALLER ret=%d\n", ret);
++	bc132("RETURN_TO_CALLER", ret);
+ 	return ret;
+ }
+ 
+@@ -235,6 +369,7 @@
+ 	mutex_lock(&dev->struct_mutex);
+ 
+ 	dev_err(dev->dev, "%s: hangcheck recover!\n", gpu->name);
++	pr_info("HANGCHK141: recover_worker enter\n");
+ 	list_for_each_entry(submit, &gpu->submit_list, node) {
+ 		if (submit->fence->seqno == (fence + 1)) {
+ 			struct task_struct *task;
+@@ -254,9 +389,50 @@
+ 		/* retire completed submits, plus the one that hung: */
+ 		retire_submits(gpu);
+ 
+-		pm_runtime_get_sync(&gpu->pdev->dev);
++		/*
++		 * TEMPORARY image 204 -- PROMOTE. The same pm_runtime wedge
++		 * that image 189 fixed in msm_gpu_submit(), still live here.
++		 *
++		 * Caught live on image 203 with the phone wedged:
++		 *
++		 *   __switch_to -> rpm_resume -> __pm_runtime_resume
++		 *               -> recover_worker+0x130
++		 *               -> process_one_work -> worker_thread
++		 *   PID 314, kworker/u16:13, State: D (forever)
++		 *
++		 * while PID 1504 (python3) sat in:
++		 *
++		 *   __switch_to -> msm_gem_new_impl -> _msm_gem_new
++		 *               -> msm_ioctl_gem_new -> drm_ioctl
++		 *   State: D
++		 *
++		 * i.e. recover_worker took dev->struct_mutex at line 298 and
++		 * then wedged in rpm_resume at line 321 while STILL HOLDING IT.
++		 * struct_mutex is the lock every DRM ioctl needs, so one hung
++		 * recover_worker permanently bricks the entire render node --
++		 * every subsequent open/ioctl blocks forever with no oops and no
++		 * kernel record. That is the real shape of the "silent death":
++		 * not a crash, a deadlock.
++		 *
++		 * Cause is the one msm_gpu_submit()'s comment already records:
++		 * our GPU is powered by the on-demand sysfs trigger, which powers
++		 * the hardware directly and does not drive the runtime-PM state
++		 * machine, yet pm_runtime_enable() is still called at probe. So
++		 * pm_runtime_get_sync() believes the device is suspended, calls
++		 * CAF's resume path, and CAF's resume path deadlocks against the
++		 * state our bring-up left behind.
++		 *
++		 * Removing the reference is safe on the same two counts as the
++		 * image 189 removal: there is no matching pm_runtime_put_* that
++		 * matters for correctness here (the put below only balances the
++		 * get we are removing), and the GPU is already powered -- our
++		 * bring-up leaves it clocked, and a6xx_recover() only needs it
++		 * to be up, which it already is.
++		 *
++		 * A future real suspend path must re-add this behind a live
++		 * "is it actually suspended" check, not blindly.
++		 */
+ 		gpu->funcs->recover(gpu);
+-		pm_runtime_put_sync(&gpu->pdev->dev);
+ 
+ 		/* replay the remaining submits after the one that hung: */
+ 		list_for_each_entry(submit, &gpu->submit_list, node) {
+@@ -283,12 +459,17 @@
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	uint32_t fence = gpu->funcs->last_fence(gpu);
+ 
++	pr_info("HANGCHK141: enter fence=%u stored=%u submitted=%u\n",
++		fence, gpu->hangcheck_fence, gpu->fctx ? gpu->fctx->last_fence : 0);
++
+ 	if (fence != gpu->hangcheck_fence) {
+ 		/* some progress has been made.. ya! */
+ 		gpu->hangcheck_fence = fence;
+ 	} else if (fence < gpu->fctx->last_fence) {
+ 		/* no progress and not done.. hung! */
+ 		gpu->hangcheck_fence = fence;
++		pr_info("HANGCHK141: LOCKUP fence=%u submitted=%u -> recover queued\n",
++			fence, gpu->fctx->last_fence);
+ 		dev_err(dev->dev, "%s: hangcheck detected gpu lockup!\n",
+ 				gpu->name);
+ 		dev_err(dev->dev, "%s:     completed fence: %u\n",
+@@ -476,10 +657,106 @@
+ 
+ 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
+-	pm_runtime_get_sync(&gpu->pdev->dev);
++	/*
++	 * TEMPORARY image 189 -- PROMOTE. The D-state wedge in the submit path.
++	 *
++	 * THIS IS THE STACK WE CAUGHT LIVE on #130, with a hand-built submit
++	 * that finally passed every validation in msm_ioctl_gem_submit():
++	 *
++	 *   __switch_to -> rpm_resume -> __pm_runtime_resume
++	 *               -> msm_gpu_submit+0x5c -> msm_ioctl_gem_submit
++	 *               -> drm_ioctl_kernel -> do_vfs_ioctl -> SyS_ioctl
++	 *   syscall 29 0x3 0xc0286646 ...   (0xc0286646 == MSM_GEM_SUBMIT)
++	 *   State: D (disk sleep)
++	 *
++	 * So the submit ioctl is not "never reached" -- it arrives, walks all
++	 * the way past BO pinning and iova allocation, and then wedges on the
++	 * very first thing this function does.
++	 *
++	 * Cause: our GPU is powered by the on-demand sysfs trigger, which
++	 * powers the hardware directly and does not drive the runtime-PM state
++	 * machine. pm_runtime_enable() was still called at probe (msm_drv.c), so
++	 * pm_runtime_get_sync() believes the device is suspended and tries to
++	 * resume it -- and CAF's resume path deadlocks against the state our
++	 * bring-up left behind. Hence D forever.
++	 *
++	 * This is the SAME class of bug as image 184, where
++	 * adreno_get_param() had the identical pm_runtime_get_sync() around the
++	 * timestamp read and wedged python3 in D for minutes. Removing the PM
++	 * transition there worked and is still in force. We simply never
++	 * applied the same remedy here, because until now no submit had ever
++	 * been attempted and there was no evidence to justify it.
++	 *
++	 * Removing it is safe on two counts:
++	 *   1. There is no matching pm_runtime_put_* anywhere in this function,
++	 *      so the reference was never balanced anyway -- nothing to unbalance.
++	 *   2. msm_gpu_hw_init() is called immediately below and is what
++	 *      actually needs the power; it is already tolerant of the GPU
++	 *      being up (our bring-up leaves it up, and needs_hw_init is
++	 *      cleared, so it no-ops).
++	 *
++	 * A future real suspend path must re-add the reference behind a live
++	 * "is it actually suspended" check, not blindly.
++	 */
+ 
+ 	msm_gpu_hw_init(gpu);
+ 
++	/*
++	 * TEMPORARY image 216 -- RESTORE the missing submit seqno.
++	 *
++	 * Upstream v4.19 has exactly this line in msm_gpu_submit()
++	 * (donor/v419/msm_gpu.c:726):
++	 *
++	 *   submit->seqno = ++ring->seqno;
++	 *
++	 * and our port simply does not have it. `grep -rn "submit->seqno ="`
++	 * across the whole driver returns nothing -- the field was never
++	 * assigned, so it stayed 0 for the lifetime of the object.
++	 *
++	 * Measured on image 215, four consecutive submits:
++	 *
++	 *   CPINT[seq=0] scratch2=0 fence=0 rptr=114 WPTR=0x72
++	 *   CPINT[seq=0] scratch2=0 fence=0 rptr=129 WPTR=0x81
++	 *   CPINT[seq=0] scratch2=0 fence=0 rptr=174 WPTR=0xae
++	 *   CPINT[seq=0] scratch2=0 fence=0 rptr=189 WPTR=0xbd
++	 *
++	 * Four separate submits -- the ring and RPTR advance each time, so the
++	 * GPU really is consuming the stream -- but submit->seqno is 0 in
++	 * every one of them. That is the whole bug:
++	 *
++	 *   a6xx_submit() does:
++	 *     OUT_PKT4(ring, REG_A6XX_CP_SCRATCH_REG(2), 1);
++	 *     OUT_RING(ring, submit->seqno);              <- always 0
++	 *     OUT_PKT7(ring, CP_EVENT_WRITE, 4);
++	 *     OUT_RING(ring, CACHE_FLUSH_TS | (1 << 31));
++	 *     OUT_RING(ring, low/high(rbmemptr(ring, fence)));
++	 *     OUT_RING(ring, submit->seqno);              <- always 0
++	 *
++	 * so the cache-flush timestamp never carries a new value, the fence
++	 * memptr is only ever written with 0, CACHE_FLUSH_TS never reaches its
++	 * trigger value so CP_CACHE_FLUSH_TS never fires, and
++	 *
++	 *   HANGCHK141: enter fence=0 stored=0 submitted=1
++	 *
++	 * reports a permanent lockup on every tick. Which is precisely the
++	 * symptom set that 200+ images failed to explain: no interrupts, no
++	 * fence progress, scratch2 pinned at 0, hangcheck screaming every
++	 * second.
++	 *
++	 * It also retro-explains several dead ends. CP_SCRATCH_REG(2) == 0
++	 * "proving" non-execution was simply the correct value for submit #0.
++	 * The SQE parking at PC 0x12e on the CACHE_FLUSH_TS header is the SQE
++	 * correctly waiting for a timestamp that never arrives. And the
++	 * "stale ring payload" theory was never a coherency problem at all --
++	 * the bytes were always right; we were reading zeros that were
++	 * supposed to be zero.
++	 *
++	 * a6xx submits exclusively on ring 0 in this tree (a6xx_submit() uses
++	 * gpu->rb[0]), and msm_ringbuffer.c:39 initialises ring->seqno = 0,
++	 * so this is a faithful transcription.
++	 */
++	submit->seqno = ++gpu->rb[0]->seqno;
++
+ 	list_add_tail(&submit->node, &gpu->submit_list);
+ 
+ 	msm_rd_dump_submit(submit);
+@@ -607,6 +884,13 @@
+ {
+ 	int ret;
+ 
++	/*
++	 * IMAGE 247 -- see the pm_hold comment at the bottom of this function.
++	 * Default ON: a wedged GPU cannot be tested at all.
++	 */
++	if (pm_hold)
++		pr_info("PMHOLD247: pm_hold=%d\n", pm_hold);
++
+ 	if (WARN_ON(gpu->num_perfcntrs > ARRAY_SIZE(gpu->last_cntrs)))
+ 		gpu->num_perfcntrs = ARRAY_SIZE(gpu->last_cntrs);
+ 
+@@ -679,8 +963,19 @@
+ 
+ 	bs_init(gpu);
+ 
+-	gpu->aspace = msm_gpu_create_address_space(gpu, pdev,
+-		config->va_start, config->va_end);
++	/*
++	 * Create the GPU address space, unless the driver already provided one.
++	 *
++	 * The a6xx driver builds gpu->aspace before calling adreno_gpu_init(),
++	 * on the CAF context bank (gfx3d_user). That has to be preserved:
++	 * creating one here would allocate a bare iommu_domain_alloc() domain,
++	 * which on this platform has no SMMU behind it because the GPU node
++	 * carries no "iommus" property, and would leak the existing address
++	 * space. Drivers that do not pre-create one are unaffected.
++	 */
++	if (!gpu->aspace)
++		gpu->aspace = msm_gpu_create_address_space(gpu, pdev,
++			config->va_start, config->va_end);
+ 
+ 	if (gpu->aspace == NULL)
+ 		dev_info(drm->dev, "%s: no IOMMU, fallback to VRAM carveout!\n", name);
+@@ -690,10 +985,10 @@
+ 	}
+ 
+ 	/* Create ringbuffer: */
+-	gpu->rb = msm_ringbuffer_new(gpu, config->ringsz);
+-	if (IS_ERR(gpu->rb)) {
+-		ret = PTR_ERR(gpu->rb);
+-		gpu->rb = NULL;
++	gpu->rb[0] = msm_ringbuffer_new(gpu, config->ringsz);
++	if (IS_ERR(gpu->rb[0])) {
++		ret = PTR_ERR(gpu->rb[0]);
++		gpu->rb[0] = NULL;
+ 		dev_err(drm->dev, "could not create ringbuffer: %d\n", ret);
+ 		goto fail;
+ 	}
+@@ -713,10 +1008,10 @@
+ 
+ 	bs_fini(gpu);
+ 
+-	if (gpu->rb) {
++	if (gpu->rb[0]) {
+ 		if (gpu->rb_iova)
+-			msm_gem_put_iova(gpu->rb->bo, gpu->aspace);
+-		msm_ringbuffer_destroy(gpu->rb);
++			msm_gem_put_iova(gpu->rb[0]->bo, gpu->aspace);
++		msm_ringbuffer_destroy(gpu->rb[0]);
+ 	}
+ 
+ 	if (!IS_ERR_OR_NULL(gpu->aspace)) {

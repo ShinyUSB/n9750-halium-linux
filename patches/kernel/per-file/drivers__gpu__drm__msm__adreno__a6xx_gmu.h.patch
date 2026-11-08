@@ -1,0 +1,310 @@
+--- /dev/null
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -0,0 +1,307 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2017 The Linux Foundation. All rights reserved. */
++
++#ifndef _A6XX_GMU_H_
++#define _A6XX_GMU_H_
++
++#include <linux/interrupt.h>
++#include <linux/mailbox_client.h>
++#include <linux/mailbox/qmp.h>
++#include "msm_drv.h"
++#include "a6xx_hfi.h"
++
++struct a6xx_gmu_bo {
++	void *virt;
++	size_t size;
++	u64 iova;
++	/*
++	 * TEMPORARY image 202: every GMU buffer is now allocated with
++	 * dma_alloc_attrs() -- including icache/dcache/ITCM hole, which
++	 * image 202 moved off alloc_page()+vmap(writecombine). All are
++	 * coherent with the GMU. phys/dma_addr are the coherent CPU pointer
++	 * and its bus address. `pages` is now unused and kept NULL; the
++	 * per-page free branch in a6xx_gmu_memory_free() is dead code
++	 * retained only as a safety net.
++	 */
++	void *phys;
++	dma_addr_t dma_addr;
++	struct page **pages;
++};
++
++/*
++ * These define the different GMU wake up options - these define how both the
++ * CPU and the GMU bring up the hardware
++ */
++
++/* THe GMU has already been booted and the rentention registers are active */
++#define GMU_WARM_BOOT 0
++
++/* the GMU is coming up for the first time or back from a power collapse */
++#define GMU_COLD_BOOT 1
++
++/* The GMU is being soft reset after a fault */
++#define GMU_RESET 2
++
++/*
++ * These define the level of control that the GMU has - the higher the number
++ * the more things that the GMU hardware controls on its own.
++ */
++
++/* The GMU does not do any idle state management */
++#define GMU_IDLE_STATE_ACTIVE 0
++
++/* The GMU manages SPTP power collapse */
++#define GMU_IDLE_STATE_SPTP 2
++
++/* The GMU does automatic IFPC (intra-frame power collapse) */
++#define GMU_IDLE_STATE_IFPC 3
++
++struct a6xx_gmu {
++	struct device *dev;
++
++	void * __iomem mmio;
++	void * __iomem pdc_mmio;
++	/*
++	 * The Samsung CAF device tree splits the GPU PDC block into two named
++	 * resources (kgsl_gmu_pdc_cfg and kgsl_gmu_pdc_seq) where upstream uses
++	 * gmu_pdc and gmu_pdc_seq. Upstream v5.8 (the A640 GMU path) already
++	 * fetches both, so both are mapped here as well.
++	 */
++	void * __iomem seq_mmio;
++
++	int hfi_irq;
++	int gmu_irq;
++
++	struct regulator *gx;
++	/*
++	 * CX GDSC for the GMU (vddcx). Vendor KGSL enables this via
++	 * regulator_enable(gmu->cx_gdsc) before enabling the GMU clocks
++	 * (gmu_enable_gdsc() in gmu_start()). The transplanted resume did
++	 * not vote it at all. Same DT node, same "vddcx" name, same device.
++	 */
++	struct regulator *cx;
++	/*
++	 * IMAGE 226: set when we successfully regulator_enable()d the GX GDSC
++	 * in resume, so the disable path stays balanced. a6xx_gmu_reset()
++	 * force-disables gmu->gx but must not do so for a rail it never
++	 * enabled (image 148 hit exactly that unbalanced-disable panic).
++	 */
++	bool gx_gdsc_enabled;
++
++	/*
++	 * IMAGE 230: AOP mailbox, for notifying the Always-On Processor of the
++	 * GPU's ACD (Adaptive Clock Distribution) state.
++	 *
++	 * Verbatim from vendor KGSL drivers/gpu/msm/kgsl_gmu.c:1305-1333 on
++	 * this machine (/home/usb/ShinyKernel/Kernel), which is the Samsung
++	 * SM8150/d2q 4.14 tree for this exact board:
++	 *
++	 *	mailbox->client = kzalloc(sizeof(*mailbox->client), GFP_KERNEL);
++	 *	mailbox->client->dev = &gmu->pdev->dev;
++	 *	mailbox->client->tx_block = true;
++	 *	mailbox->client->tx_tout = 1000;
++	 *	mailbox->client->knows_txdone = false;
++	 *	mailbox->channel = mbox_request_channel(mailbox->client, 0);
++	 */
++	struct mbox_client *aop_client;
++	struct mbox_chan *aop_chan;
++	bool aop_sent;
++	/*
++	 * msm_bus_scale client for the GPU grp3d bandwidth vote. Vendor KGSL
++	 * votes 300MHz DDR (bus index 4) via msm_bus_scale_client_update_request
++	 * (gmu->pcl, ...) immediately before FW_START. 0 = not registered.
++	 */
++	u32 bw_pcl;
++
++	struct iommu_domain *domain;
++	/* context-bank device backing ->domain (set by the msm_gpu_mmu adapter) */
++	struct device *cb_dev;
++	u64 uncached_iova_base;
++
++	int idle_level;
++
++	struct a6xx_gmu_bo *hfi;
++	struct a6xx_gmu_bo *debug;
++
++	/*
++	 * A640 (and A650) use a different GMU bring-up than A618/A630:
++	 *  - the GMU firmware is a sequence of blocks, each destined for
++	 *    ITCM, DTCM or the i/d caches, rather than one flat ITCM image
++	 *  - HFI v2 is used instead of HFI v1
++	 * Ported from upstream v5.8 (the 2020 A640/A650 series). When legacy
++	 * is true the original v4.19 behaviour is kept untouched, including
++	 * the firmware size check.
++	 */
++	bool legacy;		/* A618 or A630 */
++	struct a6xx_gmu_bo *icache;
++	struct a6xx_gmu_bo *dcache;
++	struct a6xx_gmu_bo *dummy;
++	/*
++	 * TEMPORARY image 192 -- PROMOTE ONLY ON RESULT. Covers the GMU ITCM
++	 * hole at IOVA 0x00000, which the firmware reads at bring-up.
++	 */
++	struct a6xx_gmu_bo *itcm_hole;
++	/*
++	 * TEMPORARY sentinel diagnostic -- REMOVE AFTER RESULT. 4 KiB scratch
++	 * at 0xDEADB000 to observe (not fix) the poison-address read.
++	 */
++	struct a6xx_gmu_bo *sentinel;
++	/*
++	 * TEMPORARY experiment image 102 -- REMOVE OR PROMOTE ON RESULT.
++	 * 4 KiB GMU log buffer (upstream v5.8 + vendor KGSL shape).
++	 */
++	struct a6xx_gmu_bo *log;
++
++	int nr_clocks;
++	struct clk_bulk_data *clocks;
++	struct clk *core_clk;
++
++	int nr_gpu_freqs;
++	unsigned long gpu_freqs[16];
++	u32 gx_arc_votes[16];
++
++	int nr_gmu_freqs;
++	unsigned long gmu_freqs[4];
++	u32 cx_arc_votes[4];
++
++	struct a6xx_hfi_queue queues[4];  /* TEMPORARY img101: vendor 4-queue topology */
++
++	struct tasklet_struct hfi_tasklet;
++};
++
++static inline u32 gmu_read(struct a6xx_gmu *gmu, u32 offset)
++{
++	return msm_readl(gmu->mmio + (offset << 2));
++}
++
++static inline void gmu_write(struct a6xx_gmu *gmu, u32 offset, u32 value)
++{
++	return msm_writel(value, gmu->mmio + (offset << 2));
++}
++
++/*
++ * Bulk MMIO write used by the A640 block firmware loader. Ported from
++ * upstream v5.8. A single wmb() after the copy orders all of it.
++ */
++static inline void gmu_write_bulk(struct a6xx_gmu *gmu, u32 offset,
++		const u32 *data, u32 size)
++{
++	memcpy_toio(gmu->mmio + (offset << 2), data, size);
++	wmb();
++}
++
++static inline void pdc_write(void __iomem *base, u32 offset, u32 value)
++{
++	return msm_writel(value, base + (offset << 2));
++}
++
++/*
++ * The RPMh sequence-programming registers live in the separate PDC "seq"
++ * resource on this platform, not in the pdc/cfg resource. Upstream v5.8
++ * directs these to seqptr; keeping them on pdc_mmio (as the older code did)
++ * writes them into the wrong register block.
++ */
++static inline void pdcseq_write(struct a6xx_gmu *gmu, u32 offset, u32 value)
++{
++	return msm_writel(value, gmu->seq_mmio + (offset << 2));
++}
++
++static inline void gmu_rmw(struct a6xx_gmu *gmu, u32 reg, u32 mask, u32 or)
++{
++	u32 val = gmu_read(gmu, reg);
++
++	val &= ~mask;
++
++	gmu_write(gmu, reg, val | or);
++}
++
++#define gmu_poll_timeout(gmu, addr, val, cond, interval, timeout) \
++	readl_poll_timeout((gmu)->mmio + ((addr) << 2), val, cond, \
++		interval, timeout)
++
++/*
++ * These are the available OOB (out of band requests) to the GMU where "out of
++ * band" means that the CPU talks to the GMU directly and not through HFI.
++ * Normally this works by writing a ITCM/DTCM register and then triggering a
++ * interrupt (the "request" bit) and waiting for an acknowledgment (the "ack"
++ * bit). The state is cleared by writing the "clear' bit to the GMU interrupt.
++ *
++ * These are used to force the GMU/GPU to stay on during a critical sequence or
++ * for hardware workarounds.
++ */
++
++enum a6xx_gmu_oob_state {
++	GMU_OOB_BOOT_SLUMBER = 0,
++	GMU_OOB_GPU_SET,
++	GMU_OOB_DCVS_SET,
++};
++
++/* These are the interrupt / ack bits for each OOB request that are set
++ * in a6xx_gmu_set_oob and a6xx_clear_oob
++ */
++
++/*
++ * Let the GMU know that a boot or slumber operation has started. The value in
++ * REG_A6XX_GMU_BOOT_SLUMBER_OPTION lets the GMU know which operation we are
++ * doing
++ *
++ * IMAGE 225: BOOT_SLUMBER is reverted to the upstream legacy values
++ * 22/30/30. Image 104 changed it to 30/31/31 on the theory that vendor KGSL
++ * uses "set = BIT(30 - req*2)", but that heuristic does not actually hold for
++ * the other requests (it would give 28 for DCVS, not 23), and it was applied
++ * to the wrong request: 30/31/31 are the *GPU_SET* non-legacy bits, not
++ * BOOT_SLUMBER's. In upstream BOOT_SLUMBER has no non-legacy mapping at all.
++ */
++#define GMU_OOB_BOOT_SLUMBER_REQUEST	22
++#define GMU_OOB_BOOT_SLUMBER_ACK	30
++#define GMU_OOB_BOOT_SLUMBER_CLEAR	30
++
++/*
++ * Set a new power level for the GPU when the CPU is doing frequency scaling
++ *
++ * IMAGE 225: legacy-only. Upstream gives DCVS no set_new/ack_new, and rejects
++ * it outright on non-legacy firmware. On HFI v2.x the frequency is set over HFI
++ * (a6xx_hfi_send_gx_vote), not over OOB.
++ */
++#define GMU_OOB_DCVS_REQUEST	23
++#define GMU_OOB_DCVS_ACK	31
++#define GMU_OOB_DCVS_CLEAR	31
++
++/*
++ * Let the GMU know to not turn off any GPU registers while the CPU is in a
++ * critical section
++ *
++ * IMAGE 225: THIS IS THE BUG. These 16/24/24 are the *legacy* (HFI v1) bits.
++ * HFI v2.x firmware -- which is what an A640 runs, and what our GMU reports
++ * via HFI_VERSION=0x20000001 -- uses a completely different interrupt vector:
++ *
++ *     legacy (HFI v1)  request BIT(16)  ack BIT(24)
++ *     non-legacy (v2)  request BIT(30)  ack BIT(31)
++ *
++ * We were ringing BIT(16) at v2 firmware, which does not watch it. That is
++ * precisely the observed failure: HOST2GMU_RAW=0x00010000 (bit 16) sitting set
++ * and never consumed. GPU_SET is the "Make sure the GMU keeps the GPU on while
++ * we set it up" handshake in hw_init() -- so the GMU was never told to hold
++ * the GPU powered, the GX rail never came up, and no blit ever ran.
++ */
++#define GMU_OOB_GPU_SET_REQUEST		16
++#define GMU_OOB_GPU_SET_ACK		24
++#define GMU_OOB_GPU_SET_CLEAR		24
++
++#define GMU_OOB_GPU_SET_REQUEST_NEW	30
++#define GMU_OOB_GPU_SET_ACK_NEW		31
++#define GMU_OOB_GPU_SET_CLEAR_NEW	31
++
++
++void a6xx_hfi_init(struct a6xx_gmu *gmu);
++int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state);
++int a6xx_hfi_send_gx_vote(struct a6xx_gmu *gmu, u32 ack_type, u32 freq, u32 bw);
++int a6xx_hfi_set_freq(struct a6xx_gmu *gmu, int index);
++int a6xx_hfi_send_prep_slumber(struct a6xx_gmu *gmu);
++void a6xx_hfi_stop(struct a6xx_gmu *gmu);
++struct seq_file;
++void a6xx_gmu_log_show(struct msm_gpu *gpu, struct seq_file *m);
++
++void a6xx_hfi_task(unsigned long data);
++
++#endif

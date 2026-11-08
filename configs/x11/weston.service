@@ -1,0 +1,30 @@
+[Unit]
+Description=d2q Weston compositor (DRM/Pixman, tty1)
+# getty@tty1 is DISABLED at boot: its Type=idle deferred exec vhangup()s
+# tty1 ~6s after boot, SIGHUPing Weston. Weston owns tty1 alone instead.
+# A standing local fallback lives on tty2 (getty@tty2, different VT, its
+# vhangup cannot touch Weston). When Weston stops/crashes, ExecStopPost
+# starts getty@tty1 (Weston already dead, so its vhangup is harmless) and
+# the fbcon console + login come back automatically (M10).
+After=systemd-udevd.service drm-kick.service
+
+[Service]
+Type=simple
+# Weston can block at exit if a pageflip is in flight when it tears down
+# outputs (SDE CMD panel sometimes never delivers that final flip event).
+# Bound the stop; display recovery does not depend on a clean exit -
+# closing Weston's DRM fd triggers msm_lastclose, which restores fbcon.
+TimeoutStopSec=15
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=WAYLAND_DISPLAY=wayland-1
+ExecStartPre=/bin/mkdir -p /run/user/0
+ExecStartPre=/bin/chmod 700 /run/user/0
+ExecStart=/usr/bin/weston --backend=drm-backend.so --drm-device=card0 --use-pixman --tty=1 --seat=seat0 --socket=wayland-1 --config=/root/.config/weston.ini --log=/tmp/weston-auto.log
+ExecStopPost=-/bin/systemctl start getty@tty1.service
+StandardOutput=journal
+StandardError=journal
+# No Restart: a failed Weston leaves fbcon visible + SSH working; start
+# getty@tty1 over SSH for a local login, or fix Weston and start it.
+
+[Install]
+WantedBy=multi-user.target

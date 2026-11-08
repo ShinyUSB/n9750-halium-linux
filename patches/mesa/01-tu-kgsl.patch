@@ -1,0 +1,37 @@
+--- /tmp/mp/mesa-25.3.0/src/freedreno/vulkan/tu_knl_kgsl.cc	2025-11-15 00:25:42.000000000 +0300
++++ /home/usb/mnt-sda/mesa-root/root/mesa-25.3.0/src/freedreno/vulkan/tu_knl_kgsl.cc	2026-10-26 15:38:15.597758858 +0300
+@@ -732,7 +732,8 @@
+ 
+          wait.timeout = timeout_ms;
+       } else if (ret == -1) {
+-         assert(errno == ETIMEDOUT);
++         /* d2q: KGSL returns -1 with non-ETIMEDOUT errnos (EINTR/EAGAIN) for
++          * semaphore waits; aborting the process is not acceptable. */
+          return VK_TIMEOUT;
+       } else {
+          return VK_SUCCESS;
+@@ -778,7 +779,7 @@
+                                          &device->submit_mutex, &abstime);
+          }
+          if (ret != 0) {
+-            assert(ret == ETIMEDOUT);
++            /* d2q: tolerate non-ETIMEDOUT condition-wait results */
+             pthread_mutex_unlock(&device->submit_mutex);
+             return VK_TIMEOUT;
+          }
+@@ -1710,9 +1711,13 @@
+ VkResult
+ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
+ {
++   /* PROJECT PATCH (d2q kgsl pivot, 2026-10-24): upstream hard-fails the
++    * whole instance when VK_KHR_display is enabled; tools like vulkaninfo
++    * enable it blindly, and with a kgsl-only device that kills ALL device
++    * enumeration.  Degrade gracefully: keep the instance, the display
++    * extension just never reports surfaces. */
+    if (instance->vk.enabled_extensions.KHR_display) {
+-      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+-                       "I can't KHR_display");
++      mesa_logw("tu/kgsl: VK_KHR_display requested but unsupported on kgsl; continuing without it");
+    }
+ 
+    struct tu_physical_device *device = (struct tu_physical_device *)

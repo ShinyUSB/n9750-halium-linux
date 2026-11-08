@@ -1,0 +1,43 @@
+--- a/drivers/gpu/drm/msm/dsi-staging/dsi_drm.c
++++ b/drivers/gpu/drm/msm/dsi-staging/dsi_drm.c
+@@ -640,6 +640,40 @@
+ 
+ 	convert_to_dsi_mode(drm_mode, &dsi_mode);
+ 
++	/*
++	 * D2Q PATCH (2026-10-25): priv_info comes from drm_mode->private,
++	 * which only exists on kernel-side mode objects.  A legacy
++	 * drmModeSetCrtc hands us a userspace-converted mode with private
++	 * == NULL, and the panel's topology (DSC etc.) is then unknowable
++	 * (-EINVAL from atomic check: "failed to get mode info").
++	 * Fall back to the display's own parsed mode list: match by active
++	 * size + clock, and borrow its priv_info.
++	 */
++	if (!dsi_mode.priv_info && display) {
++		struct dsi_display *d = (struct dsi_display *)display;
++		u32 count = 0;
++		int k;
++
++		if (!dsi_display_get_mode_count(d, &count)) {
++			for (k = 0; k < count; k++) {
++				struct dsi_display_mode *m = &d->modes[k];
++
++				/* refresh_rate may be 0 in userspace-converted
++				 * modes (vrefresh not computed); match on
++				 * geometry + clock only. */
++				if (m->timing.h_active ==
++					    dsi_mode.timing.h_active &&
++				    m->timing.v_active ==
++					    dsi_mode.timing.v_active &&
++				    m->pixel_clk_khz ==
++					    dsi_mode.pixel_clk_khz) {
++					dsi_mode.priv_info = m->priv_info;
++					break;
++				}
++			}
++		}
++	}
++
+ 	if (!dsi_mode.priv_info)
+ 		return -EINVAL;
+ 
