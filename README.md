@@ -33,6 +33,10 @@ contains **no vendor firmware or Samsung/Qualcomm binaries** (see NOTICE).
 | Wi-Fi | ✅ | BCM4375 PCIe |
 | Bluetooth | ✅ | BCM4375 UART (HCI attach scripts included) |
 
+## Installation
+
+See [INSTALL.md](INSTALL.md) — full path from stock firmware to a running desktop.
+
 ## Repository map
 
 ```
