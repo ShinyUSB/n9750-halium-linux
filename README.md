@@ -1,8 +1,7 @@
 # d2q — Debian Linux on the Samsung Galaxy Note 10+ (SM-N9750, Snapdragon 855)
 
 Work-in-progress research and bring-up notes for running a real Debian 12 (bookworm)
-userspace on a "Chinese" Snapdragon Note 10+ (`d2q`, SM-N9750). No Android, no Halium
-container — the stock Samsung kernel lineage is patched to boot a Debian rootfs directly
+userspace on a "Chinese" Snapdragon Note 10+ (`d2q`, SM-N9750). The stock Samsung kernel lineage is patched to boot a Debian rootfs directly
 (downstream 4.14.190 kernel, fbdev + DRM display path, kgsl GPU, ADSP audio, SLPI sensors,
 modem stack via QRTR/QMI, all reverse-engineered from the stock vendor image).
 
